@@ -10,7 +10,35 @@ append-only event log as the sole source of truth, stages/stations/routes as
 runtime data rather than code, routes snapshotted onto items at release, and a
 fully offline-capable PWA with an IndexedDB write queue.
 
-## Quickstart
+## Quickstart (Docker — the intended path)
+
+```sh
+git clone <repo> && cd LSF-track
+docker compose up
+```
+
+That's the whole deployment: PostgreSQL plus the app, migrated, seeded, and
+with an admin account ready. Open `http://localhost:8000` and sign in as
+`admin` / `admin`.
+
+Configuration goes in a `.env` file next to `docker-compose.yml` (all
+optional):
+
+```sh
+LSF_SECRET_KEY=<real random key>      # do set this for anything non-throwaway
+LSF_ADMIN_USERNAME=dave               # first admin, created on first boot only
+LSF_ADMIN_PASSWORD=...
+POSTGRES_PASSWORD=...
+LSF_PORT=8000                         # host port
+LSF_DEMO=true                         # pre-load sample factory data
+```
+
+The compose stack serves plain HTTP with `LSF_SECURE_COOKIES=false`; for the
+factory, put TLS termination (Caddy, nginx, Tailscale) in front and set it
+back to true. Data lives in the `pgdata` volume; `docker compose down -v`
+erases it.
+
+## Quickstart (bare, without Docker)
 
 ```sh
 python3.11 -m venv .venv

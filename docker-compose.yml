@@ -1,0 +1,46 @@
+# One command runs everything:
+#
+#     docker compose up
+#
+# then open http://localhost:8000 and sign in with LSF_ADMIN_USERNAME /
+# LSF_ADMIN_PASSWORD (default admin / admin — override them in a `.env` file
+# next to this compose file, along with a real LSF_SECRET_KEY).
+#
+# Set LSF_DEMO=true for a throwaway instance pre-loaded with sample data.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lsf
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lsf}
+      POSTGRES_DB: lsf_track
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lsf -d lsf_track"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      LSF_DATABASE_URL: postgresql+psycopg://lsf:${POSTGRES_PASSWORD:-lsf}@db:5432/lsf_track
+      LSF_SECRET_KEY: ${LSF_SECRET_KEY:-dev-only-change-me}
+      # The compose stack serves plain HTTP; put TLS termination (Caddy, nginx,
+      # Tailscale) in front for the factory and set this to "true".
+      LSF_SECURE_COOKIES: "false"
+      LSF_ADMIN_USERNAME: ${LSF_ADMIN_USERNAME:-admin}
+      LSF_ADMIN_PASSWORD: ${LSF_ADMIN_PASSWORD:-admin}
+      LSF_DEMO: ${LSF_DEMO:-false}
+    ports:
+      - "${LSF_PORT:-8000}:8000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

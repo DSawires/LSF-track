@@ -62,6 +62,41 @@ def cmd_create_user(args) -> None:
     print(f"created {username}{' (admin)' if args.admin else ''}")
 
 
+def cmd_bootstrap(_args) -> None:
+    """Create the admin named by LSF_ADMIN_USERNAME / LSF_ADMIN_PASSWORD.
+
+    Idempotent and safe to run on every container start: does nothing if the
+    variables are unset or the user already exists. Never updates a password --
+    rotating credentials is a deliberate act, not a side effect of a restart.
+    """
+    import os
+
+    import sqlalchemy as sa
+
+    from app.models import User
+    from app.security import hash_password
+
+    username = os.environ.get("LSF_ADMIN_USERNAME", "").strip().lower()
+    password = os.environ.get("LSF_ADMIN_PASSWORD", "")
+    if not username or not password:
+        print("bootstrap: LSF_ADMIN_USERNAME/LSF_ADMIN_PASSWORD not set; nothing to do")
+        return
+    with get_sessionmaker()() as db:
+        if db.scalars(sa.select(User).where(User.username == username)).first():
+            print(f"bootstrap: {username} already exists")
+            return
+        db.add(
+            User(
+                username=username,
+                display_name=username,
+                password_hash=hash_password(password),
+                is_admin=True,
+            )
+        )
+        db.commit()
+    print(f"bootstrap: created admin {username}")
+
+
 def cmd_demo(_args) -> None:
     from seeds.demo import run
 
@@ -85,6 +120,7 @@ def main() -> None:
     p_user.add_argument("--admin", action="store_true")
     p_user.set_defaults(func=cmd_create_user)
 
+    sub.add_parser("bootstrap").set_defaults(func=cmd_bootstrap)
     sub.add_parser("demo").set_defaults(func=cmd_demo)
 
     args = parser.parse_args()
