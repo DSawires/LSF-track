@@ -313,6 +313,33 @@ function pendingCountFor(itemId) {
   return S.pending.filter((q) => q._status === "pending" && q.item_id === itemId).length;
 }
 
+/* The position one past (stepId, stateId) on this item's chain — where a batch
+   resting there naturally advances to. (null, null) means unstarted; returns
+   null past the end of the route. */
+function positionAfter(item, stepId, stateId) {
+  const states = stateOrder();
+  const steps = [...item.steps].sort((a, b) => a.seq - b.seq);
+  const next = positionIndex(item, stepId, stateId) + 1;
+  if (!steps.length || !states.length || next > steps.length * states.length) return null;
+  return {
+    stepId: steps[Math.floor((next - 1) / states.length)].id,
+    stateId: states[(next - 1) % states.length].id,
+  };
+}
+
+/* Stable key for one sub-batch position, used in the URL so a tapped batch
+   survives the navigation: #/items/{id}/{stepId}.{stateId} */
+function positionKey(p) {
+  return p.is_unstarted ? "unstarted" : `${p.item_step_id}.${p.state_id}`;
+}
+
+function findPosition(item, key) {
+  const positions = item.state?.positions || [];
+  if (key === "unstarted") return positions.find((p) => p.is_unstarted) || null;
+  const [stepId, stateId] = key.split(".");
+  return positions.find((p) => p.item_step_id === stepId && p.state_id === stateId) || null;
+}
+
 /* -------------------------------------------------------------- routing -- */
 
 function navigate(hash) { location.hash = hash; }
@@ -338,7 +365,7 @@ function render(background = false) {
     if (hash !== "#/login") { navigate("#/login"); return; }
   }
 
-  const [, route, arg] = hash.split("/");
+  const [, route, arg, arg2] = hash.split("/");
   document.querySelectorAll("#tabs a").forEach((a) =>
     a.classList.toggle("active", a.dataset.tab === route));
 
@@ -356,7 +383,7 @@ function render(background = false) {
 
   if (route === "login") viewLogin();
   else if (route === "sync") viewSyncStatus();
-  else if (route === "items" && arg) viewLogScreen(arg);
+  else if (route === "items" && arg) viewLogScreen(arg, arg2);
   else if (route === "reports") viewReports();
   else if (route === "office") viewOffice();
   else viewItems();
@@ -525,6 +552,9 @@ function viewSyncStatus() {
 /* ---------------------------------------------------------------- items -- */
 
 function viewItems() {
+  // Back on the list: the next sub-batch tap is a fresh arrival, even if it
+  // is the same batch as last time.
+  logSel._fromKey = null;
   const projects = S.ref?.projects || [];
   const stages = (S.ref?.stages || []).filter((s) => s.is_active);
   const filterProject = sessionStorage.getItem("f-project") || "";
@@ -587,42 +617,53 @@ function viewItems() {
 }
 
 function itemRow(item) {
-  // One line per sub-batch, mirroring the aging report: a split batch reads as
-  // its positions, not as one blob with badges.
+  // One line per sub-batch, mirroring the aging report — and each line is its
+  // own tap target: tapping the 40 pcs at carpentry opens the log screen
+  // aimed at moving THOSE 40, independent of the 50 sitting at paint. This is
+  // the whole workflow: create the item at its project total, then advance
+  // batches through production one position at a time.
   const positions = item.state?.positions || [];
   const completed = item.state?.completed_qty || 0;
   const pending = pendingCountFor(item.id);
 
+  const where = (p) => p.is_unstarted
+    ? "Not started"
+    : `${p.stage_name} · ${stateName(p.state_id)}`;
+
   const lines = positions.map((p) => `
-    <div class="spread" style="padding:3px 0 3px 10px;border-left:2px solid var(--line)">
-      <span class="muted">${p.is_unstarted ? "Not started" : `${esc(p.stage_name)} · ${esc(stateName(p.state_id))}`}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
-      <span style="white-space:nowrap">
+    <a class="pos-row" href="#/items/${item.id}/${positionKey(p)}"
+       aria-label="Advance ${p.qty} pcs from ${esc(where(p))}">
+      <span class="muted" style="min-width:0">${esc(where(p))}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
+      <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
         <span class="badge qty">${p.qty}</span>${p.is_unstarted ? "" : `
         <span class="badge${p.overdue ? " age-hot" : ""}">${p.days_in_state.toFixed(1)}d</span>`}
+        <span class="chev" aria-hidden="true">›</span>
       </span>
-    </div>`).join("");
+    </a>`).join("");
 
   return `
-    <a href="#/items/${item.id}">
-      <div style="display:flex;gap:10px;align-items:flex-start">
-        ${item.icon_url ? `<img src="${item.icon_url}" alt="" loading="lazy"
-          style="width:44px;height:44px;object-fit:cover;border-radius:8px;border:1px solid var(--line);flex:none">` : ""}
-        <div style="flex:1;min-width:0">
-          <div class="spread">
-            <strong>${esc(item.code)}</strong>
-            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+    <div>
+      <a class="item-head" href="#/items/${item.id}">
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          ${item.icon_url ? `<img src="${item.icon_url}" alt="" loading="lazy"
+            style="width:44px;height:44px;object-fit:cover;border-radius:8px;border:1px solid var(--line);flex:none">` : ""}
+          <div style="flex:1;min-width:0">
+            <div class="spread">
+              <strong>${esc(item.code)}</strong>
+              <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+            </div>
+            <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
           </div>
-          <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
         </div>
-      </div>
-      ${lines || `<span class="badge">not started</span>`}
+      </a>
+      ${lines || `<a class="item-head" href="#/items/${item.id}"><span class="badge">not started</span></a>`}
       ${completed ? `
       <div class="spread" style="padding:3px 0 3px 10px;border-left:2px solid var(--good)">
         <span class="muted">Completed</span>
         <span class="badge qty" style="color:var(--good)">${completed}</span>
       </div>` : ""}
       ${pending ? `<div style="margin-top:4px"><span class="badge pending">${pending} pending</span></div>` : ""}
-    </a>`;
+    </div>`;
 }
 
 function stateName(stateId) {
@@ -631,9 +672,12 @@ function stateName(stateId) {
 
 /* ----------------------------------------------------------- log screen -- */
 
-const logSel = { stepId: null, stateId: null, typeId: null, stationId: null, reasonId: null, note: "" };
+const logSel = {
+  stepId: null, stateId: null, typeId: null, stationId: null, reasonId: null,
+  note: "", qtyDefault: null, _fromKey: null,
+};
 
-function viewLogScreen(itemId) {
+function viewLogScreen(itemId, fromKey) {
   const item = S.items.find((i) => i.id === itemId);
   if (!item) { navigate("#/items"); return; }
 
@@ -648,6 +692,27 @@ function viewLogScreen(itemId) {
   }
   const type = movableTypes.find((t) => t.id === logSel.typeId);
 
+  // Arrived by tapping a specific sub-batch on the item card: aim the form at
+  // moving THAT batch — target its next position, default the quantity to its
+  // size. Applied once per arrival (the guard), so segment taps and background
+  // re-renders don't fight the engineer's own adjustments afterwards.
+  const fromPos = fromKey ? findPosition(item, fromKey) : null;
+  if (fromPos && logSel._fromKey !== `${itemId}/${fromKey}`) {
+    logSel._fromKey = `${itemId}/${fromKey}`;
+    const target = positionAfter(
+      item,
+      fromPos.is_unstarted ? null : fromPos.item_step_id,
+      fromPos.is_unstarted ? null : fromPos.state_id,
+    );
+    if (target) {
+      logSel.typeId = defaultType?.id || logSel.typeId;
+      logSel.stepId = target.stepId;
+      logSel.stateId = target.stateId;
+      logSel.stationId = null;
+      logSel.qtyDefault = fromPos.qty;
+    }
+  }
+
   // The track constrains the picker: only steps where units rest, plus the
   // immediate next step, are offered. Rework may target any step at or before
   // the furthest units. Free jumps down the route would negate the route.
@@ -657,6 +722,7 @@ function viewLogScreen(itemId) {
     const target = defaultTarget(item, steps, states);
     logSel.stepId = allowed.has(target.stepId) ? target.stepId : shownSteps[0]?.id;
     logSel.stateId = target.stateId;
+    logSel.qtyDefault = null; // the batch context can't survive a target reset
   }
   if (!states.some((s) => s.id === logSel.stateId)) logSel.stateId = states[0]?.id;
 
@@ -705,6 +771,12 @@ function viewLogScreen(itemId) {
     </div>
 
     <div class="card">
+      ${fromPos && logSel.qtyDefault != null ? `
+      <div class="batch-context">
+        Moving the batch of <strong>${fromPos.qty}</strong> from
+        <strong>${esc(fromPos.is_unstarted ? "Not started" : `${fromPos.stage_name} · ${stateName(fromPos.state_id)}`)}</strong>
+        — adjust anything below before logging.
+      </div>` : ""}
       ${movableTypes.length > 1 ? `
       <label id="lbl-type">Entry type</label>
       <div class="seg" id="seg-type" role="group" aria-labelledby="lbl-type">
@@ -738,9 +810,10 @@ function viewLogScreen(itemId) {
 
       <label for="qty">Quantity</label>
       <div class="qty-row">
-        <button id="qty-minus">−</button>
-        <input id="qty" type="number" inputmode="numeric" min="1" value="${available || 1}">
-        <button id="qty-plus">+</button>
+        <button id="qty-minus" aria-label="One fewer">−</button>
+        <input id="qty" type="number" inputmode="numeric" min="1"
+               value="${logSel.qtyDefault != null ? Math.min(logSel.qtyDefault, available || logSel.qtyDefault) : (available || 1)}">
+        <button id="qty-plus" aria-label="One more">+</button>
       </div>
       <p class="muted" style="margin-top:5px">${available} available at the previous step</p>
       ${stage?.requires_external_po ? `<p class="muted">External supplier stage — time in state is supplier lead time.</p>` : ""}
@@ -780,7 +853,7 @@ function viewLogScreen(itemId) {
       <div id="recent" class="muted">Loading…</div>
     </div>`;
 
-  const rerender = () => viewLogScreen(itemId);
+  const rerender = () => viewLogScreen(itemId, fromKey);
   wireSeg("seg-type", (id) => { logSel.typeId = id; rerender(); });
   wireSeg("seg-step", (id) => { logSel.stepId = id; logSel.stationId = null; rerender(); });
   wireSeg("seg-state", (id) => { logSel.stateId = id; rerender(); });
@@ -822,6 +895,14 @@ function viewLogScreen(itemId) {
     });
     if (!logged) return;
     logSel.note = "";
+    logSel.qtyDefault = null;
+    logSel._fromKey = null;
+    if (fromKey) {
+      // The batch has moved on; drop its key from the URL without a reload so
+      // the next render defaults normally.
+      history.replaceState(null, "", `#/items/${item.id}`);
+      fromKey = undefined;
+    }
     // One tap, two facts: done here, queued there. The +1ms keeps the replay
     // order deterministic so the queue event always pulls the units the
     // completion just produced.
