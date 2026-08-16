@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101418">
+  <title>LSF Track</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon.svg">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+  <header id="topbar" hidden>
+    <h1>LSF Track</h1>
+    <div id="sync-pill"><span class="dot"></span><span id="sync-text">…</span></div>
+  </header>
+
+  <main id="view"></main>
+
+  <nav id="tabs" hidden>
+    <a href="#/items" data-tab="items">Items</a>
+    <a href="#/reports" data-tab="reports">Reports</a>
+    <a href="#/office" data-tab="office">Office</a>
+  </nav>
+
+  <script src="/static/js/db.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,75 @@
+"""Session handling.
+
+Sessions are deliberately long-lived and sliding. An engineer who starts a shift in
+a dead spot at the back of the paint shop must still be able to log events and drain
+their queue hours later; being bounced to a login screen with no network is a total
+outage for that person.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+from fastapi import Depends, HTTPException, Request, Response, status
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.db import get_db
+from app.models import User
+
+COOKIE_NAME = "lsf_session"
+
+
+def _serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(get_settings().secret_key, salt="lsf-session")
+
+
+def issue_session(response: Response, user: User) -> None:
+    settings = get_settings()
+    token = _serializer().dumps({"uid": str(user.id)})
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        max_age=settings.session_max_age_seconds,
+        httponly=True,
+        samesite="lax",
+        secure=settings.secure_cookies,
+        path="/",
+    )
+
+
+def clear_session(response: Response) -> None:
+    response.delete_cookie(COOKIE_NAME, path="/")
+
+
+def current_user(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> User:
+    settings = get_settings()
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not signed in")
+    try:
+        data = _serializer().loads(token, max_age=settings.session_max_age_seconds)
+    except SignatureExpired:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session expired")
+    except BadSignature:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad session")
+
+    user = db.get(User, uuid.UUID(data["uid"]))
+    if user is None or not user.is_active:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unknown user")
+
+    # Slide the expiry on every authenticated request, so an app in daily use never
+    # expires out from under someone.
+    issue_session(response, user)
+    return user
+
+
+def require_admin(user: User = Depends(current_user)) -> User:
+    if not user.is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "admin only")
+    return user

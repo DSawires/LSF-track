@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime
+
+import sqlalchemy as sa
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db import Base, utcnow
+
+
+def _pk() -> Mapped[uuid.UUID]:
+    return mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = _pk()
+    username: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(sa.String(128))
+    password_hash: Mapped[str] = mapped_column(sa.String(255))
+    is_admin: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = _pk()
+    code: Mapped[str] = mapped_column(sa.String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(sa.String(160))
+    client: Mapped[str | None] = mapped_column(sa.String(160), nullable=True)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    items: Mapped[list[Item]] = relationship(back_populates="project")
+
+
+class Stage(Base):
+    """A step type. Rows are added at runtime by non-developers.
+
+    Every behavioural difference between stages is a column here. Nothing in the
+    application may branch on `code` -- see CLAUDE.md rule 2.
+    """
+
+    __tablename__ = "stages"
+
+    id: Mapped[uuid.UUID] = _pk()
+    code: Mapped[str] = mapped_column(sa.String(48), unique=True, index=True)
+    name: Mapped[str] = mapped_column(sa.String(120))
+    sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+    # Behaviour flags. Add columns here rather than branching on the code.
+    requires_station: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    requires_external_po: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    allows_partial_qty: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    is_terminal: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+
+    stations: Mapped[list[Station]] = relationship(back_populates="stage")
+
+
+class Station(Base):
+    __tablename__ = "stations"
+
+    id: Mapped[uuid.UUID] = _pk()
+    stage_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("stages.id"), index=True)
+    code: Mapped[str] = mapped_column(sa.String(48), unique=True, index=True)
+    name: Mapped[str] = mapped_column(sa.String(120))
+    sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+    stage: Mapped[Stage] = relationship(back_populates="stations")
+
+
+class EventState(Base):
+    """queued / in_progress / completed, as data.
+
+    `sort_order` defines progression within a step; `is_complete` marks the state
+    that hands units on to the next step. Nothing else is assumed about them, so a
+    factory can add a fourth state without a deploy.
+    """
+
+    __tablename__ = "event_states"
+
+    id: Mapped[uuid.UUID] = _pk()
+    code: Mapped[str] = mapped_column(sa.String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(sa.String(64))
+    sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
+    is_complete: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+
+class EventType(Base):
+    """Table-driven event vocabulary.
+
+    The derivation in app/ledger.py branches on these flags and never on `code`,
+    which is what lets a new event type be added the same way a stage is.
+    """
+
+    __tablename__ = "event_types"
+
+    id: Mapped[uuid.UUID] = _pk()
+    code: Mapped[str] = mapped_column(sa.String(48), unique=True, index=True)
+    name: Mapped[str] = mapped_column(sa.String(120))
+    sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+    # Behaviour flags.
+    is_correction: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    is_rework: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # The two item-level events the server itself writes. Flagged rather than looked
+    # up by code, so the server never depends on a particular spelling.
+    is_release: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    is_revision_bump: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    moves_quantity: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    requires_item_step: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    requires_reason_code: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    counts_toward_completion: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+
+class ReasonCode(Base):
+    __tablename__ = "reason_codes"
+
+    id: Mapped[uuid.UUID] = _pk()
+    code: Mapped[str] = mapped_column(sa.String(48), unique=True, index=True)
+    name: Mapped[str] = mapped_column(sa.String(160))
+    sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+
+class RouteTemplate(Base):
+    """A versioned standard route. (code, version) is the identity."""
+
+    __tablename__ = "route_templates"
+    __table_args__ = (sa.UniqueConstraint("code", "version", name="uq_route_code_version"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    code: Mapped[str] = mapped_column(sa.String(48), index=True)
+    version: Mapped[int] = mapped_column(sa.Integer, default=1)
+    name: Mapped[str] = mapped_column(sa.String(160))
+    is_published: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    steps: Mapped[list[RouteTemplateStep]] = relationship(
+        back_populates="route_template", order_by="RouteTemplateStep.seq"
+    )
+
+
+class RouteTemplateStep(Base):
+    __tablename__ = "route_template_steps"
+    __table_args__ = (
+        sa.UniqueConstraint("route_template_id", "seq", name="uq_route_step_seq"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk()
+    route_template_id: Mapped[uuid.UUID] = mapped_column(
+        sa.ForeignKey("route_templates.id"), index=True
+    )
+    # Multiples of 10 so a stage can be slotted between two existing steps.
+    seq: Mapped[int] = mapped_column(sa.Integer)
+    stage_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("stages.id"))
+
+    route_template: Mapped[RouteTemplate] = relationship(back_populates="steps")
+    stage: Mapped[Stage] = relationship()
+
+
+class Item(Base):
+    """A batch of identical pieces.
+
+    Deliberately carries no derived production state: no current_stage, no
+    current_status, no is_complete. Those come from the event log.
+
+    `drawing_revision` is authored by the technical office rather than derived, and
+    every change to it is also written to the log as a revision-bump event.
+    """
+
+    __tablename__ = "items"
+
+    id: Mapped[uuid.UUID] = _pk()
+    code: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("projects.id"), index=True)
+    description: Mapped[str] = mapped_column(sa.String(255))
+    total_qty: Mapped[int] = mapped_column(sa.Integer)
+    drawing_revision: Mapped[str] = mapped_column(sa.String(32))
+    target_release_date: Mapped[date | None] = mapped_column(sa.Date, nullable=True)
+
+    # Set at release; until then the item has no route and cannot be logged against.
+    route_template_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("route_templates.id"), nullable=True
+    )
+    released_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    released_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("users.id"), nullable=True
+    )
+    released_revision: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    project: Mapped[Project] = relationship(back_populates="items")
+    route_template: Mapped[RouteTemplate | None] = relationship()
+    steps: Mapped[list[ItemStep]] = relationship(
+        back_populates="item", order_by="ItemStep.seq"
+    )
+
+    @property
+    def is_released(self) -> bool:
+        return self.released_at is not None
+
+
+class ItemStep(Base):
+    """The route snapshot taken at release. Never altered by template changes."""
+
+    __tablename__ = "item_steps"
+    __table_args__ = (sa.UniqueConstraint("item_id", "seq", name="uq_item_step_seq"),)
+
+    id: Mapped[uuid.UUID] = _pk()
+    item_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("items.id"), index=True)
+    seq: Mapped[int] = mapped_column(sa.Integer)
+    stage_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("stages.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    item: Mapped[Item] = relationship(back_populates="steps")
+    stage: Mapped[Stage] = relationship()
+
+
+class Event(Base):
+    """The log. Insert only: no UPDATE, no DELETE, anywhere, ever.
+
+    Mistakes are superseded by a correction event, not edited.
+    """
+
+    __tablename__ = "events"
+
+    # Generated on the client so a retry after a lost response is a no-op.
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True)
+    item_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("items.id"), index=True)
+    item_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("item_steps.id"), nullable=True, index=True
+    )
+    station_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("stations.id"), nullable=True, index=True
+    )
+    event_type_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("event_types.id"))
+    state_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("event_states.id"), nullable=True
+    )
+    qty: Mapped[int] = mapped_column(sa.Integer, default=0)
+    reason_code_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("reason_codes.id"), nullable=True
+    )
+    occurred_at: Mapped[datetime] = mapped_column(index=True)
+    received_at: Mapped[datetime] = mapped_column(default=utcnow, index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"), index=True)
+    note: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    supersedes_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("events.id"), nullable=True, index=True
+    )
+
+    item: Mapped[Item] = relationship()
+    event_type: Mapped[EventType] = relationship()
+    state: Mapped[EventState | None] = relationship()
+    station: Mapped[Station | None] = relationship()
+    reason_code: Mapped[ReasonCode | None] = relationship()
+
+    __table_args__ = (
+        sa.Index("ix_events_item_occurred", "item_id", "occurred_at"),
+        sa.Index("ix_events_station_occurred", "station_id", "occurred_at"),
+        sa.Index("ix_events_step_occurred", "item_step_id", "occurred_at"),
+    )
