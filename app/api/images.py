@@ -150,4 +150,7 @@ def serve_image(
     response = get_storage().response(_image_key(image.id), image.content_type)
     if response is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "file missing from storage")
+    # An image id names immutable bytes: replacing an icon uploads a new id and
+    # the latest wins. So the browser may cache a given URL forever.
+    response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
     return response
