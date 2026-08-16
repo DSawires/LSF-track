@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
 from app.deps import current_user
-from app.models import Item, Project, RouteTemplate, Stage, User
+from app.models import Item, ItemImage, Project, RouteTemplate, Stage, User
 from app.schemas import ItemCreate, ReleaseRequest, RevisionBumpRequest
 from app.services import reports
 from app.services.release import ReleaseError, bump_revision, release_item
@@ -16,9 +16,25 @@ from app.services.release import ReleaseError, bump_revision, release_item
 router = APIRouter(prefix="/api/items", tags=["items"])
 
 
-def _item_payload(item: Item) -> dict:
+def _icon_urls(db: Session, item_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Latest icon-kind image per item; ordering ascending means later uploads
+    overwrite earlier ones in the dict."""
+    if not item_ids:
+        return {}
+    icons: dict[uuid.UUID, str] = {}
+    for image in db.scalars(
+        sa.select(ItemImage)
+        .where(ItemImage.kind == "icon", ItemImage.item_id.in_(item_ids))
+        .order_by(ItemImage.uploaded_at)
+    ):
+        icons[image.item_id] = f"/api/images/{image.id}"
+    return icons
+
+
+def _item_payload(item: Item, icon_url: str | None = None) -> dict:
     return {
         "id": str(item.id),
+        "icon_url": icon_url,
         "code": item.code,
         "project_id": str(item.project_id),
         "description": item.description,
@@ -60,6 +76,7 @@ def list_items(
     items = list(db.scalars(query))
     released_ids = [item.id for item in items if item.is_released]
     state = reports.item_state(db, released_ids) if released_ids else {}
+    icons = _icon_urls(db, [item.id for item in items])
 
     rows = []
     for item in items:
@@ -75,7 +92,7 @@ def list_items(
                 if p["stage_id"]
             ):
                 continue
-        rows.append({**_item_payload(item), "state": item_state})
+        rows.append({**_item_payload(item, icons.get(item.id)), "state": item_state})
     return {"items": rows}
 
 
@@ -89,7 +106,8 @@ def get_item(
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
     state = reports.item_state(db, [item.id]) if item.is_released else {}
-    return {**_item_payload(item), "state": state.get(str(item.id))}
+    icon = _icon_urls(db, [item.id]).get(item.id)
+    return {**_item_payload(item, icon), "state": state.get(str(item.id))}
 
 
 @router.get("/{item_id}/events")

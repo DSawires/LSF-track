@@ -233,6 +233,8 @@ class ItemImage(Base):
 
     id: Mapped[uuid.UUID] = _pk()
     item_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("items.id"), index=True)
+    # "snag" (a defect photo) or "icon" (the item's thumbnail; latest wins).
+    kind: Mapped[str] = mapped_column(sa.String(16), default="snag", server_default="snag")
     filename: Mapped[str] = mapped_column(sa.String(255))
     content_type: Mapped[str] = mapped_column(sa.String(64))
     size_bytes: Mapped[int] = mapped_column(sa.Integer)

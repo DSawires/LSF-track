@@ -54,10 +54,14 @@ def _image_key(image_id: uuid.UUID) -> str:
     return f"images/{image_id}"
 
 
+_KINDS = {"snag", "icon"}
+
+
 def _image_payload(image: ItemImage) -> dict:
     return {
         "id": str(image.id),
         "item_id": str(image.item_id),
+        "kind": image.kind,
         "content_type": image.content_type,
         "size_bytes": image.size_bytes,
         "filename": image.filename,
@@ -72,11 +76,14 @@ async def upload_image(
     item_id: uuid.UUID,
     file: UploadFile = File(...),
     note: str = Form(default=""),
+    kind: str = Form(default="snag"),
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
     if db.get(Item, item_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
+    if kind not in _KINDS:
+        raise HTTPException(422, f"kind must be one of {sorted(_KINDS)}")
 
     settings = get_settings()
     head = await file.read(16)
@@ -105,6 +112,7 @@ async def upload_image(
     image = ItemImage(
         id=image_id,
         item_id=item_id,
+        kind=kind,
         filename=(file.filename or "photo")[:255],
         content_type=content_type,
         size_bytes=size,

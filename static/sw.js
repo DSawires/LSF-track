@@ -4,7 +4,7 @@
 
 // Bump this on every frontend change you ship: browsers re-check sw.js on each
 // visit, see the new byte, and swap the whole shell cache for the new one.
-const CACHE = "lsf-shell-v4";
+const CACHE = "lsf-shell-v5";
 const SHELL = [
   "/",
   "/static/css/app.css",

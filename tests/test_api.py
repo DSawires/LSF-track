@@ -334,3 +334,36 @@ def test_item_search_and_aging_filters(world, client):
         f"/api/reports/wip?project_id={uuid.uuid4()}"
     ).json()
     assert other_project["stages"] == []
+
+
+def test_icon_kind_surfaces_on_item_list(world, client, tmp_path, monkeypatch):
+    monkeypatch.setenv("LSF_UPLOAD_DIR", str(tmp_path / "uploads"))
+    from app.config import get_settings
+    get_settings.cache_clear()
+
+    factory, _route, item = world
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    snag = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("chip.png", png, "image/png")},
+        data={"kind": "snag"},
+    )
+    icon = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("front.png", png, "image/png")},
+        data={"kind": "icon"},
+    )
+    assert snag.json()["kind"] == "snag"
+    assert icon.status_code == 201
+
+    listed = next(i for i in client.get("/api/items").json()["items"] if i["code"] == "API-1")
+    assert listed["icon_url"] == icon.json()["url"]  # icon, not the snag
+
+    bad = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("x.png", png, "image/png")},
+        data={"kind": "banner"},
+    )
+    assert bad.status_code == 422
+    get_settings.cache_clear()

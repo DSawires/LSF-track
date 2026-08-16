@@ -358,11 +358,17 @@ function itemRow(item) {
 
   return `
     <a href="#/items/${item.id}">
-      <div class="spread">
-        <strong>${esc(item.code)}</strong>
-        <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+      <div style="display:flex;gap:10px;align-items:flex-start">
+        ${item.icon_url ? `<img src="${item.icon_url}" alt="" loading="lazy"
+          style="width:44px;height:44px;object-fit:cover;border-radius:8px;border:1px solid var(--line);flex:none">` : ""}
+        <div style="flex:1;min-width:0">
+          <div class="spread">
+            <strong>${esc(item.code)}</strong>
+            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+          </div>
+          <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
+        </div>
       </div>
-      <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
       ${lines || `<span class="badge">not started</span>`}
       ${completed ? `
       <div class="spread" style="padding:3px 0 3px 10px;border-left:2px solid var(--good)">
@@ -427,11 +433,17 @@ function viewLogScreen(itemId) {
 
   $view.innerHTML = `
     <div class="card">
-      <div class="spread">
-        <h2>${esc(item.code)}</h2>
-        <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+      <div style="display:flex;gap:12px;align-items:center">
+        ${item.icon_url ? `<img src="${item.icon_url}" alt=""
+          style="width:52px;height:52px;object-fit:cover;border-radius:10px;border:1px solid var(--line);flex:none">` : ""}
+        <div style="flex:1;min-width:0">
+          <div class="spread">
+            <h2>${esc(item.code)}</h2>
+            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+          </div>
+          <div class="muted">${esc(item.description)}</div>
+        </div>
       </div>
-      <div class="muted">${esc(item.description)}</div>
     </div>
 
     <div class="card">
@@ -489,10 +501,16 @@ function viewLogScreen(itemId) {
       <h2>Photos <span class="muted" id="photo-count"></span></h2>
       <div id="photos" class="muted">Loading…</div>
       <div style="height:8px"></div>
-      <label class="ghost" style="display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
-        ${S.online ? "Add photo" : "Photos need a connection"}
-        <input type="file" id="photo-file" accept="image/*" capture="environment" hidden ${S.online ? "" : "disabled"}>
-      </label>
+      <div style="display:flex;gap:8px">
+        <label class="ghost" style="flex:1;display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
+          ${S.online ? "Add snag photo" : "Photos need a connection"}
+          <input type="file" id="photo-file" accept="image/*" capture="environment" hidden ${S.online ? "" : "disabled"}>
+        </label>
+        <label class="ghost" style="flex:1;display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
+          Set item icon
+          <input type="file" id="icon-file" accept="image/*" hidden ${S.online ? "" : "disabled"}>
+        </label>
+      </div>
     </div>
 
     <div class="card">
@@ -557,25 +575,35 @@ function viewLogScreen(itemId) {
     rerender();
   };
 
-  const photoInput = document.getElementById("photo-file");
-  photoInput.onchange = async () => {
-    const file = photoInput.files[0];
-    if (!file) return;
-    const form = new FormData();
-    form.append("file", file);
-    try {
-      const response = await fetch(`/api/items/${item.id}/images`, {
-        method: "POST", body: form, credentials: "same-origin",
-      });
-      if (!response.ok) throw new Error();
-      toast("Photo added");
-      loadPhotos(item);
-    } catch {
-      toast("Upload failed");
-    } finally {
-      photoInput.value = "";
-    }
+  const wireUpload = (inputId, kind, doneMessage, refreshList) => {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    input.onchange = async () => {
+      const file = input.files[0];
+      if (!file) return;
+      const form = new FormData();
+      form.append("file", file);
+      form.append("kind", kind);
+      try {
+        const response = await fetch(`/api/items/${item.id}/images`, {
+          method: "POST", body: form, credentials: "same-origin",
+        });
+        if (!response.ok) throw new Error();
+        toast(doneMessage);
+        if (refreshList) {
+          await sync(); // pulls the new icon_url into S.items, re-renders
+        } else {
+          loadPhotos(item);
+        }
+      } catch {
+        toast("Upload failed");
+      } finally {
+        input.value = "";
+      }
+    };
   };
+  wireUpload("photo-file", "snag", "Snag photo added", false);
+  wireUpload("icon-file", "icon", "Item icon set", true);
 
   loadRecent(item);
   loadPhotos(item);
@@ -618,9 +646,10 @@ async function loadPhotos(item) {
     target.innerHTML = images.length
       ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
           ${images.map((img) => `
-            <a href="${img.url}" target="_blank" rel="noopener">
+            <a href="${img.url}" target="_blank" rel="noopener" style="position:relative;display:block">
               <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy"
                    style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;border:1px solid var(--line)">
+              ${img.kind === "icon" ? `<span class="badge" style="position:absolute;top:4px;left:4px;background:rgba(0,0,0,.55)">icon</span>` : ""}
             </a>`).join("")}
          </div>`
       : `<span class="muted">No photos yet.</span>`;
