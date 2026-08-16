@@ -76,15 +76,18 @@ def cmd_bootstrap(_args) -> None:
     from app.models import User
     from app.security import hash_password
 
-    username = os.environ.get("LSF_ADMIN_USERNAME", "").strip().lower()
+    import secrets
+
+    username = os.environ.get("LSF_ADMIN_USERNAME", "admin").strip().lower()
     password = os.environ.get("LSF_ADMIN_PASSWORD", "")
-    if not username or not password:
-        print("bootstrap: LSF_ADMIN_USERNAME/LSF_ADMIN_PASSWORD not set; nothing to do")
-        return
     with get_sessionmaker()() as db:
         if db.scalars(sa.select(User).where(User.username == username)).first():
             print(f"bootstrap: {username} already exists")
             return
+        generated = not password
+        if generated:
+            # Never default to a guessable password: mint one and say it once.
+            password = secrets.token_urlsafe(12)
         db.add(
             User(
                 username=username,
@@ -94,7 +97,15 @@ def cmd_bootstrap(_args) -> None:
             )
         )
         db.commit()
-    print(f"bootstrap: created admin {username}")
+    if generated:
+        print("=" * 62)
+        print(f"bootstrap: created admin '{username}' with a GENERATED password:")
+        print(f"bootstrap:     {password}")
+        print("bootstrap: shown only this once. Sign in and note it down, or")
+        print("bootstrap: set LSF_ADMIN_PASSWORD before first boot next time.")
+        print("=" * 62)
+    else:
+        print(f"bootstrap: created admin {username}")
 
 
 def cmd_demo(_args) -> None:

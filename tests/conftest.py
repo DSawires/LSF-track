@@ -33,6 +33,35 @@ from seeds.seed import run as run_seed  # noqa: E402
 
 
 @pytest.fixture()
+def client(factory):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    factory.db.commit()
+    with TestClient(app) as test_client:
+        test_client.post("/api/auth/login", json={"username": "test", "password": "pw"})
+        yield test_client
+
+
+@pytest.fixture()
+def world(factory):
+    route = factory.route("api-route", ["carpentry", "paint", "packing"])
+    item = factory.item("API-1", 50, route)
+    factory.db.commit()
+    return factory, route, item
+
+
+@pytest.fixture(autouse=True)
+def _clean_throttle():
+    from app.throttle import login_throttle
+
+    login_throttle.reset()
+    yield
+    login_throttle.reset()
+
+
+@pytest.fixture()
 def db(tmp_path):
     # File-backed rather than :memory:, because the API tests hit the app through
     # TestClient and FastAPI runs sync endpoints in worker threads -- an in-memory

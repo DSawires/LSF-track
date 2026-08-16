@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import auth, events, items, office, reference, reports
+from app.config import get_settings
 
 app = FastAPI(title="LSF Track", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
@@ -18,6 +19,25 @@ app.include_router(events.router)
 app.include_router(reports.router)
 
 _STATIC = Path(__file__).resolve().parent.parent / "static"
+
+_CSP = (
+    "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Content-Security-Policy", _CSP)
+    if get_settings().secure_cookies:
+        # Only meaningful once TLS is actually in front; harmless before then.
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
 
 
 @app.get("/health")

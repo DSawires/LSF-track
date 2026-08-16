@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=256)
 
 
 class EventCreate(BaseModel):
@@ -27,14 +27,16 @@ class EventCreate(BaseModel):
     state_id: uuid.UUID | None = None
     qty: int = 0
     reason_code_id: uuid.UUID | None = None
-    note: str | None = None
+    note: str | None = Field(default=None, max_length=2000)
     supersedes_event_id: uuid.UUID | None = None
     # Who logged it on the floor, which is not always who is syncing it now.
     user_id: uuid.UUID | None = None
 
 
 class EventBatch(BaseModel):
-    events: list[EventCreate] = Field(default_factory=list)
+    # A phone that has been offline all day drains a few dozen entries; 500 is
+    # far beyond any honest queue and small enough to bound request cost.
+    events: list[EventCreate] = Field(default_factory=list, max_length=500)
 
 
 class ItemCreate(BaseModel):

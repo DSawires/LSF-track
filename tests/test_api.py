@@ -14,22 +14,6 @@ from app.models import Event, RouteTemplate
 from tests.conftest import hours_ago
 
 
-@pytest.fixture()
-def client(factory):
-    factory.db.commit()
-    with TestClient(app) as test_client:
-        test_client.post("/api/auth/login", json={"username": "test", "password": "pw"})
-        yield test_client
-
-
-@pytest.fixture()
-def world(factory):
-    route = factory.route("api-route", ["carpentry", "paint", "packing"])
-    item = factory.item("API-1", 50, route)
-    factory.db.commit()
-    return factory, route, item
-
-
 def _event_body(factory, item, seq, state_code, qty, station_code=None, **extra):
     step = next(s for s in item.steps if s.seq == seq)
     return {

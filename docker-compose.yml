@@ -2,9 +2,21 @@
 #
 #     docker compose up
 #
-# then open http://localhost:8000 and sign in with LSF_ADMIN_USERNAME /
-# LSF_ADMIN_PASSWORD (default admin / admin — override them in a `.env` file
-# next to this compose file, along with a real LSF_SECRET_KEY).
+# Boot logs print a generated admin password on first start (or set
+# LSF_ADMIN_PASSWORD in a `.env` file next to this compose file).
+#
+# Public deployment (EC2 etc.):
+#   1. Point a DNS record at the instance; open ports 80 and 443 only.
+#   2. In `.env`, set:
+#        LSF_DOMAIN=track.example.com     # Caddy then gets TLS from Let's Encrypt
+#        LSF_SECURE_COOKIES=true
+#        LSF_SECRET_KEY=<python -c "import secrets; print(secrets.token_urlsafe(48))">
+#        LSF_ADMIN_PASSWORD=<a real one>
+#        POSTGRES_PASSWORD=<a real one>
+#   3. docker compose up -d
+#
+# Without LSF_DOMAIN the proxy serves plain HTTP on port 80 — fine for a LAN or
+# a first look, not for the public internet.
 #
 # Set LSF_DEMO=true for a throwaway instance pre-loaded with sample data.
 
@@ -29,18 +41,34 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # Only the proxy can reach the app (no published ports), so trusting
+    # X-Forwarded-For here is safe and gives the login throttle real client IPs.
+    command: ["--proxy-headers", "--forwarded-allow-ips", "*"]
     environment:
       LSF_DATABASE_URL: postgresql+psycopg://lsf:${POSTGRES_PASSWORD:-lsf}@db:5432/lsf_track
-      LSF_SECRET_KEY: ${LSF_SECRET_KEY:-dev-only-change-me}
-      # The compose stack serves plain HTTP; put TLS termination (Caddy, nginx,
-      # Tailscale) in front for the factory and set this to "true".
-      LSF_SECURE_COOKIES: "false"
+      # Empty means an ephemeral random key: secure, but sessions reset on
+      # restart. Set a stable key for real use. Placeholder values are refused.
+      LSF_SECRET_KEY: ${LSF_SECRET_KEY:-}
+      LSF_SECURE_COOKIES: ${LSF_SECURE_COOKIES:-false}
       LSF_ADMIN_USERNAME: ${LSF_ADMIN_USERNAME:-admin}
-      LSF_ADMIN_PASSWORD: ${LSF_ADMIN_PASSWORD:-admin}
+      LSF_ADMIN_PASSWORD: ${LSF_ADMIN_PASSWORD:-}
       LSF_DEMO: ${LSF_DEMO:-false}
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2-alpine
+    # With a real domain Caddy redirects HTTP->HTTPS and manages certificates
+    # itself; ":80" serves plain HTTP.
+    command: caddy reverse-proxy --from "${LSF_DOMAIN:-:80}" --to app:8000
     ports:
-      - "${LSF_PORT:-8000}:8000"
+      - "${LSF_HTTP_PORT:-80}:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+    depends_on:
+      - app
     restart: unless-stopped
 
 volumes:
   pgdata:
+  caddy_data:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -9,6 +9,7 @@ from app.deps import clear_session, current_user, issue_session
 from app.models import User
 from app.schemas import LoginRequest
 from app.security import verify_password
+from app.throttle import login_throttle
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -23,12 +24,31 @@ def _user_payload(user: User) -> dict:
 
 
 @router.post("/login")
-def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)) -> dict:
-    user = db.scalars(
-        sa.select(User).where(User.username == payload.username.strip().lower())
-    ).first()
+def login(
+    payload: LoginRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
+    username = payload.username.strip().lower()
+    # Real client IP relies on uvicorn's --proxy-headers when behind the compose
+    # proxy; the app port is not published, so the header can't be spoofed from
+    # outside.
+    ip = request.client.host if request.client else "unknown"
+
+    wait = login_throttle.retry_after(username, ip)
+    if wait:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"too many attempts; retry in {wait}s",
+            headers={"Retry-After": str(wait)},
+        )
+
+    user = db.scalars(sa.select(User).where(User.username == username)).first()
     if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
+        login_throttle.record_failure(username, ip)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong username or password")
+    login_throttle.record_success(username)
     issue_session(response, user)
     return {"user": _user_payload(user)}
 
