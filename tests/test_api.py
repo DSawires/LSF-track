@@ -367,3 +367,45 @@ def test_icon_kind_surfaces_on_item_list(world, client, tmp_path, monkeypatch):
     )
     assert bad.status_code == 422
     get_settings.cache_clear()
+
+
+def test_remove_item_archives_with_history_deletes_without(world, client):
+    factory, _route, item = world
+    client.post("/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1"))
+
+    # API-1 has events: archived, not deleted; disappears from lists and reports.
+    result = client.delete(f"/api/items/{item.id}")
+    assert result.json() == {"archived": True, "deleted": False}
+    assert client.get("/api/items").json()["items"] == []
+    assert client.get("/api/reports/wip").json()["stages"] == []
+    archived = client.get("/api/items?include_archived=true").json()["items"]
+    assert [i["is_active"] for i in archived] == [False]
+
+    # A never-logged item is hard-deleted.
+    fresh = client.post(
+        "/api/items",
+        json={
+            "code": "FRESH-1", "project_id": str(factory.project.id),
+            "description": "no events", "total_qty": 5, "drawing_revision": "A",
+        },
+    ).json()
+    assert client.delete(f"/api/items/{fresh['id']}").json()["deleted"] is True
+    assert client.get("/api/items?include_archived=true").json()["items"][0]["code"] == "API-1"
+
+
+def test_remove_project_refused_until_items_gone(world, client):
+    factory, _route, item = world
+    refused = client.delete(f"/api/projects/{factory.project.id}")
+    assert refused.status_code == 409
+
+    client.delete(f"/api/items/{item.id}")  # archives it
+    archived = client.delete(f"/api/projects/{factory.project.id}")
+    assert archived.json() == {"archived": True}
+
+
+def test_unpublish_route_version(world, client):
+    factory, route, _item = world
+    result = client.delete(f"/api/routes/{route.id}")
+    assert result.json() == {"unpublished": True}
+    listed = client.get("/api/reference").json()["route_templates"]
+    assert [t["is_published"] for t in listed if t["id"] == str(route.id)] == [False]

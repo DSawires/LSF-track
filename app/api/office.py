@@ -12,9 +12,11 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+import uuid
+
 from app.db import get_db
-from app.deps import current_user
-from app.models import Project, RouteTemplate, RouteTemplateStep, Stage, User
+from app.deps import current_user, require_admin
+from app.models import Item, Project, RouteTemplate, RouteTemplateStep, Stage, User
 from app.schemas import ProjectCreate, RouteTemplateCreate
 
 router = APIRouter(prefix="/api", tags=["office"])
@@ -41,6 +43,46 @@ def create_project(
         "client": project.client,
         "is_active": project.is_active,
     }
+
+
+@router.delete("/projects/{project_id}")
+def archive_project(
+    project_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown project")
+    active_items = db.scalar(
+        sa.select(sa.func.count())
+        .select_from(Item)
+        .where(Item.project_id == project_id, Item.is_active.is_(True))
+    )
+    if active_items:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"project has {active_items} active item(s); remove or archive them first",
+        )
+    project.is_active = False
+    db.flush()
+    return {"archived": True}
+
+
+@router.delete("/routes/{route_template_id}")
+def unpublish_route(
+    route_template_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Unpublishing hides a route version from the release picker. Items already
+    released against it are untouched -- their steps are a snapshot."""
+    template = db.get(RouteTemplate, route_template_id)
+    if template is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown route template")
+    template.is_published = False
+    db.flush()
+    return {"unpublished": True}
 
 
 @router.post("/routes", status_code=status.HTTP_201_CREATED)

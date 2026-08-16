@@ -7,8 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
-from app.deps import current_user
-from app.models import Item, ItemImage, Project, RouteTemplate, Stage, User
+from app.deps import current_user, require_admin
+from app.models import Event, Item, ItemImage, ItemStep, Project, RouteTemplate, Stage, User
 from app.schemas import ItemCreate, ReleaseRequest, RevisionBumpRequest
 from app.services import reports
 from app.services.release import ReleaseError, bump_revision, release_item
@@ -35,6 +35,7 @@ def _item_payload(item: Item, icon_url: str | None = None) -> dict:
     return {
         "id": str(item.id),
         "icon_url": icon_url,
+        "is_active": item.is_active,
         "code": item.code,
         "project_id": str(item.project_id),
         "description": item.description,
@@ -61,8 +62,11 @@ def list_items(
     stage_id: uuid.UUID | None = None,
     released: bool | None = None,
     q: str | None = None,
+    include_archived: bool = False,
 ) -> dict:
     query = sa.select(Item).options(selectinload(Item.steps)).order_by(Item.code)
+    if not include_archived:
+        query = query.where(Item.is_active.is_(True))
     if project_id is not None:
         query = query.where(Item.project_id == project_id)
     if q:
@@ -187,6 +191,46 @@ def release(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     db.refresh(item)
     return _item_payload(item)
+
+
+@router.delete("/{item_id}")
+def remove_item(
+    item_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Archive an item with history; hard-delete one that never saw the floor.
+
+    The event log is append-only, so an item that has events is never destroyed
+    -- it is deactivated, which removes it from every list and report while its
+    history stays intact and derivable.
+    """
+    item = db.get(Item, item_id)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
+
+    has_events = (
+        db.scalar(
+            sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item_id)
+        )
+        > 0
+    )
+    if has_events:
+        item.is_active = False
+        db.flush()
+        return {"archived": True, "deleted": False}
+
+    from app.storage import get_storage
+
+    storage = get_storage()
+    for image in db.scalars(sa.select(ItemImage).where(ItemImage.item_id == item_id)):
+        storage.delete(f"images/{image.id}")
+        db.delete(image)
+    for step in db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item_id)):
+        db.delete(step)
+    db.delete(item)
+    db.flush()
+    return {"archived": False, "deleted": True}
 
 
 @router.post("/{item_id}/revision")

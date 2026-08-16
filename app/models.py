@@ -183,6 +183,9 @@ class Item(Base):
     code: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True)
     project_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("projects.id"), index=True)
     description: Mapped[str] = mapped_column(sa.String(255))
+    # Archived items keep their history (the log is append-only) but disappear
+    # from lists and reports. Only an item with no events may be hard-deleted.
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True, server_default=sa.true())
     total_qty: Mapped[int] = mapped_column(sa.Integer)
     drawing_revision: Mapped[str] = mapped_column(sa.String(32))
     target_release_date: Mapped[date | None] = mapped_column(sa.Date, nullable=True)

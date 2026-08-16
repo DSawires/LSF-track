@@ -400,14 +400,20 @@ function viewLogScreen(itemId) {
   if (!logSel.typeId || !movableTypes.some((t) => t.id === logSel.typeId)) {
     logSel.typeId = defaultType?.id;
   }
-  if (!steps.some((s) => s.id === logSel.stepId)) {
+  const type = movableTypes.find((t) => t.id === logSel.typeId);
+
+  // The track constrains the picker: only steps where units rest, plus the
+  // immediate next step, are offered. Rework may target any step at or before
+  // the furthest units. Free jumps down the route would negate the route.
+  const allowed = allowedStepIds(item, steps, states, !!type?.is_rework);
+  const shownSteps = steps.filter((s) => allowed.has(s.id));
+  if (!shownSteps.some((s) => s.id === logSel.stepId)) {
     const target = defaultTarget(item, steps, states);
-    logSel.stepId = target.stepId;
+    logSel.stepId = allowed.has(target.stepId) ? target.stepId : shownSteps[0]?.id;
     logSel.stateId = target.stateId;
   }
   if (!states.some((s) => s.id === logSel.stateId)) logSel.stateId = states[0]?.id;
 
-  const type = movableTypes.find((t) => t.id === logSel.typeId);
   const step = steps.find((s) => s.id === logSel.stepId);
   const stage = step ? stageById(step.stage_id) : null;
   const stations = stage
@@ -455,7 +461,7 @@ function viewLogScreen(itemId) {
 
       <label>Stage</label>
       <div class="seg" id="seg-step">
-        ${steps.map((s) => {
+        ${shownSteps.map((s) => {
           const st = stageById(s.stage_id);
           return `<button data-id="${s.id}" class="${s.id === logSel.stepId ? "on" : ""}">${esc(st?.name || "?")}</button>`;
         }).join("")}
@@ -501,16 +507,10 @@ function viewLogScreen(itemId) {
       <h2>Photos <span class="muted" id="photo-count"></span></h2>
       <div id="photos" class="muted">Loading…</div>
       <div style="height:8px"></div>
-      <div style="display:flex;gap:8px">
-        <label class="ghost" style="flex:1;display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
-          ${S.online ? "Add snag photo" : "Photos need a connection"}
-          <input type="file" id="photo-file" accept="image/*" capture="environment" hidden ${S.online ? "" : "disabled"}>
-        </label>
-        <label class="ghost" style="flex:1;display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
-          Set item icon
-          <input type="file" id="icon-file" accept="image/*" hidden ${S.online ? "" : "disabled"}>
-        </label>
-      </div>
+      <label class="ghost" style="display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
+        ${S.online ? "Add snag photo" : "Photos need a connection"}
+        <input type="file" id="photo-file" accept="image/*" capture="environment" hidden ${S.online ? "" : "disabled"}>
+      </label>
     </div>
 
     <div class="card">
@@ -603,7 +603,6 @@ function viewLogScreen(itemId) {
     };
   };
   wireUpload("photo-file", "snag", "Snag photo added", false);
-  wireUpload("icon-file", "icon", "Item icon set", true);
 
   loadRecent(item);
   loadPhotos(item);
@@ -615,6 +614,35 @@ function wireSeg(id, onPick) {
   seg.querySelectorAll("button").forEach((b) => {
     b.onclick = () => onPick(b.dataset.id);
   });
+}
+
+/* Which steps the picker may offer, derived from where quantity actually is.
+   A normal move targets an occupied step or the one right after it; rework may
+   return to any step at or before the furthest units. */
+function allowedStepIds(item, steps, states, isRework) {
+  const occupied = new Set();
+  let furthest = -1;
+  let hasUnstarted = false;
+  for (const p of item.state?.positions || []) {
+    if (p.qty <= 0) continue;
+    if (p.is_unstarted) { hasUnstarted = true; continue; }
+    const index = steps.findIndex((s) => s.id === p.item_step_id);
+    if (index < 0) continue;
+    occupied.add(index);
+    furthest = Math.max(furthest, index);
+  }
+  const allowed = new Set();
+  if (isRework) {
+    for (let i = 0; i <= furthest; i++) allowed.add(i);
+  } else {
+    if (hasUnstarted) allowed.add(0);
+    for (const index of occupied) {
+      allowed.add(index);
+      if (index + 1 < steps.length) allowed.add(index + 1);
+    }
+  }
+  if (!allowed.size && steps.length) allowed.add(0);
+  return new Set([...allowed].map((i) => steps[i].id));
 }
 
 /* The natural next entry: one position past wherever the oldest quantity is
@@ -819,7 +847,7 @@ function viewOffice() {
       <div class="field-grid">
         <div><label>Code</label><input id="ni-code" autocapitalize="characters"></div>
         <div><label>Project</label>
-          <select id="ni-project">${projects.map((p) => `<option value="${p.id}">${esc(p.code)}</option>`).join("")}</select>
+          <select id="ni-project">${projects.filter((p) => p.is_active !== false).map((p) => `<option value="${p.id}">${esc(p.code)}</option>`).join("")}</select>
         </div>
       </div>
       <label>Description</label><input id="ni-desc">
@@ -891,7 +919,19 @@ function viewOffice() {
             <div data-dist-for="${item.id}" style="margin-top:6px"></div>
           </details>
         </div>`).join("") || `<p class="muted">Nothing waiting.</p>`}
-    </div>`;
+    </div>
+
+    ${S.user?.is_admin ? `
+    <div class="card">
+      <h2>Manage</h2>
+      <p class="muted" style="margin-bottom:8px">Removal keeps history: an item with logged events is archived (hidden everywhere), never destroyed. Projects archive once their items are gone; routes are unpublished, leaving released items untouched.</p>
+      <label>Items</label>
+      <div id="mg-items" class="muted">Loading…</div>
+      <label>Projects</label>
+      <div id="mg-projects"></div>
+      <label>Route versions</label>
+      <div id="mg-routes"></div>
+    </div>` : ""}`;
 
   document.getElementById("ni-go").onclick = async () => {
     const err = document.getElementById("ni-err");
@@ -1017,6 +1057,8 @@ function viewOffice() {
     select.addEventListener("change", () => renderDistribution(itemId));
   });
 
+  if (S.user?.is_admin) loadManage();
+
   $view.querySelectorAll("[data-release]").forEach((button) => {
     button.onclick = async () => {
       const itemId = button.dataset.release;
@@ -1048,6 +1090,72 @@ function viewOffice() {
       }
     };
   });
+}
+
+/* Admin management lists: items (incl. archived), projects, route versions,
+   each with a Remove action. The server decides archive vs delete. */
+async function loadManage() {
+  const $items = document.getElementById("mg-items");
+  if (!$items) return;
+
+  const row = (label, sub, attr, id, action = "Remove") => `
+    <div class="spread" style="padding:6px 0;border-bottom:1px solid var(--line)">
+      <span style="min-width:0">${label}${sub ? `<br><span class="muted">${sub}</span>` : ""}</span>
+      <button class="ghost" ${attr}="${id}" style="flex:none">${action}</button>
+    </div>`;
+
+  try {
+    const { items } = await api("/api/items?include_archived=true");
+    if (!$items.isConnected) return;
+    $items.innerHTML = items.map((item) => row(
+      esc(item.code),
+      `${esc(item.description)} · ${!item.is_active ? "archived" : item.is_released ? "released" : "not released"}`,
+      "data-rm-item", item.id, item.is_active ? "Remove" : "Archived",
+    )).join("") || `<span class="muted">No items.</span>`;
+  } catch {
+    $items.textContent = "Management needs a connection.";
+    return;
+  }
+
+  const projects = S.ref?.projects || [];
+  document.getElementById("mg-projects").innerHTML = projects.map((p) => row(
+    esc(p.code), p.is_active ? esc(p.name) : `${esc(p.name)} · archived`,
+    "data-rm-project", p.id, p.is_active ? "Remove" : "Archived",
+  )).join("") || `<span class="muted">No projects.</span>`;
+
+  const routes = (S.ref?.route_templates || []).filter((t) => t.is_published);
+  document.getElementById("mg-routes").innerHTML = routes.map((t) => row(
+    `${esc(t.name)} v${t.version}`, `${t.steps.length} steps`,
+    "data-rm-route", t.id, "Unpublish",
+  )).join("") || `<span class="muted">No published routes.</span>`;
+
+  const wire = (attr, confirmText, request, done) => {
+    document.querySelectorAll(`[${attr}]`).forEach((button) => {
+      if (button.textContent === "Archived") { button.disabled = true; return; }
+      button.onclick = async () => {
+        if (!confirm(confirmText)) return;
+        try {
+          const result = await request(button.getAttribute(attr));
+          toast(done(result));
+          await sync();
+        } catch (error) {
+          alert(error.body?.detail || "Could not remove it.");
+        }
+      };
+    });
+  };
+  wire("data-rm-item",
+    "Remove this item? If it has logged events it is archived with its history; otherwise it is deleted.",
+    (id) => api(`/api/items/${id}`, { method: "DELETE" }),
+    (r) => (r.archived ? "Item archived (history kept)" : "Item deleted"));
+  wire("data-rm-project",
+    "Archive this project? Its items must be removed or archived first.",
+    (id) => api(`/api/projects/${id}`, { method: "DELETE" }),
+    () => "Project archived");
+  wire("data-rm-route",
+    "Unpublish this route version? Items already released keep their route.",
+    (id) => api(`/api/routes/${id}`, { method: "DELETE" }),
+    () => "Route version unpublished");
 }
 
 /* ----------------------------------------------------------------- boot -- */
