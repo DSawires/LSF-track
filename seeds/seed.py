@@ -16,6 +16,7 @@ from app.models import EventState, EventType, ReasonCode, Stage, Station
 STAGES = [
     # code, name, sort, requires_station, requires_external_po, is_terminal
     ("carpentry", "Carpentry", 10, True, False, False),
+    ("lipping", "Lipping", 15, False, False, False),
     ("veneer", "Veneer", 20, True, False, False),
     ("paint", "Paint", 30, True, False, False),
     ("upholstery", "Upholstery", 40, True, False, False),
