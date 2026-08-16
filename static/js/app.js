@@ -827,7 +827,10 @@ function viewOffice() {
         <div><label>Total qty</label><input id="ni-qty" type="number" inputmode="numeric" min="1"></div>
         <div><label>Drawing rev</label><input id="ni-rev" value="A"></div>
       </div>
-      <label>Target release date</label><input id="ni-date" type="date">
+      <div class="field-grid">
+        <div><label>Target release date</label><input id="ni-date" type="date"></div>
+        <div><label>Item icon (photo)</label><input id="ni-icon" type="file" accept="image/*" style="padding:10px"></div>
+      </div>
       <div style="height:12px"></div>
       <button class="primary" id="ni-go" ${S.online ? "" : "disabled"}>Create item</button>
       ${S.online ? "" : `<p class="warn-text">Office tasks need a connection.</p>`}
@@ -894,7 +897,7 @@ function viewOffice() {
     const err = document.getElementById("ni-err");
     err.hidden = true;
     try {
-      await api("/api/items", {
+      const created = await api("/api/items", {
         method: "POST",
         body: JSON.stringify({
           code: document.getElementById("ni-code").value.trim(),
@@ -905,7 +908,20 @@ function viewOffice() {
           target_release_date: document.getElementById("ni-date").value || null,
         }),
       });
-      toast("Item created");
+      const iconFile = document.getElementById("ni-icon").files[0];
+      if (iconFile) {
+        const form = new FormData();
+        form.append("file", iconFile);
+        form.append("kind", "icon");
+        const uploaded = await fetch(`/api/items/${created.id}/images`, {
+          method: "POST", body: form, credentials: "same-origin",
+        });
+        // The item exists either way; a failed icon shouldn't look like a
+        // failed creation.
+        toast(uploaded.ok ? "Item created with icon" : "Item created — icon upload failed");
+      } else {
+        toast("Item created");
+      }
       await sync();
     } catch (error) {
       err.textContent = error.body?.detail?.reason || error.body?.detail || "Could not create the item.";
