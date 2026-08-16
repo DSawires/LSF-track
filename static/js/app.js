@@ -341,11 +341,21 @@ function viewItems() {
 }
 
 function itemRow(item) {
-  const positions = (item.state?.positions || []).filter((p) => !p.is_unstarted);
-  const worst = positions.reduce((max, p) => Math.max(max, p.days_in_state), 0);
+  // One line per sub-batch, mirroring the aging report: a split batch reads as
+  // its positions, not as one blob with badges.
+  const positions = item.state?.positions || [];
+  const completed = item.state?.completed_qty || 0;
   const pending = pendingCountFor(item.id);
-  const badges = positions.slice(0, 4).map((p) =>
-    `<span class="badge qty">${esc(p.stage_name)} ${p.state_code ? esc(stateName(p.state_id)) : ""}: ${p.qty}</span>`).join(" ");
+
+  const lines = positions.map((p) => `
+    <div class="spread" style="padding:3px 0 3px 10px;border-left:2px solid var(--line)">
+      <span class="muted">${p.is_unstarted ? "Not started" : `${esc(p.stage_name)} · ${esc(stateName(p.state_id))}`}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
+      <span style="white-space:nowrap">
+        <span class="badge qty">${p.qty}</span>${p.is_unstarted ? "" : `
+        <span class="badge${p.days_in_state >= 3 ? " age-hot" : ""}">${p.days_in_state.toFixed(1)}d</span>`}
+      </span>
+    </div>`).join("");
+
   return `
     <a href="#/items/${item.id}">
       <div class="spread">
@@ -353,11 +363,13 @@ function itemRow(item) {
         <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
       </div>
       <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
-      <div>
-        ${badges || `<span class="badge">not started</span>`}
-        ${worst >= 3 ? `<span class="badge age-hot">${worst.toFixed(1)}d</span>` : ""}
-        ${pending ? `<span class="badge pending">${pending} pending</span>` : ""}
-      </div>
+      ${lines || `<span class="badge">not started</span>`}
+      ${completed ? `
+      <div class="spread" style="padding:3px 0 3px 10px;border-left:2px solid var(--good)">
+        <span class="muted">Completed</span>
+        <span class="badge qty" style="color:var(--good)">${completed}</span>
+      </div>` : ""}
+      ${pending ? `<div style="margin-top:4px"><span class="badge pending">${pending} pending</span></div>` : ""}
     </a>`;
 }
 
