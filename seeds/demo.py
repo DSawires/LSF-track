@@ -1,6 +1,9 @@
 """A small demo factory: two projects, four items, a week of events.
 
 For trying the app locally. Idempotent: keyed on codes, safe to re-run.
+Refuses to touch a database that already holds real (non-demo) projects, so
+a stray LSF_DEMO=true on a production instance cannot mix sample items --
+or the demo/demo login -- into factory data.
 """
 
 from __future__ import annotations
@@ -30,16 +33,30 @@ from app.services.release import release_item
 from seeds.seed import run as run_seed
 
 
+DEMO_PROJECT_CODES = {"HOTEL-A", "VILLA-B"}
+
+
 def run(db: Session) -> None:
+    existing = {p.code for p in db.scalars(sa.select(Project))}
+    if existing - DEMO_PROJECT_CODES:
+        print(
+            "demo: refusing to load sample data — this database already holds "
+            f"real projects ({', '.join(sorted(existing - DEMO_PROJECT_CODES))}). "
+            "Unset LSF_DEMO."
+        )
+        return
+
     run_seed(db)
 
     user = db.scalars(sa.select(User).where(User.username == "demo")).first()
     if user is None:
+        # A well-known password never gets admin rights: the demo account can
+        # log events and browse, and that is all a demo needs.
         user = User(
             username="demo",
             display_name="Demo Engineer",
             password_hash=hash_password("demo"),
-            is_admin=True,
+            is_admin=False,
         )
         db.add(user)
         db.flush()

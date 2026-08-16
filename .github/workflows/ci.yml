@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  LSF_SECRET_KEY: ci-only-secret-key-long-enough-to-pass-the-check
+  LSF_SECURE_COOKIES: "false"
+
+jobs:
+  # Fast feedback on the dialect the test suite was born on.
+  test-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
+      # The demo path exercises migrations-by-create_all, seeds and a week of
+      # synthetic events end to end.
+      - name: Demo smoke test
+        run: |
+          export LSF_DATABASE_URL=sqlite:///ci-demo.sqlite3
+          python manage.py migrate
+          python manage.py seed
+          python manage.py demo
+
+  # The dialect production actually runs on. SAVEPOINT rollback semantics,
+  # varchar length enforcement, and native UUIDs all differ from SQLite.
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lsf
+          POSTGRES_PASSWORD: lsf
+          POSTGRES_DB: lsf_track
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lsf -d lsf_track"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgresql+psycopg://lsf:lsf@localhost:5432/lsf_track
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      # The migrations must build the schema from empty on the real dialect...
+      - name: Alembic upgrade from empty
+        run: python manage.py migrate
+        env:
+          LSF_DATABASE_URL: ${{ env.DATABASE_URL }}
+      # ...and must agree with the models: any drift fails the build.
+      - name: Alembic check (models vs migrations)
+        run: alembic check
+        env:
+          LSF_DATABASE_URL: ${{ env.DATABASE_URL }}
+      - name: Seed twice (idempotency on the real dialect)
+        run: |
+          python manage.py seed
+          python manage.py seed
+        env:
+          LSF_DATABASE_URL: ${{ env.DATABASE_URL }}
+      - name: Pytest against PostgreSQL
+        run: python -m pytest -q
+        env:
+          LSF_TEST_DATABASE_URL: ${{ env.DATABASE_URL }}

@@ -151,6 +151,19 @@ def test_batch_with_internal_duplicate_stores_once_and_acks_both(world, client):
     assert len(stored) == 2
 
 
+def test_received_at_is_server_set_and_cannot_be_smuggled(world, client):
+    from datetime import datetime, timezone
+
+    factory, _route, item = world
+    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    body["received_at"] = "1999-01-01T00:00:00+00:00"  # ignored: not a schema field
+
+    response = client.post("/api/events", json=body)
+    assert response.status_code == 201
+    received = datetime.fromisoformat(response.json()["event"]["received_at"])
+    assert abs((datetime.now(timezone.utc) - received).total_seconds()) < 60
+
+
 def test_batch_applies_in_occurred_at_order(world, client):
     """A queue assembled out of order (retries, interleaved devices) must not
     reject its own internally-consistent sequence: entries are applied by

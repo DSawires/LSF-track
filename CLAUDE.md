@@ -82,9 +82,14 @@ existing ones without renumbering.
 An item is usually a batch (e.g. 120 identical bedside tables). Events carry a `qty`,
 so a batch can partially advance. Never assume an item moves as an indivisible unit.
 
-Quantity in a given state is derived by summing events. Guard against a batch
-advancing more units than exist at the previous step, and surface that as a
-validation error rather than silently allowing it.
+Quantity in a given state is derived by summing events. A batch advancing more
+units than exist upstream is a **validation error** (422), never silently stored.
+The check simulates the item's whole log in `occurred_at` order with the candidate
+event included, so out-of-order sync is never falsely rejected; a genuine rejection
+is quarantined on the phone with the reason and a Retry button, which is how it
+resolves once a correction voids the conflicting entry or the missing upstream
+event syncs in from another device. Rows that predate the guard still surface as
+`over_advance` anomalies in the exceptions view.
 
 ### 5. Rework is forward motion, not a reversal
 
@@ -131,7 +136,8 @@ Names are indicative; Alembic migrations are authoritative.
 | `reason_code_id` | nullable |
 | `occurred_at` | device time, when it happened on the floor |
 | `received_at` | server time, set on insert |
-| `user_id` | |
+| `user_id` | who saw the work happen (client-claimed, for shared floor phones) |
+| `submitted_by_user_id` | the authenticated session that posted the row; server-set |
 | `note` | nullable, free text, never parsed |
 | `supersedes_event_id` | nullable, for corrections |
 
@@ -159,22 +165,29 @@ connection.
 - The UI always shows pending-event count and last-synced time. If users cannot tell
   whether their entries landed, they stop trusting the system.
 
-## v1 scope
+## Scope
 
-Build only these:
+The shipped product (v1 scope plus additions blessed 2026-08-16):
 
-- Login
-- Item list, filterable by project and stage
-- Event logging: four fields, under fifteen seconds, one-handed on a phone
+- Login, logout, session handling that survives offline shifts
+- Item list, filterable by project and stage, plus free-text search
+- Event logging: pre-selected fields, under fifteen seconds, one-handed on a phone
 - WIP by stage and station, with queue depth
 - Aging report: days in current state, sorted descending
+- Exceptions view: clock drift, late syncs, competing/orphaned corrections and
+  legacy over-advance rows — flags derived from the log, not a third dashboard
+- Office tab: projects, items, versioned routes, release (with mid-production
+  quantity distribution), and admin management of stages/stations
+- Item photos (snag photos + item icons). Online-only by design: the offline
+  guarantee protects the logging path, and multi-megabyte blobs do not belong
+  in its sync queue
 
 ### Explicitly out of scope
 
 Do not build these without being asked, and do not add hooks "for later":
-photo uploads, push notifications, Gantt or timeline views, client portal, cost or
-costing data, accounting integration, supplier portal, dashboards beyond the two
-reports above, role hierarchies beyond user/admin.
+push notifications, Gantt or timeline views, client portal, cost or costing
+data, accounting integration, supplier portal, dashboards beyond the reports
+above, role hierarchies beyond user/admin.
 
 ## Conventions
 
@@ -189,14 +202,29 @@ reports above, role hierarchies beyond user/admin.
 
 ## Adding a new stage (the procedure this design exists to support)
 
-1. Insert a row into `stages` with the appropriate behaviour flags.
-2. Insert `stations` rows if the stage has physical instances.
-3. Create a new version of any affected `route_templates`, with steps renumbered
-   using the gaps.
-4. Nothing else. No deploy, no migration, no code change.
+Performed by an admin in the app: Office tab → "Stages & stations".
+
+1. Add the stage with the appropriate behaviour flags.
+2. Add stations if the stage has physical instances.
+3. Create a new version of any affected route, using the route builder's
+   insertion points to slot the stage between existing steps.
+4. Nothing else. No deploy, no migration, no code change. Items already in
+   production keep the route they were released against.
 
 If a stage cannot be added this way, that is a bug in the design and should be
 fixed rather than patched around.
+
+## Operational constraints worth knowing
+
+- `LSF_SECRET_KEY` is mandatory (no ephemeral fallback): sessions must survive
+  restarts or offline phones cannot drain their queues after a redeploy. The
+  Docker entrypoint generates and persists one if unset.
+- The login throttle is in-memory and per-process: correct at one uvicorn
+  worker (the shipped configuration). Adding `--workers N` needs a shared
+  store for it first.
+- Seeds are insert-if-missing only. They guarantee the vocabulary exists;
+  they never overwrite rows, because stages and flags are runtime data owned
+  by the factory.
 
 ## Glossary
 

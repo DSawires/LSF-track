@@ -288,6 +288,38 @@ def test_aging_uses_oldest_lot_fifo(factory):
     assert 9.9 < row["days_in_state"] < 10.1
 
 
+def test_clock_anomalies_flag_ahead_devices_and_late_syncs(factory):
+    """CLAUDE.md: received_at exists to detect wrong device clocks and late
+    syncs -- flagged, not silently trusted."""
+    from datetime import timedelta
+
+    route = factory.route("r", ["carpentry"])
+    item = factory.item("CLK-1", 5, route)
+
+    # Synced 20 days after it happened: past the 14-day late-sync threshold.
+    factory.log(item, 10, "in_progress", 5, at=days_ago(20), station_code="carpentry_1")
+    # Device clock 3h ahead: within the 7-day hard-reject bound, past the
+    # 1h flag threshold.
+    factory.log(item, 10, "completed", 5, at=utcnow() + timedelta(hours=3), station_code="carpentry_1")
+
+    derivation = derive(factory.db, item_ids=[item.id])
+    codes = [a.code for a in derivation.anomalies]
+    assert "device_clock_ahead" in codes
+    assert "late_sync" in codes
+
+
+def test_far_future_occurred_at_is_rejected(factory):
+    from datetime import timedelta
+
+    route = factory.route("r", ["carpentry"])
+    item = factory.item("CLK-2", 5, route)
+    with pytest.raises(EventRejected, match="future"):
+        factory.log(
+            item, 10, "queued", 5,
+            at=utcnow() + timedelta(days=30), station_code="carpentry_1",
+        )
+
+
 def test_missing_station_is_flagged_only_past_the_queue(factory):
     """The queue in front of a stage's stations is shared, so queued events
     don't need a station; anything past the queue does."""
