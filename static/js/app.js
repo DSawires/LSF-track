@@ -25,6 +25,7 @@ const S = {
 const $view = document.getElementById("view");
 const $pill = document.getElementById("sync-pill");
 const $pillText = document.getElementById("sync-text");
+$pill.onclick = () => { if (!S.needsLogin || S.user) navigate("#/sync"); };
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -32,7 +33,7 @@ const esc = (s) =>
 
 /* ------------------------------------------------------------------ api -- */
 
-async function api(path, options = {}) {
+async function apiResponse(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
@@ -46,56 +47,123 @@ async function api(path, options = {}) {
     const body = await response.json().catch(() => ({}));
     throw Object.assign(new Error("request failed"), { status: response.status, body });
   }
-  return response.json();
+  return response;
 }
+
+async function api(path, options = {}) {
+  return (await apiResponse(path, options)).json();
+}
+
+// A fetch() that never reached a server throws a bare TypeError; errors from
+// apiResponse carry .status (HTTP) or .auth (401). The distinction decides
+// retry-later versus quarantine.
+const isNetworkError = (error) => !error.status && !error.auth;
 
 /* ----------------------------------------------------------------- sync -- */
 
 let syncRunning = false;
+const BATCH_CHUNK = 100; // the server caps a batch at 500; stay well under it
+
+async function drainQueue() {
+  // Loop, because entries can be enqueued *while* a drain is in flight (the
+  // auto-queue second event, or a fast pair of taps) and the syncRunning
+  // guard swallows the sync() call they trigger. Bounded so a server that
+  // rejects nothing but stores nothing can't spin us.
+  for (let round = 0; round < 10; round++) {
+    const queue = (await LSF_DB.queueAll()).filter((q) => q._status === "pending");
+    if (!queue.length) return;
+    const events = queue
+      .slice(0, BATCH_CHUNK)
+      .map(({ _queued_at, _status, _reason, ...event }) => event);
+    let results;
+    try {
+      ({ results } = await api("/api/events/batch", {
+        method: "POST",
+        body: JSON.stringify({ events }),
+      }));
+    } catch (error) {
+      if (error.auth || isNetworkError(error)) throw error;
+      // The server answered but refused the whole batch — one malformed entry
+      // fails request validation for all of them. Post one at a time so a
+      // single poison entry quarantines alone instead of wedging the queue.
+      results = await drainOneByOne(events);
+    }
+    let divergent = 0;
+    for (const result of results) {
+      if (result.status === "stored" || result.status === "duplicate") {
+        await LSF_DB.ack(result.id);
+        if (result.divergent) divergent += 1;
+      } else {
+        await LSF_DB.markRejected(result.id, result.reason || "rejected");
+      }
+    }
+    if (divergent) {
+      toast(`${divergent} ${divergent === 1 ? "entry" : "entries"} already existed with different details`);
+    }
+  }
+}
+
+async function drainOneByOne(events) {
+  const results = [];
+  for (const event of events) {
+    try {
+      const { divergent } = await api("/api/events", {
+        method: "POST",
+        body: JSON.stringify(event),
+      });
+      results.push({ id: event.id, status: "stored", divergent });
+    } catch (error) {
+      if (error.auth || isNetworkError(error)) throw error;
+      results.push({ id: event.id, status: "rejected", reason: rejectReason(error) });
+    }
+  }
+  return results;
+}
+
+function rejectReason(error) {
+  const detail = error.body?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail?.reason) return detail.reason; // EventRejected shape
+  if (Array.isArray(detail) && detail.length) {
+    // Pydantic validation error shape
+    const first = detail[0];
+    return `${(first.loc || []).slice(1).join(".")}: ${first.msg}`.replace(/^: /, "");
+  }
+  return "rejected by server";
+}
 
 async function sync() {
   if (syncRunning) return;
   syncRunning = true;
   try {
-    // Loop, because entries can be enqueued *while* a drain is in flight (the
-    // auto-queue second event, or a fast pair of taps) and the syncRunning
-    // guard swallows the sync() call they trigger. Bounded so a server that
-    // rejects nothing but stores nothing can't spin us.
-    for (let round = 0; round < 5; round++) {
-      const queue = (await LSF_DB.queueAll()).filter((q) => q._status === "pending");
-      if (!queue.length) break;
-      const events = queue.map(({ _queued_at, _status, _reason, ...event }) => event);
-      const { results } = await api("/api/events/batch", {
-        method: "POST",
-        body: JSON.stringify({ events }),
-      });
-      for (const result of results) {
-        if (result.status === "stored" || result.status === "duplicate") {
-          await LSF_DB.ack(result.id);
-        } else {
-          await LSF_DB.markRejected(result.id, result.reason || "rejected");
-        }
+    try {
+      await drainQueue();
+    } catch (error) {
+      if (error.auth) {
+        // Never touch the queue on a 401: the entries outlive the session, and
+        // render() keeps the app usable from cache until the engineer can sign
+        // in again. Nothing here navigates away from the floor.
+      } else {
+        S.online = false; // network failed; queue stays, we try again later
       }
     }
-    // Queue drained (or empty): refresh the offline caches.
-    S.ref = await api("/api/reference");
-    await LSF_DB.put("reference", S.ref);
-    const itemsPayload = await api("/api/items");
-    S.items = itemsPayload.items;
-    await LSF_DB.put("items", S.items);
-    S.lastSync = Date.now();
-    await LSF_DB.put("lastSync", S.lastSync);
-    S.needsLogin = false;
-    S.online = true;
-  } catch (error) {
-    if (error.auth) {
-      // Never touch the queue on a 401. The entries outlive the session.
-      renderPill();
-      if (!location.hash.startsWith("#/login")) navigate("#/login");
-      syncRunning = false;
-      return;
+    // Refresh the offline caches in their own try: a wedged drain must never
+    // freeze reference data, and a failed refresh must never look like a
+    // failed drain.
+    try {
+      S.ref = await api("/api/reference");
+      await LSF_DB.put("reference", S.ref);
+      const itemsPayload = await api("/api/items");
+      S.items = itemsPayload.items;
+      await LSF_DB.put("items", S.items);
+      S.lastSync = Date.now();
+      await LSF_DB.put("lastSync", S.lastSync);
+      S.needsLogin = false;
+      S.online = true;
+    } catch (error) {
+      if (isNetworkError(error)) S.online = false;
+      // A 5xx is not "offline": the server is reachable, leave the flag alone.
     }
-    S.online = false; // network failed; queue stays, we try again later
   } finally {
     syncRunning = false;
   }
@@ -104,19 +172,23 @@ async function sync() {
   render(true); // background refresh; defers if the user is mid-form
 }
 
+/* The pill always shows the pending count AND the last sync together — an
+   engineer with a queue wants to know exactly how long the phone has been out
+   of contact, not one or the other. */
 function renderPill() {
   const pending = S.pending.filter((q) => q._status === "pending").length;
   const rejected = S.pending.filter((q) => q._status === "rejected").length;
   $pill.classList.toggle("offline", !S.online || S.needsLogin);
-  $pill.classList.toggle("pending", pending > 0);
-  let text;
-  if (pending) text = `${pending} pending`;
-  else if (S.lastSync) text = `synced ${timeAgo(S.lastSync)}`;
-  else text = S.online ? "synced" : "offline";
-  if (!S.online) text = `offline · ${text}`;
-  if (S.needsLogin) text = "sign-in needed";
-  if (rejected) text += ` · ${rejected} rejected`;
-  $pillText.textContent = text;
+  $pill.classList.toggle("pending", pending > 0 || rejected > 0);
+  const parts = [];
+  if (pending) parts.push(`${pending} pending`);
+  if (rejected) parts.push(`${rejected} rejected`);
+  if (!S.online) parts.push("offline");
+  else if (S.needsLogin) parts.push("sign-in needed");
+  parts.push(S.lastSync ? `synced ${timeAgo(S.lastSync)}` : "never synced");
+  $pillText.textContent = parts.join(" · ");
+  const banner = document.getElementById("session-banner");
+  if (banner) banner.hidden = !(S.needsLogin && S.user);
 }
 
 function timeAgo(timestamp) {
@@ -129,17 +201,51 @@ function timeAgo(timestamp) {
 
 window.addEventListener("online", () => { S.online = true; sync(); });
 window.addEventListener("offline", () => { S.online = false; renderPill(); });
+document.addEventListener("visibilitychange", () => {
+  // A phone coming out of a pocket shouldn't wait for the 30s tick.
+  if (!document.hidden) sync();
+});
 setInterval(sync, 30000);
 setInterval(renderPill, 60000);
 
 /* -------------------------------------------------------------- logging -- */
 
+function newId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  // Insecure origins don't get crypto.randomUUID; build a v4 by hand rather
+  // than silently failing on the one tap that matters.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function requestBackgroundSync() {
+  // Ask the browser to drain the queue even if the app is closed before
+  // connectivity returns. The 30s interval remains the fallback.
+  if ("serviceWorker" in navigator && "SyncManager" in window) {
+    navigator.serviceWorker.ready
+      .then((registration) => registration.sync.register("lsf-drain"))
+      .catch(() => {});
+  }
+}
+
 async function logEvent(event) {
-  await LSF_DB.enqueue(event);
+  try {
+    await LSF_DB.enqueue(event);
+  } catch {
+    // IndexedDB refused the write (quota, private browsing, corruption). The
+    // one thing worse than an error is pretending the entry was recorded.
+    toast("NOT saved — device storage failed");
+    return false;
+  }
   S.pending = await LSF_DB.queueAll();
   renderPill();
   toast("Logged ✓");
+  requestBackgroundSync();
   sync(); // fire and forget; the queue survives if this fails
+  return true;
 }
 
 function toast(message) {
@@ -204,12 +310,21 @@ function navigate(hash) { location.hash = hash; }
 // Wrapped so the Event object is not mistaken for the `background` flag.
 window.addEventListener("hashchange", () => render());
 
+/* Fields the user has actually typed into since the last deliberate render.
+   A background sync must not clobber them with freshly-rendered defaults. */
+const dirtyFields = new Set();
+$view.addEventListener("input", (e) => { if (e.target.id) dirtyFields.add(e.target.id); });
+
 function render(background = false) {
   const hash = location.hash || "#/items";
   document.getElementById("topbar").hidden = false;
   document.getElementById("tabs").hidden = S.needsLogin && !S.user;
 
-  if (S.needsLogin || (!S.user && !S.ref)) {
+  // Only force the login screen when there is no cached identity to work
+  // with. A session expiring mid-shift must NOT lock an engineer out of an
+  // offline-first app: they keep logging from cache (the banner explains),
+  // and the queue drains after the next successful sign-in.
+  if (!S.user && (S.needsLogin || !S.ref)) {
     if (hash !== "#/login") { navigate("#/login"); return; }
   }
 
@@ -219,16 +334,18 @@ function render(background = false) {
 
   // A background sync re-renders whatever view is open. Don't let that eat a
   // half-typed form: skip the refresh entirely while a field is focused (the
-  // next sync catches up), and carry non-empty field values over regardless.
+  // next sync catches up), and carry user-typed values over regardless.
   const typing = $view.contains(document.activeElement) &&
     /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
   if (background && typing) return;
+  if (!background) dirtyFields.clear();
   const saved = {};
   $view.querySelectorAll("input[id], select[id]").forEach((el) => {
     if (el.value) saved[el.id] = el.value;
   });
 
   if (route === "login") viewLogin();
+  else if (route === "sync") viewSyncStatus();
   else if (route === "items" && arg) viewLogScreen(arg);
   else if (route === "reports") viewReports();
   else if (route === "office") viewOffice();
@@ -236,7 +353,10 @@ function render(background = false) {
 
   for (const [id, value] of Object.entries(saved)) {
     const el = document.getElementById(id);
-    if (el && !el.value) el.value = value;
+    // Restore into empty fields (text inputs with no default), and into any
+    // field the user had edited — even if the fresh render gave it a default,
+    // like the qty box does.
+    if (el && (!el.value || dirtyFields.has(id))) el.value = value;
   }
 }
 
@@ -244,20 +364,27 @@ function render(background = false) {
 
 function viewLogin() {
   document.getElementById("tabs").hidden = true;
+  const pendingCount = S.pending.filter((q) => q._status === "pending").length;
   $view.innerHTML = `
     <div class="login-wrap">
-      <h1>LSF Track</h1>
-      <div class="card">
-        <label>Username</label>
-        <input id="login-user" autocapitalize="none" autocomplete="username">
-        <label>Password</label>
-        <input id="login-pass" type="password" autocomplete="current-password">
+      <h2 style="text-align:center;font-size:22px;margin-bottom:12px">LSF Track</h2>
+      <form class="card" id="login-form">
+        <label for="login-user">Username</label>
+        <input id="login-user" autocapitalize="none" autocomplete="username" enterkeyhint="next" required>
+        <label for="login-pass">Password</label>
+        <input id="login-pass" type="password" autocomplete="current-password" enterkeyhint="go" required>
         <div style="height:14px"></div>
-        <button class="primary" id="login-go">Sign in</button>
-        <p id="login-err" class="warn-text" hidden>Wrong username or password.</p>
-      </div>
+        <button class="primary" id="login-go" type="submit">Sign in</button>
+        <p id="login-err" class="warn-text" role="alert" hidden></p>
+        ${pendingCount ? `<p class="muted" style="margin-top:10px">${pendingCount} queued ${pendingCount === 1 ? "entry is" : "entries are"} safe on this device and will sync after sign-in.</p>` : ""}
+      </form>
     </div>`;
-  document.getElementById("login-go").onclick = async () => {
+  document.getElementById("login-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const err = document.getElementById("login-err");
+    const button = document.getElementById("login-go");
+    err.hidden = true;
+    button.disabled = true;
     try {
       const body = JSON.stringify({
         username: document.getElementById("login-user").value.trim(),
@@ -270,10 +397,93 @@ function viewLogin() {
       document.getElementById("tabs").hidden = false;
       navigate("#/items");
       sync();
-    } catch {
-      document.getElementById("login-err").hidden = false;
+    } catch (error) {
+      // "Wrong password" when the real problem is no signal is an infuriating
+      // dead end on the floor — name the actual failure.
+      if (error.auth) err.textContent = "Wrong username or password.";
+      else if (error.status === 429) err.textContent = error.body?.detail || "Too many attempts — wait a minute and try again.";
+      else if (error.status) err.textContent = "The server had a problem — try again shortly.";
+      else err.textContent = "No connection. Sign-in needs the network; queued entries are safe and will sync later.";
+      err.hidden = false;
+    } finally {
+      button.disabled = false;
     }
   };
+}
+
+/* ---------------------------------------------------------- sync status -- */
+
+/* Tapping the pill lands here: what exactly is pending, what was rejected and
+   why, and the two honest actions for a reject — retry (the false-rejection
+   path: upstream events may have landed since) or discard. */
+function viewSyncStatus() {
+  const pending = S.pending.filter((q) => q._status === "pending");
+  const rejected = S.pending.filter((q) => q._status === "rejected");
+
+  const describe = (q) => {
+    const item = S.items.find((i) => i.id === q.item_id);
+    const step = item?.steps?.find((s) => s.id === q.item_step_id);
+    const stage = step ? stageById(step.stage_id) : null;
+    const type = S.ref?.event_types.find((t) => t.id === q.event_type_id);
+    const what = [
+      type?.name || "entry",
+      stage?.name,
+      q.state_id ? stateName(q.state_id) : "",
+      q.qty ? `${q.qty} pcs` : "",
+    ].filter(Boolean).join(" · ");
+    return { code: item?.code || "unknown item", what, when: new Date(q._queued_at || Date.now()).toLocaleString() };
+  };
+
+  const entryRow = (q, actions) => {
+    const d = describe(q);
+    return `
+      <div style="padding:8px 0;border-bottom:1px solid var(--line)">
+        <div class="spread">
+          <strong>${esc(d.code)}</strong>
+          <span class="muted">${esc(d.when)}</span>
+        </div>
+        <div class="muted">${esc(d.what)}</div>
+        ${q._reason ? `<div class="warn-text" style="margin:4px 0">${esc(q._reason)}</div>` : ""}
+        ${actions ? `
+        <div style="display:flex;gap:8px;margin-top:6px">
+          <button class="ghost" data-retry="${q.id}" style="width:auto;padding:8px 16px">Retry</button>
+          <button class="ghost" data-discard="${q.id}" style="width:auto;padding:8px 16px">Discard</button>
+        </div>` : ""}
+      </div>`;
+  };
+
+  $view.innerHTML = `
+    <div class="card">
+      <h2>Waiting to sync (${pending.length})</h2>
+      ${pending.map((q) => entryRow(q, false)).join("") || `<p class="muted">Nothing waiting — everything has reached the server.</p>`}
+      <p class="muted" style="margin-top:8px">${S.lastSync ? `Last synced ${timeAgo(S.lastSync)}.` : "Never synced from this device."}${S.online ? "" : " Currently offline; entries are safe here until the network returns."}</p>
+    </div>
+
+    ${rejected.length ? `
+    <div class="card">
+      <h2>Rejected by the server (${rejected.length})</h2>
+      <p class="muted" style="margin-bottom:6px">These did not go in. Retry if the situation has changed (e.g. the missing upstream entry has since synced); discard if the entry was a mistake.</p>
+      ${rejected.map((q) => entryRow(q, true)).join("")}
+    </div>` : ""}`;
+
+  $view.querySelectorAll("[data-retry]").forEach((button) => {
+    button.onclick = async () => {
+      await LSF_DB.markPending(button.dataset.retry);
+      S.pending = await LSF_DB.queueAll();
+      renderPill();
+      render();
+      sync();
+    };
+  });
+  $view.querySelectorAll("[data-discard]").forEach((button) => {
+    button.onclick = async () => {
+      if (!confirm("Discard this entry? It was never stored on the server and will be gone for good.")) return;
+      await LSF_DB.dropRejected(button.dataset.discard);
+      S.pending = await LSF_DB.queueAll();
+      renderPill();
+      render();
+    };
+  });
 }
 
 /* ---------------------------------------------------------------- items -- */
@@ -426,6 +636,12 @@ function viewLogScreen(itemId) {
     ? availableUpstream(item, step.id, logSel.stateId, !!type?.is_rework)
     : 0;
   const reasons = (S.ref.reason_codes || []).filter((r) => r.is_active);
+  // Keep the tracked selection valid: a re-render must not silently reset the
+  // reason to the first option, and an empty reason list must never turn into
+  // an empty-string id in the payload.
+  if (type?.requires_reason_code && !reasons.some((r) => r.id === logSel.reasonId)) {
+    logSel.reasonId = reasons[0]?.id || null;
+  }
 
   // Completing a non-final step usually means the units move straight to the
   // next stage's queue; offer to log both in one tap.
@@ -527,6 +743,8 @@ function viewLogScreen(itemId) {
     if (stage) localStorage.setItem(`station:${stage.id}`, id);
     rerender();
   });
+  const $reason = document.getElementById("sel-reason");
+  if ($reason) $reason.onchange = (e) => { logSel.reasonId = e.target.value || null; };
 
   const $qty = document.getElementById("qty");
   const warn = () => {
@@ -537,28 +755,28 @@ function viewLogScreen(itemId) {
   document.getElementById("qty-plus").onclick = () => { $qty.value = Number($qty.value) + 1; warn(); };
 
   document.getElementById("log-go").onclick = async () => {
-    const reasonSelect = document.getElementById("sel-reason");
     const qty = Number($qty.value) || 1;
-    await logEvent({
-      id: crypto.randomUUID(),
+    const logged = await logEvent({
+      id: newId(),
       item_id: item.id,
       item_step_id: logSel.stepId,
       station_id: stage?.requires_station ? logSel.stationId : null,
       event_type_id: logSel.typeId,
       state_id: logSel.stateId,
       qty,
-      reason_code_id: reasonSelect ? reasonSelect.value : null,
+      reason_code_id: type?.requires_reason_code ? logSel.reasonId : null,
       occurred_at: new Date().toISOString(),
       note: null,
       supersedes_event_id: null,
       user_id: S.user?.id || null,
     });
+    if (!logged) return;
     // One tap, two facts: done here, queued there. The +1ms keeps the replay
     // order deterministic so the queue event always pulls the units the
     // completion just produced.
     if (offerAutoQueue && document.getElementById("auto-queue")?.checked) {
       await logEvent({
-        id: crypto.randomUUID(),
+        id: newId(),
         item_id: item.id,
         item_step_id: nextStep.id,
         station_id: null,
@@ -572,6 +790,7 @@ function viewLogScreen(itemId) {
         user_id: S.user?.id || null,
       });
     }
+    dirtyFields.clear(); // the form resets to fresh defaults after a log
     rerender();
   };
 
@@ -710,7 +929,7 @@ async function loadRecent(item) {
       button.onclick = async () => {
         if (!confirm("Void this entry? A correction event will be logged; history is kept.")) return;
         await logEvent({
-          id: crypto.randomUUID(),
+          id: newId(),
           item_id: item.id,
           item_step_id: null,
           station_id: null,
@@ -742,6 +961,13 @@ async function viewReports() {
 
   $view.innerHTML = `<p class="muted">Loading reports…</p>`;
   let wip, aging, exceptions;
+  let cachedFrom = null; // set when the service worker served last-known data
+  const fetchReport = async (path) => {
+    const response = await apiResponse(path);
+    const marker = response.headers.get("X-LSF-From-Cache");
+    if (marker) cachedFrom = marker;
+    return response.json();
+  };
   try {
     const wipQuery = fProject ? `?project_id=${fProject}` : "";
     const agingParams = new URLSearchParams({ limit: "40" });
@@ -749,19 +975,23 @@ async function viewReports() {
     if (fStage) agingParams.set("stage_id", fStage);
     if (fDays) agingParams.set("min_days", fDays);
     [wip, aging, exceptions] = await Promise.all([
-      api(`/api/reports/wip${wipQuery}`),
-      api(`/api/reports/aging?${agingParams}`),
-      api("/api/reports/exceptions"),
+      fetchReport(`/api/reports/wip${wipQuery}`),
+      fetchReport(`/api/reports/aging?${agingParams}`),
+      fetchReport("/api/reports/exceptions"),
     ]);
   } catch {
     $view.innerHTML = `<p class="muted">Reports need a connection — they are computed from the full log on the server.</p>`;
     return;
   }
+  const staleNote = cachedFrom
+    ? `<p class="warn-text" style="margin-bottom:8px">Offline — showing last-known reports${cachedFrom !== "1" ? ` from ${new Date(cachedFrom).toLocaleString()}` : ""}.</p>`
+    : "";
 
   const maxQty = Math.max(1, ...wip.stages.map((s) => s.total_qty));
   const stateCodes = wip.states.map((s) => s.code);
 
   $view.innerHTML = `
+    ${staleNote}
     <div class="filters">
       <select id="r-project">
         <option value="">All projects</option>
@@ -1163,13 +1393,36 @@ async function loadManage() {
 async function boot() {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
+    // The worker pings after a Background Sync drain so an open page's pill
+    // catches up immediately.
+    navigator.serviceWorker.addEventListener("message", (e) => {
+      if (e.data === "queue-drained") sync();
+    });
   }
-  // Come up from cache first so the app is usable before any network round trip.
-  S.ref = (await LSF_DB.get("reference")) || null;
-  S.items = (await LSF_DB.get("items")) || [];
-  S.user = (await LSF_DB.get("user")) || null;
-  S.lastSync = (await LSF_DB.get("lastSync")) || null;
-  S.pending = await LSF_DB.queueAll();
+  // Unsynced events must not sit in storage the browser considers evictable.
+  if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+
+  try {
+    // Come up from cache first so the app is usable before any network round trip.
+    S.ref = (await LSF_DB.get("reference")) || null;
+    S.items = (await LSF_DB.get("items")) || [];
+    S.user = (await LSF_DB.get("user")) || null;
+    S.lastSync = (await LSF_DB.get("lastSync")) || null;
+    S.pending = await LSF_DB.queueAll();
+  } catch (error) {
+    // IndexedDB refused to open (private browsing, corruption, storage full).
+    // A blank white page tells the engineer nothing; this at least says why
+    // the app can't keep its offline promise on this browser.
+    document.getElementById("topbar").hidden = false;
+    $view.innerHTML = `
+      <div class="card">
+        <h2>Storage unavailable</h2>
+        <p class="muted">This browser blocked the on-device database the app needs for
+        offline logging (private browsing does this). Entries cannot be queued safely —
+        close this tab and open the app in a normal browser window.</p>
+      </div>`;
+    return;
+  }
   renderPill();
   render();
   sync();

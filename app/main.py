@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api import auth, events, images, items, office, reference, reports
@@ -53,10 +55,26 @@ if _STATIC.is_dir():  # pragma: no branch - static ships with the repo
     def index() -> FileResponse:
         return FileResponse(_STATIC / "index.html")
 
+    @lru_cache
+    def _static_hash() -> str:
+        digest = hashlib.sha256()
+        for path in sorted(_STATIC.rglob("*")):
+            if path.is_file():
+                digest.update(str(path.relative_to(_STATIC)).encode())
+                digest.update(path.read_bytes())
+        return digest.hexdigest()[:12]
+
     @app.get("/sw.js", include_in_schema=False)
-    def service_worker() -> FileResponse:
-        # Served from the root so its scope covers the whole app.
-        return FileResponse(_STATIC / "sw.js", media_type="application/javascript")
+    def service_worker() -> Response:
+        # Served from the root so its scope covers the whole app. The shell
+        # cache name carries a hash of static/, so any shipped frontend change
+        # busts every phone's cache without a hand-bumped version constant.
+        source = (_STATIC / "sw.js").read_text(encoding="utf-8")
+        return Response(
+            source.replace("__STATIC_HASH__", _static_hash()),
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
 
     @app.get("/manifest.webmanifest", include_in_schema=False)
     def manifest() -> FileResponse:

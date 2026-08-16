@@ -13,8 +13,13 @@
 <body>
   <header id="topbar" hidden>
     <h1>LSF Track</h1>
-    <div id="sync-pill"><span class="dot"></span><span id="sync-text">…</span></div>
+    <button id="sync-pill" type="button" role="status" aria-live="polite"
+            title="Sync status — tap for details"><span class="dot" aria-hidden="true"></span><span id="sync-text">…</span></button>
   </header>
+
+  <div id="session-banner" hidden>
+    Session expired — logging still works and syncs after you <a href="#/login">sign in</a>.
+  </div>
 
   <main id="view"></main>
 

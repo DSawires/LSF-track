@@ -56,9 +56,21 @@ header h1 { font-size: 17px; font-weight: 650; flex: 1; }
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 999px;
-  padding: 4px 10px;
+  padding: 6px 12px;
   white-space: nowrap;
+  cursor: pointer;
 }
+
+#session-banner {
+  background: #4a3a10;
+  color: #ffd98a;
+  padding: 8px 14px;
+  font-size: 14px;
+  text-align: center;
+  border-bottom: 1px solid var(--line);
+}
+
+#session-banner a { color: inherit; font-weight: 650; }
 
 #sync-pill .dot {
   width: 8px; height: 8px; border-radius: 50%;
