@@ -13,18 +13,18 @@ would put the sync queue's reliability at risk for the sake of a nice-to-have.
 
 from __future__ import annotations
 
+import tempfile
 import uuid
-from pathlib import Path
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
 from app.deps import current_user
 from app.models import Item, ItemImage, User
+from app.storage import get_storage
 
 router = APIRouter(prefix="/api", tags=["images"])
 
@@ -50,10 +50,8 @@ def _sniff(head: bytes) -> str | None:
     return None
 
 
-def _upload_root() -> Path:
-    root = Path(get_settings().upload_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+def _image_key(image_id: uuid.UUID) -> str:
+    return f"images/{image_id}"
 
 
 def _image_payload(image: ItemImage) -> dict:
@@ -87,23 +85,22 @@ async def upload_image(
         raise HTTPException(422, "not a recognised image format")
 
     image_id = uuid.uuid4()
-    destination = _upload_root() / str(image_id)
     size = 0
-    try:
-        with destination.open("wb") as out:
-            out.write(head)
-            size = len(head)
-            while chunk := await file.read(64 * 1024):
-                size += len(chunk)
-                if size > settings.max_upload_bytes:
-                    raise HTTPException(
-                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        f"image exceeds {settings.max_upload_bytes // (1024 * 1024)}MB",
-                    )
-                out.write(chunk)
-    except HTTPException:
-        destination.unlink(missing_ok=True)
-        raise
+    # Spooled locally first so the size cap is enforced before a byte reaches
+    # the storage backend; small photos never touch disk at all.
+    with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as spool:
+        spool.write(head)
+        size = len(head)
+        while chunk := await file.read(64 * 1024):
+            size += len(chunk)
+            if size > settings.max_upload_bytes:
+                raise HTTPException(
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    f"image exceeds {settings.max_upload_bytes // (1024 * 1024)}MB",
+                )
+            spool.write(chunk)
+        spool.seek(0)
+        get_storage().put(_image_key(image_id), spool, content_type)
 
     image = ItemImage(
         id=image_id,
@@ -142,7 +139,7 @@ def serve_image(
     image = db.get(ItemImage, image_id)
     if image is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown image")
-    path = _upload_root() / str(image.id)
-    if not path.is_file():
+    response = get_storage().response(_image_key(image.id), image.content_type)
+    if response is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "file missing from storage")
-    return FileResponse(path, media_type=image.content_type)
+    return response

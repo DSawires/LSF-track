@@ -6,6 +6,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /srv/lsf
 
+# pg_dump matching the postgres:16 service — bookworm's own client is v15,
+# which refuses to dump a newer server, so it comes from the pgdg repo.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-common ca-certificates curl gnupg \
+    && /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y \
+    && apt-get install -y --no-install-recommends postgresql-client-16 \
+    && apt-get purge -y curl gnupg && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 # Dependencies first, so code edits don't bust this layer. The install reads the
 # dependency list straight from pyproject.toml — one source of truth.
 COPY pyproject.toml ./

@@ -38,6 +38,31 @@ factory, put TLS termination (Caddy, nginx, Tailscale) in front and set it
 back to true. Data lives in the `pgdata` volume; `docker compose down -v`
 erases it.
 
+### Photos and backups: S3
+
+Set `LSF_S3_BUCKET` and one private bucket holds both item photos (`images/`)
+and nightly `pg_dump` archives (`backups/`, newest `LSF_BACKUP_KEEP` kept).
+The `backup` service runs daily; run one on demand with
+`docker compose exec backup python manage.py backup`. Restore with
+`gunzip -c dump.sql.gz | psql`. Without a bucket, both land on the local
+`uploads` volume instead — fine for a laptop, not durable for production.
+
+On EC2, skip AWS keys entirely: attach an instance role with
+
+```json
+{"Effect": "Allow",
+ "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+ "Resource": ["arn:aws:s3:::YOUR-BUCKET", "arn:aws:s3:::YOUR-BUCKET/*"]}
+```
+
+and raise the metadata hop limit so containers can reach role credentials
+(the default of 1 silently blocks them):
+
+```sh
+aws ec2 modify-instance-metadata-options --instance-id i-… \
+  --http-put-response-hop-limit 2 --http-tokens required
+```
+
 ## Quickstart (bare, without Docker)
 
 ```sh

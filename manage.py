@@ -80,6 +80,67 @@ def cmd_set_password(args) -> None:
     print(f"password updated for {username}")
 
 
+def cmd_backup(_args) -> None:
+    """pg_dump the database into blob storage (S3 when configured, else disk).
+
+    Dumps land under `backups/` next to the item photos — one bucket for
+    everything. Pruning keeps the newest LSF_BACKUP_KEEP dumps; the timestamped
+    names sort chronologically, so "oldest" is just the front of the list.
+    """
+    import gzip
+    import os
+    import subprocess
+    import tempfile
+    from datetime import datetime, timezone
+    from urllib.parse import unquote, urlparse
+
+    from app.config import get_settings
+    from app.storage import get_storage
+
+    settings = get_settings()
+    url = urlparse(settings.database_url)
+    if not url.scheme.startswith("postgresql"):
+        print(f"backup: {url.scheme} is not backed up by pg_dump; skipping")
+        return
+
+    command = [
+        "pg_dump",
+        "--no-owner",
+        "-h", url.hostname or "localhost",
+        "-p", str(url.port or 5432),
+        "-U", unquote(url.username or "postgres"),
+        "-d", url.path.lstrip("/"),
+    ]
+    env = {**os.environ, "PGPASSWORD": unquote(url.password or "")}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    key = f"backups/lsf-{stamp}.sql.gz"
+
+    with tempfile.TemporaryFile() as spool:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, env=env) as proc:
+            with gzip.GzipFile(fileobj=spool, mode="wb") as gz:
+                while chunk := proc.stdout.read(256 * 1024):
+                    gz.write(chunk)
+        # An empty or failed dump must never overwrite the retention window
+        # with garbage: bail before upload, loudly.
+        if proc.returncode != 0:
+            print(f"backup: pg_dump exited {proc.returncode}; nothing uploaded", file=sys.stderr)
+            sys.exit(1)
+        size = spool.tell()
+        if size < 512:
+            print(f"backup: dump implausibly small ({size} bytes); nothing uploaded", file=sys.stderr)
+            sys.exit(1)
+        spool.seek(0)
+        storage = get_storage()
+        storage.put(key, spool, "application/gzip")
+
+    existing = storage.list("backups/")
+    for old in existing[: -settings.backup_keep] if settings.backup_keep > 0 else []:
+        storage.delete(old)
+    destination = f"s3://{settings.s3_bucket}/{settings.s3_prefix}" if settings.s3_bucket else settings.upload_dir
+    print(f"backup: wrote {key} ({size // 1024}KB) to {destination}; {min(len(existing), settings.backup_keep)} kept")
+
+
 def cmd_bootstrap(_args) -> None:
     """Create the admin named by LSF_ADMIN_USERNAME / LSF_ADMIN_PASSWORD.
 
@@ -155,6 +216,7 @@ def main() -> None:
     p_pass.set_defaults(func=cmd_set_password)
 
     sub.add_parser("bootstrap").set_defaults(func=cmd_bootstrap)
+    sub.add_parser("backup").set_defaults(func=cmd_backup)
     sub.add_parser("demo").set_defaults(func=cmd_demo)
 
     args = parser.parse_args()

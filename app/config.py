@@ -61,6 +61,9 @@ class Settings:
     max_sync_lag_days: int
     upload_dir: str
     max_upload_bytes: int
+    s3_bucket: str
+    s3_prefix: str
+    backup_keep: int
 
     @property
     def session_max_age_seconds(self) -> int:
@@ -80,4 +83,7 @@ def get_settings() -> Settings:
         max_sync_lag_days=_int("LSF_MAX_SYNC_LAG_DAYS", 14),
         upload_dir=os.environ.get("LSF_UPLOAD_DIR", "data/uploads"),
         max_upload_bytes=_int("LSF_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
+        s3_bucket=os.environ.get("LSF_S3_BUCKET", "").strip(),
+        s3_prefix=os.environ.get("LSF_S3_PREFIX", "").strip(),
+        backup_keep=_int("LSF_BACKUP_KEEP", 30),
     )

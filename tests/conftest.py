@@ -54,11 +54,14 @@ def world(factory):
 
 @pytest.fixture(autouse=True)
 def _clean_throttle():
+    from app.storage import get_storage
     from app.throttle import login_throttle
 
     login_throttle.reset()
+    get_storage.cache_clear()
     yield
     login_throttle.reset()
+    get_storage.cache_clear()
 
 
 @pytest.fixture()
