@@ -707,7 +707,7 @@ function viewLogScreen(itemId) {
         <button id="qty-plus">+</button>
       </div>
       <p class="muted" style="margin-top:5px">${available} available at the previous step</p>
-      <p class="warn-text" id="qty-warn" hidden>More than is available upstream — it will be stored and flagged for review.</p>
+      <p class="warn-text" id="qty-warn" hidden>More than is available upstream — the server will reject this entry until the earlier steps are logged. It will wait under the sync pill with a Retry button.</p>
 
       ${offerAutoQueue ? `
       <label style="display:flex;align-items:center;gap:10px;margin-top:14px;font-size:15px;color:var(--text)">

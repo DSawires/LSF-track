@@ -66,9 +66,14 @@ def post_batch(
     Per-event outcomes, never all-or-nothing: one malformed entry must not hold
     the rest of the queue hostage on a flaky connection. The client clears each
     queue entry whose id comes back as stored/duplicate, and quarantines rejects.
+
+    Entries are applied in occurred_at order, not arrival order, so an offline
+    session's own sequence (complete carpentry, then queue at veneer) validates
+    against itself no matter how the queue was assembled. Clients match results
+    by id, so the reordering is invisible to them.
     """
     results = []
-    for entry in payload.events:
+    for entry in sorted(payload.events, key=lambda e: e.occurred_at):
         try:
             result = record_event(db, entry, user)
             results.append(

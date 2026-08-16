@@ -59,9 +59,10 @@ class Position:
 class Anomaly:
     """Something the log says that does not add up.
 
-    These are reported, never enforced: an event that reaches the server is always
-    stored. A validation failure that silently drops an engineer's entry hours after
-    they logged it is worse than a number that needs explaining.
+    New writes that over-advance are rejected at the API (see services.events),
+    but the log can still contain rows that predate that rule, arrived through
+    another path, or conflict only in hindsight after a correction. Replay flags
+    those rather than guessing; history is never rewritten to make them add up.
     """
 
     code: str
@@ -344,6 +345,9 @@ class ItemLedger:
                 )
             )
         return result
+
+    def has_position(self, item_step_id: uuid.UUID | None, state_id: uuid.UUID | None) -> bool:
+        return (item_step_id, state_id) in self._index_by_key
 
     def qty_at(self, item_step_id: uuid.UUID | None, state_id: uuid.UUID | None) -> int:
         index = self._index_by_key.get((item_step_id, state_id))

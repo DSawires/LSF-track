@@ -110,6 +110,37 @@ def test_batch_with_internal_duplicate_stores_once_and_acks_both(world, client):
     assert len(stored) == 2
 
 
+def test_batch_applies_in_occurred_at_order(world, client):
+    """A queue assembled out of order (retries, interleaved devices) must not
+    reject its own internally-consistent sequence: entries are applied by
+    occurred_at, so the downstream move validates against the upstream one that
+    occurred first, whatever the array order."""
+    factory, _route, item = world
+    later = _event_body(
+        factory, item, 20, "queued", 50, "paint_1",
+        occurred_at=hours_ago(1).isoformat(),
+    )
+    earlier = _event_body(
+        factory, item, 10, "completed", 50, "carpentry_1",
+        occurred_at=hours_ago(2).isoformat(),
+    )
+
+    response = client.post("/api/events/batch", json={"events": [later, earlier]})
+    assert response.status_code == 200
+    results = {r["id"]: r for r in response.json()["results"]}
+    assert results[earlier["id"]]["status"] == "stored"
+    assert results[later["id"]]["status"] == "stored"
+
+
+def test_over_advance_rejected_over_http_with_reason(world, client):
+    factory, _route, item = world
+    body = _event_body(factory, item, 10, "queued", item.total_qty + 1, "carpentry_1")
+    response = client.post("/api/events", json=body)
+    assert response.status_code == 422
+    assert response.json()["detail"]["field"] == "qty"
+    assert f"only {item.total_qty}" in response.json()["detail"]["reason"]
+
+
 def test_item_recent_events_endpoint(world, client):
     factory, _route, item = world
     client.post("/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1"))
