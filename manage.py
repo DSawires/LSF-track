@@ -62,6 +62,24 @@ def cmd_create_user(args) -> None:
     print(f"created {username}{' (admin)' if args.admin else ''}")
 
 
+def cmd_set_password(args) -> None:
+    import sqlalchemy as sa
+
+    from app.models import User
+    from app.security import hash_password
+
+    username = args.username.strip().lower()
+    password = args.password or getpass.getpass(f"new password for {username}: ")
+    with get_sessionmaker()() as db:
+        user = db.scalars(sa.select(User).where(User.username == username)).first()
+        if user is None:
+            print(f"{username} does not exist", file=sys.stderr)
+            sys.exit(1)
+        user.password_hash = hash_password(password)
+        db.commit()
+    print(f"password updated for {username}")
+
+
 def cmd_bootstrap(_args) -> None:
     """Create the admin named by LSF_ADMIN_USERNAME / LSF_ADMIN_PASSWORD.
 
@@ -130,6 +148,11 @@ def main() -> None:
     p_user.add_argument("--password", help="omit to be prompted")
     p_user.add_argument("--admin", action="store_true")
     p_user.set_defaults(func=cmd_create_user)
+
+    p_pass = sub.add_parser("set-password")
+    p_pass.add_argument("username")
+    p_pass.add_argument("--password", help="omit to be prompted")
+    p_pass.set_defaults(func=cmd_set_password)
 
     sub.add_parser("bootstrap").set_defaults(func=cmd_bootstrap)
     sub.add_parser("demo").set_defaults(func=cmd_demo)
