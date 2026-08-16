@@ -46,6 +46,7 @@ def _stage_payload(stage: Stage) -> dict:
         "requires_external_po": stage.requires_external_po,
         "allows_partial_qty": stage.allows_partial_qty,
         "is_terminal": stage.is_terminal,
+        "max_days_in_state": stage.max_days_in_state,
     }
 
 
@@ -65,6 +66,7 @@ def create_stage(
         requires_external_po=payload.requires_external_po,
         allows_partial_qty=payload.allows_partial_qty,
         is_terminal=payload.is_terminal,
+        max_days_in_state=payload.max_days_in_state,
     )
     db.add(stage)
     db.flush()

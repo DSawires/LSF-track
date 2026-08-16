@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, events, images, items, office, reference, reports
+from app.api import auth, events, images, items, office, reference, reports, users
 from app.config import get_settings
 from app.db import dispose_engine, get_engine
 
@@ -79,6 +79,7 @@ app.include_router(office.router)
 app.include_router(images.router)
 app.include_router(events.router)
 app.include_router(reports.router)
+app.include_router(users.router)
 
 _STATIC = Path(__file__).resolve().parent.parent / "static"
 

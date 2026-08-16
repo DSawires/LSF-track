@@ -172,7 +172,9 @@ Dockerfile). To bump: create a fresh venv, `pip install .`, then
 Done in the app by an admin: **Office tab → Stages & stations**.
 
 1. Add the stage with its behaviour flags (`requires_station`,
-   `requires_external_po`, `allows_partial_qty`, `is_terminal`, sort order).
+   `requires_external_po`, `allows_partial_qty`, `is_terminal`, sort order,
+   and `max_days_in_state` — the per-stage aging threshold; empty means the
+   stage is never flagged, which is what outsourced work wants).
 2. Add stations if the stage has physical instances.
 3. In "New route", create the next version of any affected route — the
    builder has ＋ insertion points to slot the stage between existing steps.
@@ -249,5 +251,10 @@ version; items already released keep the version they left against.
   Files are stored by row id, format-sniffed on upload, and served only
   through an authenticated endpoint.
 - **Sessions are revocable.** Tokens carry a digest of the password hash;
-  `manage.py set-password` (or any reset) kills every session issued before
-  it. Signing out clears the device's cached identity and data cache.
+  a password reset (admin UI or `manage.py set-password`) kills every session
+  issued before it. Signing out clears the device's cached identity and data
+  cache. User accounts are managed in the app: Office tab → Users (admin).
+- **"Sitting too long" is per stage, not one number.** Each stage carries an
+  optional `max_days_in_state`; the aging report and item cards flag against
+  it, so paint runs hot at 3 days while outsourced rests for 3 weeks
+  unflagged. Set it in the stage admin UI.

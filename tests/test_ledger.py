@@ -288,6 +288,33 @@ def test_aging_uses_oldest_lot_fifo(factory):
     assert 9.9 < row["days_in_state"] < 10.1
 
 
+def test_overdue_is_judged_against_the_stage_threshold(factory):
+    """Sitting too long is per stage, not one global number: 5 days at a
+    3-day stage is overdue, 5 days at a no-threshold stage is not."""
+    hot = factory.stage("paint")
+    hot.max_days_in_state = 3
+    calm = factory.add_stage("resting", sort=35, max_days_in_state=None)
+    route = factory.route("r-age", ["paint", "resting"])
+    item = factory.item("AGE-1", 20, route)
+
+    factory.log(item, 10, "queued", 20, at=days_ago(9), station_code="paint_1")
+    factory.log(item, 10, "completed", 10, at=days_ago(6), station_code="paint_1")
+    factory.log(item, 20, "queued", 10, at=days_ago(5))
+
+    report = reports.aging_report(factory.db)
+    by_stage = {
+        (r["stage"]["code"], r["state"]["code"]): r
+        for r in report["rows"] if r["stage"]
+    }
+    assert by_stage[("paint", "queued")]["overdue"] is True       # 9d >= 3d
+    assert by_stage[("resting", "queued")]["overdue"] is False    # no threshold
+    # The item-card payload carries the same judgement.
+    state = reports.item_state(factory.db, [item.id])[str(item.id)]
+    flags = {p["stage_code"]: p["overdue"] for p in state["positions"] if p["stage_code"]}
+    assert flags["paint"] is True
+    assert flags["resting"] is False
+
+
 def test_clock_anomalies_flag_ahead_devices_and_late_syncs(factory):
     """CLAUDE.md: received_at exists to detect wrong device clocks and late
     syncs -- flagged, not silently trusted."""

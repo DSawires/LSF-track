@@ -58,6 +58,9 @@ class Stage(Base):
     requires_external_po: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     allows_partial_qty: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     is_terminal: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # Days in one state at this stage before the aging report and item cards
+    # flag it. NULL = no opinion (outsourced work sits for weeks by design).
+    max_days_in_state: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
 
     stations: Mapped[list[Station]] = relationship(back_populates="stage")
 

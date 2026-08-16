@@ -62,6 +62,20 @@ class ProjectCreate(BaseModel):
     client: str | None = Field(default=None, max_length=160)
 
 
+class UserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_.-]+$")
+    display_name: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=8, max_length=256)
+    is_admin: bool = False
+
+
+class UserUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    password: str | None = Field(default=None, min_length=8, max_length=256)
+    is_admin: bool | None = None
+    is_active: bool | None = None
+
+
 class StageCreate(BaseModel):
     """A new stage, added at runtime by an admin — no deploy, no migration.
 
@@ -76,6 +90,7 @@ class StageCreate(BaseModel):
     requires_external_po: bool = False
     allows_partial_qty: bool = True
     is_terminal: bool = False
+    max_days_in_state: int | None = Field(default=None, ge=1, le=365)
 
 
 class StageUpdate(BaseModel):
@@ -88,6 +103,9 @@ class StageUpdate(BaseModel):
     requires_external_po: bool | None = None
     allows_partial_qty: bool | None = None
     is_terminal: bool | None = None
+    # None means "no threshold"; the field must still be distinguishable from
+    # "not sent", which exclude_unset handles at the endpoint.
+    max_days_in_state: int | None = Field(default=None, ge=1, le=365)
 
 
 class StationCreate(BaseModel):

@@ -56,6 +56,7 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "requires_external_po": s.requires_external_po,
                 "allows_partial_qty": s.allows_partial_qty,
                 "is_terminal": s.is_terminal,
+                "max_days_in_state": s.max_days_in_state,
             }
             for s in stages
         ],

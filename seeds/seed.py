@@ -18,15 +18,16 @@ from sqlalchemy.orm import Session
 from app.models import EventState, EventType, ReasonCode, Stage, Station
 
 STAGES = [
-    # code, name, sort, requires_station, requires_external_po, is_terminal
-    ("carpentry", "Carpentry", 10, True, False, False),
-    ("lipping", "Lipping", 15, False, False, False),
-    ("veneer", "Veneer", 20, True, False, False),
-    ("paint", "Paint", 30, True, False, False),
-    ("upholstery", "Upholstery", 40, True, False, False),
-    ("outsourced", "Outsourced", 50, False, True, False),
-    ("qc", "Quality Control", 60, False, False, False),
-    ("packing", "Packing", 70, False, False, True),
+    # code, name, sort, requires_station, requires_external_po, is_terminal,
+    # max_days_in_state (None = never flagged as aging; tune in the admin UI)
+    ("carpentry", "Carpentry", 10, True, False, False, 3),
+    ("lipping", "Lipping", 15, False, False, False, 2),
+    ("veneer", "Veneer", 20, True, False, False, 3),
+    ("paint", "Paint", 30, True, False, False, 3),
+    ("upholstery", "Upholstery", 40, True, False, False, 3),
+    ("outsourced", "Outsourced", 50, False, True, False, 21),
+    ("qc", "Quality Control", 60, False, False, False, 2),
+    ("packing", "Packing", 70, False, False, True, 3),
 ]
 
 STATIONS = [
@@ -97,7 +98,7 @@ def _insert_if_missing(db: Session, model, code: str, values: dict) -> None:
 
 
 def run(db: Session) -> None:
-    for code, name, sort, requires_station, external_po, terminal in STAGES:
+    for code, name, sort, requires_station, external_po, terminal, max_days in STAGES:
         _insert_if_missing(
             db,
             Stage,
@@ -108,6 +109,7 @@ def run(db: Session) -> None:
                 "requires_station": requires_station,
                 "requires_external_po": external_po,
                 "is_terminal": terminal,
+                "max_days_in_state": max_days,
             },
         )
     db.flush()

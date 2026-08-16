@@ -30,6 +30,8 @@ const SHELL_FILES = [
   "/static/js/db.js",
   "/static/js/app.js",
   "/static/icon.svg",
+  "/static/icon-192.png",
+  "/static/icon-512.png",
   "/manifest.webmanifest",
 ];
 

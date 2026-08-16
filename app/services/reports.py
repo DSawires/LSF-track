@@ -32,6 +32,7 @@ def _stage_payload(stage) -> dict:
         "requires_external_po": stage.requires_external_po,
         "allows_partial_qty": stage.allows_partial_qty,
         "is_terminal": stage.is_terminal,
+        "max_days_in_state": stage.max_days_in_state,
     }
 
 
@@ -48,6 +49,12 @@ def _state_payload(state) -> dict:
 
 def _days_since(moment: datetime, now: datetime) -> float:
     return round((now - moment).total_seconds() / 86400.0, 2)
+
+
+def _overdue(stage, oldest_arrived_at: datetime, now: datetime) -> bool:
+    if stage is None or stage.max_days_in_state is None:
+        return False
+    return _days_since(oldest_arrived_at, now) >= stage.max_days_in_state
 
 
 def _bucket_rows(
@@ -230,6 +237,9 @@ def aging_report(
                 ],
                 "since": bucket.oldest_arrived_at.isoformat(),
                 "days_in_state": _days_since(bucket.oldest_arrived_at, now),
+                # Judged against the STAGE's threshold, not one global number:
+                # outsourced rests for weeks by design. No threshold, no flag.
+                "overdue": _overdue(stage, bucket.oldest_arrived_at, now),
                 "is_unstarted": position.is_unstarted,
             }
         )
@@ -269,6 +279,7 @@ def item_state(db: Session, item_ids: list[uuid.UUID], now: datetime | None = No
                     "reworked_qty": bucket.reworked_qty,
                     "since": bucket.oldest_arrived_at.isoformat(),
                     "days_in_state": _days_since(bucket.oldest_arrived_at, now),
+                    "overdue": _overdue(stage, bucket.oldest_arrived_at, now),
                     "is_unstarted": position.is_unstarted,
                 }
             )

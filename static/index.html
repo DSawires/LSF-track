@@ -4,13 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#101418">
+  <meta name="description" content="Factory production tracking: log item movement through stages from the floor, fully offline-capable.">
   <title>LSF Track</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/static/icon.svg">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
   <link rel="stylesheet" href="/static/css/app.css">
 </head>
 <body>
+  <noscript>
+    <p style="padding:20px;font-family:sans-serif">LSF Track needs JavaScript — it keeps
+    working offline by queueing entries on this device, which a static page cannot do.</p>
+  </noscript>
   <header id="topbar" hidden>
     <h1>LSF Track</h1>
     <button id="sync-pill" type="button" role="status" aria-live="polite"
