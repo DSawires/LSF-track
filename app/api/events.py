@@ -25,6 +25,9 @@ def _event_payload(event: Event) -> dict:
         "occurred_at": event.occurred_at.isoformat(),
         "received_at": event.received_at.isoformat(),
         "user_id": str(event.user_id),
+        "submitted_by_user_id": (
+            str(event.submitted_by_user_id) if event.submitted_by_user_id else None
+        ),
         "note": event.note,
         "supersedes_event_id": (
             str(event.supersedes_event_id) if event.supersedes_event_id else None

@@ -454,6 +454,13 @@ function viewSyncStatus() {
 
   $view.innerHTML = `
     <div class="card">
+      <div class="spread">
+        <span>Signed in as <strong>${esc(S.user?.display_name || S.user?.username || "nobody")}</strong>${S.user?.is_admin ? ` <span class="badge">admin</span>` : ""}</span>
+        ${S.user ? `<button class="ghost" id="sign-out" style="width:auto;padding:8px 16px;flex:none">Sign out</button>` : ""}
+      </div>
+    </div>
+
+    <div class="card">
       <h2>Waiting to sync (${pending.length})</h2>
       ${pending.map((q) => entryRow(q, false)).join("") || `<p class="muted">Nothing waiting — everything has reached the server.</p>`}
       <p class="muted" style="margin-top:8px">${S.lastSync ? `Last synced ${timeAgo(S.lastSync)}.` : "Never synced from this device."}${S.online ? "" : " Currently offline; entries are safe here until the network returns."}</p>
@@ -484,6 +491,25 @@ function viewSyncStatus() {
       render();
     };
   });
+
+  const signOut = document.getElementById("sign-out");
+  if (signOut) signOut.onclick = async () => {
+    const waiting = pending.length;
+    if (waiting && !confirm(`${waiting} ${waiting === 1 ? "entry has" : "entries have"} not synced yet. ${waiting === 1 ? "It stays" : "They stay"} on this device and will sync after the next sign-in. Sign out anyway?`)) return;
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch {
+      // Offline: the server cookie outlives this, but the local identity and
+      // cached data still clear so the next user starts clean.
+    }
+    S.user = null;
+    S.needsLogin = true;
+    await LSF_DB.put("user", null);
+    // The next user of a shared phone must not see this user's cached reports.
+    navigator.serviceWorker?.controller?.postMessage("purge-data");
+    renderPill();
+    navigate("#/login");
+  };
 }
 
 /* ---------------------------------------------------------------- items -- */

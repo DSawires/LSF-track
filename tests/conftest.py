@@ -9,7 +9,7 @@ import sqlalchemy as sa
 
 os.environ["LSF_DATABASE_URL"] = "sqlite://"
 os.environ["LSF_SECURE_COOKIES"] = "false"
-os.environ["LSF_SECRET_KEY"] = "test-secret"
+os.environ["LSF_SECRET_KEY"] = "test-secret-key-long-enough-to-pass-the-length-check"
 
 from app import db as app_db  # noqa: E402
 from app.db import Base, utcnow  # noqa: E402

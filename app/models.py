@@ -274,6 +274,12 @@ class Event(Base):
     occurred_at: Mapped[datetime] = mapped_column(index=True)
     received_at: Mapped[datetime] = mapped_column(default=utcnow, index=True)
     user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"), index=True)
+    # user_id is the engineer who saw the work happen (client-claimed, for shared
+    # floor devices); submitted_by_user_id is the authenticated session that
+    # actually posted the row. Nullable only because rows predate the column.
+    submitted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("users.id"), nullable=True
+    )
     note: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     supersedes_event_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("events.id"), nullable=True, index=True

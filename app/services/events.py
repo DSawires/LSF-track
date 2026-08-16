@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -39,6 +39,11 @@ from app.models import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# Hard ceiling on how far ahead of the server clock an occurred_at may be.
+# Distinct from settings.max_device_ahead_seconds, which only *flags*.
+_MAX_FUTURE = timedelta(days=7)
 
 
 class EventRejected(Exception):
@@ -133,6 +138,14 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         # and the target is excluded from the derivation the moment it lands.
 
     occurred_at = _require_aware(payload.occurred_at, "occurred_at")
+    if occurred_at > utcnow() + _MAX_FUTURE:
+        # Small clock drift is stored and flagged (see clock_anomalies); a
+        # timestamp days in the future is garbage that would sort after every
+        # honest event forever -- and an append-only log can never remove it.
+        raise EventRejected(
+            "occurred_at is more than a week in the future; fix the device clock",
+            "occurred_at",
+        )
 
     _validate_availability(db, item, item_step, payload, event_type)
 
@@ -149,6 +162,9 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         # Never from the client: this is how a wrong device clock is detected.
         received_at=utcnow(),
         user_id=_attribute_user(db, payload, session_user),
+        # Always the authenticated session, so the claimed attribution above is
+        # auditable: the log records both who saw the work and who posted it.
+        submitted_by_user_id=session_user.id,
         note=payload.note,
         supersedes_event_id=payload.supersedes_event_id,
     )

@@ -1,17 +1,37 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import sqlalchemy as sa
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.api import auth, events, images, items, office, reference, reports
 from app.config import get_settings
+from app.db import dispose_engine, get_engine
 
-app = FastAPI(title="LSF Track", docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Fail at boot, not on the first request: a bad LSF_SECRET_KEY or an
+    # inconsistent TLS/cookie combination must stop the deploy while someone
+    # is still looking at it.
+    get_settings()
+    yield
+    dispose_engine()
+
+
+app = FastAPI(
+    title="LSF Track",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+    lifespan=_lifespan,
+)
 
 app.include_router(auth.router)
 app.include_router(reference.router)
@@ -30,6 +50,25 @@ _CSP = (
 
 
 @app.middleware("http")
+async def csrf_origin_check(request: Request, call_next):
+    # SameSite=Lax on the session cookie is the primary CSRF defence; this is
+    # the second lock on the same door. Browsers always send Origin on
+    # cross-site state-changing requests, so a mismatched Origin is an attack
+    # (or a proxy misconfiguration worth failing loudly on). Requests without
+    # an Origin header -- curl, the test client, same-origin GETs -- pass.
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("origin")
+        if origin:
+            expected = f"{request.url.scheme}://{request.url.netloc}"
+            if urlsplit(origin).scheme != request.url.scheme or urlsplit(origin).netloc != request.url.netloc:
+                return JSONResponse(
+                    {"detail": f"cross-origin request blocked (origin {origin}, expected {expected})"},
+                    status_code=403,
+                )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -44,8 +83,23 @@ async def security_headers(request: Request, call_next):
 
 
 @app.get("/health")
-def health() -> dict:
-    return {"ok": True}
+def health() -> Response:
+    """Deep enough to mean something: a pod with a dead database is not healthy."""
+    try:
+        with get_engine().connect() as conn:
+            conn.execute(sa.text("SELECT 1"))
+    except Exception:
+        return JSONResponse({"ok": False, "database": "unreachable"}, status_code=503)
+    migration = None
+    try:
+        with get_engine().connect() as conn:
+            migration = conn.execute(
+                sa.text("SELECT version_num FROM alembic_version")
+            ).scalar()
+    except Exception:
+        # No alembic_version table (e.g. a test database built by create_all).
+        pass
+    return JSONResponse({"ok": True, "migration": migration})
 
 
 if _STATIC.is_dir():  # pragma: no branch - static ships with the repo

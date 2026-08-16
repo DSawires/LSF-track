@@ -46,10 +46,14 @@ services:
     command: ["--proxy-headers", "--forwarded-allow-ips", "*"]
     environment:
       LSF_DATABASE_URL: postgresql+psycopg://lsf:${POSTGRES_PASSWORD:-lsf}@db:5432/lsf_track
-      # Empty means an ephemeral random key: secure, but sessions reset on
-      # restart. Set a stable key for real use. Placeholder values are refused.
+      # Empty means the entrypoint generates a key ONCE and persists it on the
+      # uploads volume, so sessions survive restarts either way. Set your own
+      # to manage it; placeholder values are refused at boot.
       LSF_SECRET_KEY: ${LSF_SECRET_KEY:-}
+      # The app refuses to boot with LSF_DOMAIN set while this is false, so a
+      # TLS deployment cannot silently ship insecure cookies.
       LSF_SECURE_COOKIES: ${LSF_SECURE_COOKIES:-false}
+      LSF_DOMAIN: ${LSF_DOMAIN:-}
       LSF_ADMIN_USERNAME: ${LSF_ADMIN_USERNAME:-admin}
       LSF_ADMIN_PASSWORD: ${LSF_ADMIN_PASSWORD:-}
       LSF_DEMO: ${LSF_DEMO:-false}

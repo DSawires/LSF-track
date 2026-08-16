@@ -70,8 +70,14 @@ def list_items(
     if project_id is not None:
         query = query.where(Item.project_id == project_id)
     if q:
-        needle = f"%{q.strip()}%"
-        query = query.where(Item.code.ilike(needle) | Item.description.ilike(needle))
+        # Escape LIKE wildcards so a literal % or _ in the search box matches
+        # itself instead of exploding into a scan.
+        cleaned = q.strip().replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        needle = f"%{cleaned}%"
+        query = query.where(
+            Item.code.ilike(needle, escape="\\")
+            | Item.description.ilike(needle, escape="\\")
+        )
     if released is True:
         query = query.where(Item.released_at.is_not(None))
     elif released is False:

@@ -25,7 +25,10 @@ class EventCreate(BaseModel):
     item_step_id: uuid.UUID | None = None
     station_id: uuid.UUID | None = None
     state_id: uuid.UUID | None = None
-    qty: int = 0
+    # ge=0: negative movement is a rework/correction event, never a negative
+    # qty. The ceiling is far beyond any real batch; it exists so a client bug
+    # cannot store a number that breaks every report aggregate.
+    qty: int = Field(default=0, ge=0, le=1_000_000)
     reason_code_id: uuid.UUID | None = None
     note: str | None = Field(default=None, max_length=2000)
     supersedes_event_id: uuid.UUID | None = None
@@ -39,27 +42,32 @@ class EventBatch(BaseModel):
     events: list[EventCreate] = Field(default_factory=list, max_length=500)
 
 
+# String bounds mirror the column widths in app/models.py. Without them an
+# over-length value is a DataError -> 500 on PostgreSQL -- which the SQLite
+# test suite can never catch, so keep the two in sync by hand.
+
+
 class ItemCreate(BaseModel):
-    code: str
+    code: str = Field(min_length=1, max_length=64)
     project_id: uuid.UUID
-    description: str
-    total_qty: int = Field(gt=0)
-    drawing_revision: str
+    description: str = Field(max_length=255)
+    total_qty: int = Field(gt=0, le=1_000_000)
+    drawing_revision: str = Field(min_length=1, max_length=32)
     target_release_date: date | None = None
 
 
 class ProjectCreate(BaseModel):
-    code: str
-    name: str = ""
-    client: str | None = None
+    code: str = Field(min_length=1, max_length=32)
+    name: str = Field(default="", max_length=160)
+    client: str | None = Field(default=None, max_length=160)
 
 
 class RouteTemplateCreate(BaseModel):
     """Steps in order. Posting an existing code creates the next version."""
 
-    code: str
-    name: str = ""
-    stage_ids: list[uuid.UUID] = Field(default_factory=list)
+    code: str = Field(min_length=1, max_length=48)
+    name: str = Field(default="", max_length=160)
+    stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
 
 
 class ReleaseRequest(BaseModel):
@@ -72,4 +80,4 @@ class ReleaseRequest(BaseModel):
 
 
 class RevisionBumpRequest(BaseModel):
-    drawing_revision: str
+    drawing_revision: str = Field(min_length=1, max_length=32)
