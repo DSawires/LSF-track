@@ -77,6 +77,8 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "name": s.name,
                 "sort_order": s.sort_order,
                 "is_complete": s.is_complete,
+                "is_initial": s.is_initial,
+                "is_active": s.is_active,
             }
             for s in states
         ],

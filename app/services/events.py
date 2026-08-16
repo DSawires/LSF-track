@@ -289,7 +289,31 @@ def _require_aware(moment: datetime, field: str) -> datetime:
 
 
 def _differs(existing: Event, payload) -> bool:
-    for field in ("item_id", "item_step_id", "station_id", "event_type_id", "state_id", "qty"):
+    """Every field the client controls. A UUID reused with ANY different
+    content is the client bug the divergent flag exists to catch -- including
+    a different timestamp or a different superseded target."""
+    fields = (
+        "item_id",
+        "item_step_id",
+        "station_id",
+        "event_type_id",
+        "state_id",
+        "qty",
+        "reason_code_id",
+        "supersedes_event_id",
+        "note",
+    )
+    for field in fields:
         if getattr(existing, field) != getattr(payload, field, None):
             return True
+    payload_occurred = getattr(payload, "occurred_at", None)
+    if payload_occurred is not None and payload_occurred.tzinfo is not None:
+        if existing.occurred_at != payload_occurred:
+            return True
+    # user_id=None means "the session user", which legitimately varies between
+    # the original post and a replay drained by a colleague's phone -- only a
+    # non-null claim that names someone else counts as divergence.
+    claimed = getattr(payload, "user_id", None)
+    if claimed is not None and existing.user_id != claimed:
+        return True
     return False

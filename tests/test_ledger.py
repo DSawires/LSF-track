@@ -234,6 +234,40 @@ def test_competing_corrections_keep_only_the_last(factory):
     assert _bucket(factory.db, item, "carpentry", "completed").qty == 15
 
 
+def test_orphaned_correction_is_flagged_not_silent(factory):
+    """A correction whose target sits on a DIFFERENT item does nothing to this
+    item's derivation and must surface as an anomaly instead of sitting inert.
+    The API rejects this shape today, so the row is inserted directly -- it
+    models data that predates the guard or arrived outside the API."""
+    route = factory.route("r", ["carpentry", "paint"])
+    item = factory.item("IT-8B", 10, route)
+    other = factory.item("IT-8C", 5, route)
+    factory.log(item, 10, "completed", 10, at=hours_ago(4), station_code="carpentry_1")
+    target = factory.log(other, 10, "queued", 5, at=hours_ago(3), station_code="carpentry_1")
+
+    correction_type = factory.event_type("correction")
+    factory.db.add(
+        Event(
+            id=uuid.uuid4(),
+            item_id=item.id,
+            event_type_id=correction_type.id,
+            qty=0,
+            occurred_at=hours_ago(1),
+            received_at=utcnow(),
+            user_id=factory.user.id,
+            supersedes_event_id=target.id,  # exists, but on the other item
+        )
+    )
+    factory.db.flush()
+
+    derivation = derive(factory.db, item_ids=[item.id])
+    assert "orphaned_correction" in [a.code for a in derivation.anomalies]
+    # The correction excluded nothing: the completed units are untouched.
+    assert _bucket(factory.db, item, "carpentry", "completed").qty == 10
+    # And the other item's event, which it wrongly names, is untouched too.
+    assert _bucket(factory.db, other, "carpentry", "queued").qty == 5
+
+
 def test_aging_uses_oldest_lot_fifo(factory):
     """A partial advance must not reset the age of what stayed behind."""
     route = factory.route("r", ["carpentry", "paint"])

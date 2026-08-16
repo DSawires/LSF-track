@@ -82,24 +82,31 @@ async function drainQueue() {
         body: JSON.stringify({ events }),
       }));
     } catch (error) {
-      if (error.auth || isNetworkError(error)) throw error;
-      // The server answered but refused the whole batch — one malformed entry
-      // fails request validation for all of them. Post one at a time so a
-      // single poison entry quarantines alone instead of wedging the queue.
+      // Only a batch-level 4xx falls back to one-at-a-time posting: one
+      // malformed entry fails request validation for all 100, and the poison
+      // entry must quarantine alone instead of wedging the queue. Network
+      // failures and 5xx are retried whole next sync.
+      if (!(error.status >= 400 && error.status < 500)) throw error;
       results = await drainOneByOne(events);
     }
     let divergent = 0;
+    let progressed = false;
     for (const result of results) {
       if (result.status === "stored" || result.status === "duplicate") {
         await LSF_DB.ack(result.id);
+        progressed = true;
         if (result.divergent) divergent += 1;
-      } else {
+      } else if (result.status === "rejected") {
         await LSF_DB.markRejected(result.id, result.reason || "rejected");
+        progressed = true;
       }
+      // status "error": a server-side failure on that entry. Leave it pending;
+      // it retries next sync rather than being quarantined for a server bug.
     }
     if (divergent) {
       toast(`${divergent} ${divergent === 1 ? "entry" : "entries"} already existed with different details`);
     }
+    if (!progressed) return; // all errors: stop looping, wait for the next sync
   }
 }
 
@@ -113,7 +120,7 @@ async function drainOneByOne(events) {
       });
       results.push({ id: event.id, status: "stored", divergent });
     } catch (error) {
-      if (error.auth || isNetworkError(error)) throw error;
+      if (!(error.status >= 400 && error.status < 500)) throw error;
       results.push({ id: event.id, status: "rejected", reason: rejectReason(error) });
     }
   }
@@ -143,9 +150,11 @@ async function sync() {
         // Never touch the queue on a 401: the entries outlive the session, and
         // render() keeps the app usable from cache until the engineer can sign
         // in again. Nothing here navigates away from the floor.
-      } else {
+      } else if (isNetworkError(error)) {
         S.online = false; // network failed; queue stays, we try again later
       }
+      // 5xx: the server is reachable but unwell; the queue stays and the pill
+      // does not lie about being offline.
     }
     // Refresh the offline caches in their own try: a wedged drain must never
     // freeze reference data, and a failed refresh must never look like a
@@ -711,7 +720,7 @@ function viewLogScreen(itemId) {
 
       <label>State</label>
       <div class="seg" id="seg-state">
-        ${states.map((s) => `<button data-id="${s.id}" class="${s.id === logSel.stateId ? "on" : ""}">${esc(s.name)}</button>`).join("")}
+        ${states.filter((s) => s.is_active !== false).map((s) => `<button data-id="${s.id}" class="${s.id === logSel.stateId ? "on" : ""}">${esc(s.name)}</button>`).join("")}
       </div>
 
       ${stage?.requires_station ? `
@@ -809,7 +818,9 @@ function viewLogScreen(itemId) {
         item_step_id: nextStep.id,
         station_id: null,
         event_type_id: logSel.typeId,
-        state_id: states[0].id,
+        // The queue state is flagged, not positional: a state added at a lower
+        // sort_order must not change what "queue at next stage" writes.
+        state_id: (states.find((s) => s.is_initial) || states[0]).id,
         qty,
         reason_code_id: null,
         occurred_at: new Date(Date.now() + 1).toISOString(),

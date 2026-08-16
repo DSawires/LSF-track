@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import logging.config
+import os
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +17,42 @@ from fastapi.staticfiles import StaticFiles
 from app.api import auth, events, images, items, office, reference, reports
 from app.config import get_settings
 from app.db import dispose_engine, get_engine
+
+
+def _configure_logging() -> None:
+    """Give app loggers a real handler.
+
+    Without this, everything logged under `app.*` falls through to Python's
+    lastResort handler: WARNING-and-above only, no timestamps, and INFO --
+    including the security-relevant records -- dropped silently.
+    """
+    level = os.environ.get("LSF_LOG_LEVEL", "INFO").upper()
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "standard": {
+                    "format": "%(asctime)s %(levelname)s %(name)s %(message)s",
+                }
+            },
+            "handlers": {
+                "stderr": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "standard",
+                }
+            },
+            "root": {"handlers": ["stderr"], "level": level},
+            # uvicorn configures its own loggers; leave them be.
+            "loggers": {
+                "uvicorn": {"level": level, "propagate": True},
+            },
+        }
+    )
+
+
+_configure_logging()
+log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -47,6 +86,14 @@ _CSP = (
     "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
     "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    # A stack trace in the log, a usable JSON body for the client -- never a
+    # bare 500 with an HTML error page the PWA cannot parse.
+    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse({"detail": "internal server error"}, status_code=500)
 
 
 @app.middleware("http")

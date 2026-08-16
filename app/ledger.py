@@ -110,6 +110,28 @@ def effective_events(events: list[Event]) -> tuple[list[Event], list[Anomaly]]:
 
     excluded: set[uuid.UUID] = set(superseders.keys())
 
+    # A correction whose target is not among this item's events is doing
+    # nothing: the target either has not synced yet (it will resolve) or landed
+    # on a different item (it never will). Either way, say so rather than let
+    # the correction sit inert and invisible forever.
+    present = {event.id for event in events}
+    for target_id, correctors in superseders.items():
+        if target_id in present:
+            continue
+        for corrector in correctors:
+            anomalies.append(
+                Anomaly(
+                    code="orphaned_correction",
+                    event_id=corrector.id,
+                    item_id=corrector.item_id,
+                    detail=(
+                        f"correction names event {target_id}, which is not on this "
+                        f"item; it has no effect (target unsynced, or on another item)"
+                    ),
+                    occurred_at=corrector.occurred_at,
+                )
+            )
+
     # Two devices correcting the same event would otherwise both apply, and the
     # quantity would move twice. Keep the last one and say so.
     for target_id, correctors in superseders.items():
@@ -171,8 +193,12 @@ class ItemLedger:
         ordered_states = vocab.ordered_states
         # The entry state (the queue) is exempt from the station requirement:
         # the queue in front of the paint stations is shared, and which booth the
-        # work lands at isn't known until someone starts it.
-        self._entry_state_id = ordered_states[0].id if ordered_states else None
+        # work lands at isn't known until someone starts it. Flagged is_initial;
+        # lowest sort_order is the fallback for rows predating the flag.
+        self._entry_state_id = next(
+            (s.id for s in ordered_states if s.is_initial),
+            ordered_states[0].id if ordered_states else None,
+        )
         last_seq = ordered_steps[-1].seq if ordered_steps else None
         self._stage_by_step: dict[uuid.UUID, Stage] = {}
         for step in ordered_steps:

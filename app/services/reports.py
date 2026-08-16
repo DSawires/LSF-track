@@ -8,12 +8,15 @@ nothing else -- there is a test that does exactly that.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from datetime import datetime
 
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.db import utcnow
 from app.ledger import Bucket, Vocabulary
+from app.models import Item
 from app.services.derivation import Derivation, derive, reference_maps
 
 UNSTARTED_LABEL = "not started"
@@ -39,6 +42,7 @@ def _state_payload(state) -> dict:
         "name": state.name,
         "sort_order": state.sort_order,
         "is_complete": state.is_complete,
+        "is_initial": state.is_initial,
     }
 
 
@@ -49,14 +53,20 @@ def _days_since(moment: datetime, now: datetime) -> float:
 def _bucket_rows(
     derivation: Derivation,
     include_unstarted: bool,
-    project_id: uuid.UUID | None = None,
-) -> list[tuple]:
+) -> Iterator[tuple]:
     for item_id, ledger in derivation.ledgers.items():
         item = derivation.items[item_id]
-        if project_id is not None and item.project_id != project_id:
-            continue
         for bucket in ledger.occupied(include_unstarted=include_unstarted):
             yield item, bucket
+
+
+def _derive_scope(db: Session, project_id: uuid.UUID | None) -> Derivation:
+    """Filter BEFORE deriving: replaying every project's events to answer a
+    one-project question does not scale with the log."""
+    if project_id is None:
+        return derive(db)
+    item_ids = list(db.scalars(sa.select(Item.id).where(Item.project_id == project_id)))
+    return derive(db, item_ids=item_ids)
 
 
 def wip_report(
@@ -69,17 +79,18 @@ def wip_report(
     correct report without a code change.
     """
     now = now or utcnow()
-    derivation = derive(db)
+    derivation = _derive_scope(db, project_id)
     vocab: Vocabulary = derivation.vocab
     refs = reference_maps(db)
     states = vocab.ordered_states
-    queue_state_id = states[0].id if states else None
+    queue_state = next((s for s in states if s.is_initial), states[0] if states else None)
+    queue_state_id = queue_state.id if queue_state else None
 
     stage_rows: dict[uuid.UUID, dict] = {}
     unstarted_qty = 0
     unstarted_items = 0
 
-    for item, bucket in _bucket_rows(derivation, include_unstarted=True, project_id=project_id):
+    for item, bucket in _bucket_rows(derivation, include_unstarted=True):
         position = bucket.position
         if position.is_unstarted:
             unstarted_qty += bucket.qty
@@ -157,7 +168,7 @@ def wip_report(
     return {
         "generated_at": now.isoformat(),
         "states": [_state_payload(state) for state in states],
-        "queue_state_code": states[0].code if states else None,
+        "queue_state_code": queue_state.code if queue_state else None,
         "stages": stages_out,
         "unstarted": {"qty": unstarted_qty, "item_count": unstarted_items},
         "totals": {
@@ -183,11 +194,11 @@ def aging_report(
     reset the clock on the units left behind.
     """
     now = now or utcnow()
-    derivation = derive(db)
+    derivation = _derive_scope(db, project_id)
     refs = reference_maps(db)
     rows: list[dict] = []
 
-    for item, bucket in _bucket_rows(derivation, include_unstarted=True, project_id=project_id):
+    for item, bucket in _bucket_rows(derivation, include_unstarted=True):
         position = bucket.position
         if stage_id is not None and position.stage_id != stage_id:
             continue
@@ -274,11 +285,12 @@ def item_state(db: Session, item_ids: list[uuid.UUID], now: datetime | None = No
 
 
 def exceptions_report(db: Session) -> dict:
-    """Everything the log asserts that cannot be true.
+    """Everything the stored log asserts that does not add up.
 
-    Nothing here was rejected at write time. An engineer's entry is always stored;
-    the arithmetic that does not work out surfaces here for someone to correct with
-    a correction event.
+    Over-advancing writes are rejected at the API since the write-time guard,
+    so this mostly surfaces clock drift, late syncs, competing corrections,
+    and rows that predate the guard. Fixes are correction events; history is
+    never rewritten.
     """
     derivation = derive(db)
     rows = []

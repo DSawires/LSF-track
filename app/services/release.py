@@ -153,7 +153,7 @@ def _place_initial_quantities(
     ).first()
     queued_state = db.scalars(
         sa.select(EventState).where(EventState.is_active.is_(True))
-        .order_by(EventState.sort_order).limit(1)
+        .order_by(EventState.is_initial.desc(), EventState.sort_order).limit(1)
     ).first()
     if move_type is None or queued_state is None:
         raise ReleaseError("no movement event type or entry state is seeded")

@@ -143,9 +143,10 @@ async function drainFromWorker() {
     for (const result of results) {
       if (result.status === "stored" || result.status === "duplicate") {
         await LSF_DB.ack(result.id);
-      } else {
+      } else if (result.status === "rejected") {
         await LSF_DB.markRejected(result.id, result.reason || "rejected");
       }
+      // "error" stays pending; the page's sync retries it.
     }
   }
   const clients = await self.clients.matchAll();

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -8,6 +10,8 @@ from app.deps import current_user
 from app.models import Event, User
 from app.schemas import EventBatch, EventCreate
 from app.services.events import EventRejected, record_event
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/events", tags=["events"])
 
@@ -78,7 +82,12 @@ def post_batch(
     results = []
     for entry in sorted(payload.events, key=lambda e: e.occurred_at):
         try:
-            result = record_event(db, entry, user)
+            # A SAVEPOINT per entry: an unexpected failure on one event must
+            # neither 500 the whole drain (rolling back events the client is
+            # about to be told were stored) nor poison the session for the
+            # entries after it.
+            with db.begin_nested():
+                result = record_event(db, entry, user)
             results.append(
                 {
                     "id": str(entry.id),
@@ -93,6 +102,17 @@ def post_batch(
                     "status": "rejected",
                     "reason": exc.reason,
                     "field": exc.field,
+                }
+            )
+        except Exception:
+            log.exception("unexpected failure storing event %s in a batch", entry.id)
+            # "error", not "rejected": the client keeps the entry pending and
+            # retries next sync instead of quarantining it for a server bug.
+            results.append(
+                {
+                    "id": str(entry.id),
+                    "status": "error",
+                    "reason": "server error storing this entry; it will be retried",
                 }
             )
     return {"results": results}

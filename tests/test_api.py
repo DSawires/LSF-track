@@ -67,11 +67,52 @@ def test_divergent_replay_returns_stored_row(world, client):
     body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
     assert client.post("/api/events", json=body).status_code == 201
 
-    tampered = {**body, "qty": 999}
+    tampered = {**body, "qty": 49}
     response = client.post("/api/events", json=tampered)
     assert response.status_code == 201
     assert response.json()["divergent"] is True
     assert response.json()["event"]["qty"] == 50  # stored row wins
+
+
+def test_divergence_covers_every_client_field_not_just_the_movement(world, client):
+    """A reused UUID with only a different timestamp (or note) is still the
+    client bug the divergent flag exists to catch."""
+    factory, _route, item = world
+    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    assert client.post("/api/events", json=body).status_code == 201
+
+    shifted = {**body, "occurred_at": hours_ago(6).isoformat()}
+    assert client.post("/api/events", json=shifted).json()["divergent"] is True
+
+    noted = {**body, "note": "actually the other rack"}
+    assert client.post("/api/events", json=noted).json()["divergent"] is True
+
+    verbatim = client.post("/api/events", json=body)
+    assert verbatim.json()["divergent"] is False
+
+
+def test_archiving_an_item_writes_an_audit_event(world, client):
+    factory, _route, item = world
+    assert client.post(
+        "/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    ).status_code == 201
+
+    result = client.delete(f"/api/items/{item.id}")
+    assert result.json()["archived"] is True
+
+    factory.db.expire_all()
+    from app.models import EventType
+
+    archive_type = factory.db.scalars(
+        sa.select(EventType).where(EventType.is_archive.is_(True))
+    ).one()
+    audit = factory.db.scalars(
+        sa.select(Event).where(
+            Event.item_id == item.id, Event.event_type_id == archive_type.id
+        )
+    ).all()
+    assert len(audit) == 1
+    assert audit[0].submitted_by_user_id is not None
 
 
 def test_batch_sync_reports_per_event_outcomes(world, client):

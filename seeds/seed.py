@@ -40,10 +40,10 @@ STATIONS = [
 ]
 
 STATES = [
-    # code, name, sort, is_complete
-    ("queued", "Queued", 10, False),
-    ("in_progress", "In progress", 20, False),
-    ("completed", "Completed", 30, True),
+    # code, name, sort, is_complete, is_initial
+    ("queued", "Queued", 10, False, True),
+    ("in_progress", "In progress", 20, False, False),
+    ("completed", "Completed", 30, True, False),
 ]
 
 EVENT_TYPES = [
@@ -72,6 +72,12 @@ EVENT_TYPES = [
         "Drawing revision bump",
         50,
         {"is_revision_bump": True, "moves_quantity": False, "requires_item_step": False},
+    ),
+    (
+        "archive",
+        "Archived",
+        60,
+        {"is_archive": True, "moves_quantity": False, "requires_item_step": False},
     ),
 ]
 
@@ -115,9 +121,17 @@ def run(db: Session) -> None:
             {"stage_id": stage_ids[stage_code], "name": name, "sort_order": sort},
         )
 
-    for code, name, sort, is_complete in STATES:
+    for code, name, sort, is_complete, is_initial in STATES:
         _insert_if_missing(
-            db, EventState, code, {"name": name, "sort_order": sort, "is_complete": is_complete}
+            db,
+            EventState,
+            code,
+            {
+                "name": name,
+                "sort_order": sort,
+                "is_complete": is_complete,
+                "is_initial": is_initial,
+            },
         )
 
     for code, name, sort, flags in EVENT_TYPES:

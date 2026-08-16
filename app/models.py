@@ -90,6 +90,10 @@ class EventState(Base):
     name: Mapped[str] = mapped_column(sa.String(64))
     sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
     is_complete: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # The state new work enters a step in (the queue). A flag rather than
+    # "lowest sort_order", so inserting a state that sorts before the queue
+    # cannot silently change what auto-queue and queue-depth mean.
+    is_initial: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
 
@@ -111,10 +115,11 @@ class EventType(Base):
     # Behaviour flags.
     is_correction: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_rework: Mapped[bool] = mapped_column(sa.Boolean, default=False)
-    # The two item-level events the server itself writes. Flagged rather than looked
+    # The item-level events the server itself writes. Flagged rather than looked
     # up by code, so the server never depends on a particular spelling.
     is_release: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_revision_bump: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    is_archive: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     moves_quantity: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     requires_item_step: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     requires_reason_code: Mapped[bool] = mapped_column(sa.Boolean, default=False)
