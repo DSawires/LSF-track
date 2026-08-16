@@ -183,10 +183,15 @@ def test_aging_uses_oldest_lot_fifo(factory):
     assert 9.9 < row["days_in_state"] < 10.1
 
 
-def test_missing_station_is_flagged_when_stage_requires_one(factory):
+def test_missing_station_is_flagged_only_past_the_queue(factory):
+    """The queue in front of a stage's stations is shared, so queued events
+    don't need a station; anything past the queue does."""
     route = factory.route("r", ["carpentry"])
     item = factory.item("IT-10", 5, route)
-    factory.log(item, 10, "queued", 5, at=hours_ago(1))  # no station given
+    factory.log(item, 10, "queued", 5, at=hours_ago(2))  # no station: fine
+    derivation = derive(factory.db, item_ids=[item.id])
+    assert "missing_station" not in [a.code for a in derivation.anomalies]
 
+    factory.log(item, 10, "in_progress", 5, at=hours_ago(1))  # no station: flagged
     derivation = derive(factory.db, item_ids=[item.id])
     assert "missing_station" in [a.code for a in derivation.anomalies]

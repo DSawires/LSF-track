@@ -168,6 +168,10 @@ class ItemLedger:
 
         ordered_steps = sorted(steps, key=lambda s: s.seq)
         ordered_states = vocab.ordered_states
+        # The entry state (the queue) is exempt from the station requirement:
+        # the queue in front of the paint stations is shared, and which booth the
+        # work lands at isn't known until someone starts it.
+        self._entry_state_id = ordered_states[0].id if ordered_states else None
         last_seq = ordered_steps[-1].seq if ordered_steps else None
         self._stage_by_step: dict[uuid.UUID, Stage] = {}
         for step in ordered_steps:
@@ -217,7 +221,12 @@ class ItemLedger:
             if event.item_step_id is not None
             else None
         )
-        if stage is not None and stage.requires_station and event.station_id is None:
+        if (
+            stage is not None
+            and stage.requires_station
+            and event.station_id is None
+            and event.state_id != self._entry_state_id
+        ):
             self._flag(
                 event,
                 "missing_station",

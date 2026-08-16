@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -12,8 +14,12 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 
 @router.get("/wip")
-def wip(db: Session = Depends(get_db), user: User = Depends(current_user)) -> dict:
-    return reports.wip_report(db)
+def wip(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+    project_id: uuid.UUID | None = None,
+) -> dict:
+    return reports.wip_report(db, project_id=project_id)
 
 
 @router.get("/aging")
@@ -21,8 +27,13 @@ def aging(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
     limit: int | None = None,
+    project_id: uuid.UUID | None = None,
+    stage_id: uuid.UUID | None = None,
+    min_days: float | None = None,
 ) -> dict:
-    return reports.aging_report(db, limit=limit)
+    return reports.aging_report(
+        db, limit=limit, project_id=project_id, stage_id=stage_id, min_days=min_days
+    )
 
 
 @router.get("/exceptions")

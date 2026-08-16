@@ -46,13 +46,22 @@ def _days_since(moment: datetime, now: datetime) -> float:
     return round((now - moment).total_seconds() / 86400.0, 2)
 
 
-def _bucket_rows(derivation: Derivation, include_unstarted: bool) -> list[tuple]:
+def _bucket_rows(
+    derivation: Derivation,
+    include_unstarted: bool,
+    project_id: uuid.UUID | None = None,
+) -> list[tuple]:
     for item_id, ledger in derivation.ledgers.items():
+        item = derivation.items[item_id]
+        if project_id is not None and item.project_id != project_id:
+            continue
         for bucket in ledger.occupied(include_unstarted=include_unstarted):
-            yield derivation.items[item_id], bucket
+            yield item, bucket
 
 
-def wip_report(db: Session, now: datetime | None = None) -> dict:
+def wip_report(
+    db: Session, now: datetime | None = None, project_id: uuid.UUID | None = None
+) -> dict:
     """Work in progress by stage and station.
 
     Queue depth is the quantity sitting in the earliest state of a stage -- earliest
@@ -70,7 +79,7 @@ def wip_report(db: Session, now: datetime | None = None) -> dict:
     unstarted_qty = 0
     unstarted_items = 0
 
-    for item, bucket in _bucket_rows(derivation, include_unstarted=True):
+    for item, bucket in _bucket_rows(derivation, include_unstarted=True, project_id=project_id):
         position = bucket.position
         if position.is_unstarted:
             unstarted_qty += bucket.qty
@@ -158,7 +167,14 @@ def wip_report(db: Session, now: datetime | None = None) -> dict:
     }
 
 
-def aging_report(db: Session, now: datetime | None = None, limit: int | None = None) -> dict:
+def aging_report(
+    db: Session,
+    now: datetime | None = None,
+    limit: int | None = None,
+    project_id: uuid.UUID | None = None,
+    stage_id: uuid.UUID | None = None,
+    min_days: float | None = None,
+) -> dict:
     """Days in current state, longest first.
 
     One row per item *and position*, because a batch splits: 40 of the 120 can be in
@@ -171,8 +187,10 @@ def aging_report(db: Session, now: datetime | None = None, limit: int | None = N
     refs = reference_maps(db)
     rows: list[dict] = []
 
-    for item, bucket in _bucket_rows(derivation, include_unstarted=True):
+    for item, bucket in _bucket_rows(derivation, include_unstarted=True, project_id=project_id):
         position = bucket.position
+        if stage_id is not None and position.stage_id != stage_id:
+            continue
         stage = refs["stages"].get(position.stage_id) if position.stage_id else None
         state = refs["states"].get(position.state_id) if position.state_id else None
         stations = [
@@ -205,6 +223,8 @@ def aging_report(db: Session, now: datetime | None = None, limit: int | None = N
             }
         )
 
+    if min_days is not None:
+        rows = [row for row in rows if row["days_in_state"] >= min_days]
     rows.sort(key=lambda r: r["days_in_state"], reverse=True)
     if limit is not None:
         rows = rows[:limit]

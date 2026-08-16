@@ -248,3 +248,89 @@ def test_reports_require_auth(factory):
     with TestClient(app) as anonymous:
         assert anonymous.get("/api/reports/wip").status_code == 401
         assert anonymous.get("/api/reports/aging").status_code == 401
+
+
+def test_image_upload_roundtrip_and_format_sniff(world, client, tmp_path, monkeypatch):
+    monkeypatch.setenv("LSF_UPLOAD_DIR", str(tmp_path / "uploads"))
+    from app.config import get_settings
+    get_settings.cache_clear()
+
+    factory, _route, item = world
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    up = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("shelf.png", png, "image/png")},
+        data={"note": "veneer chip on corner"},
+    )
+    assert up.status_code == 201
+    body = up.json()
+    assert body["content_type"] == "image/png"
+    assert body["note"] == "veneer chip on corner"
+
+    served = client.get(body["url"])
+    assert served.status_code == 200
+    assert served.content == png
+
+    listed = client.get(f"/api/items/{item.id}/images").json()["images"]
+    assert [i["id"] for i in listed] == [body["id"]]
+
+    # A renamed non-image is refused regardless of its claimed content type.
+    fake = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("evil.png", b"MZ\x90\x00" + b"\x00" * 64, "image/png")},
+    )
+    assert fake.status_code == 422
+    get_settings.cache_clear()
+
+
+def test_release_with_initial_stage_distribution(client, factory):
+    factory.route("dist-route", ["carpentry", "paint", "packing"])
+    factory.db.commit()
+    template = factory.db.scalars(
+        sa.select(RouteTemplate).where(RouteTemplate.code == "dist-route")
+    ).one()
+    item = client.post(
+        "/api/items",
+        json={
+            "code": "DIST-1", "project_id": str(factory.project.id),
+            "description": "already mid-production", "total_qty": 100,
+            "drawing_revision": "A",
+        },
+    ).json()
+
+    over = client.post(
+        f"/api/items/{item['id']}/release",
+        json={"route_template_id": str(template.id), "initial_quantities": {"10": 80, "20": 30}},
+    )
+    assert over.status_code == 409  # 110 > 100
+
+    released = client.post(
+        f"/api/items/{item['id']}/release",
+        json={"route_template_id": str(template.id), "initial_quantities": {"10": 50, "20": 30}},
+    )
+    assert released.status_code == 200
+
+    state = client.get(f"/api/items/{item['id']}").json()["state"]
+    by_pos = {(p["seq"], p["state_code"]): p["qty"] for p in state["positions"]}
+    assert by_pos[(10, "queued")] == 50
+    assert by_pos[(20, "queued")] == 30
+    assert state["unstarted_qty"] == 20
+
+
+def test_item_search_and_aging_filters(world, client):
+    factory, _route, item = world
+    client.post("/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1"))
+
+    found = client.get("/api/items?q=api-1").json()["items"]
+    assert [i["code"] for i in found] == ["API-1"]
+    assert client.get("/api/items?q=zzz-nope").json()["items"] == []
+
+    stage_id = str(factory.stage("paint").id)
+    rows = client.get(f"/api/reports/aging?stage_id={stage_id}").json()["rows"]
+    assert rows == []  # nothing at paint yet
+    rows = client.get("/api/reports/aging?min_days=9999").json()["rows"]
+    assert rows == []
+    other_project = client.get(
+        f"/api/reports/wip?project_id={uuid.uuid4()}"
+    ).json()
+    assert other_project["stages"] == []

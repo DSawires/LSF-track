@@ -15,8 +15,19 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from datetime import timedelta
+
 from app.db import utcnow
-from app.models import Event, EventType, Item, ItemStep, RouteTemplate, RouteTemplateStep, User
+from app.models import (
+    Event,
+    EventState,
+    EventType,
+    Item,
+    ItemStep,
+    RouteTemplate,
+    RouteTemplateStep,
+    User,
+)
 
 
 class ReleaseError(Exception):
@@ -30,6 +41,7 @@ def release_item(
     user: User,
     drawing_revision: str | None = None,
     released_at: datetime | None = None,
+    initial_quantities: dict[int, int] | None = None,
 ) -> list[ItemStep]:
     if item.is_released:
         raise ReleaseError(f"{item.code} was already released on {item.released_at:%Y-%m-%d}")
@@ -83,7 +95,71 @@ def release_item(
             )
         )
         db.flush()
+
+    if initial_quantities:
+        _place_initial_quantities(db, item, steps, initial_quantities, user, moment)
     return steps
+
+
+def _place_initial_quantities(
+    db: Session,
+    item: Item,
+    steps: list[ItemStep],
+    quantities: dict[int, int],
+    user: User,
+    moment: datetime,
+) -> None:
+    """Onboard an item that is already mid-production.
+
+    Each placement is an ordinary queued event, so the ledger needs no special
+    case. Deepest step first, each a millisecond apart: the replay pulls from the
+    *nearest* upstream position, and only this ordering guarantees every
+    placement draws from the unstarted pool rather than from a shallower
+    placement that happened to land first.
+    """
+    step_by_seq = {step.seq: step for step in steps}
+    for seq, qty in quantities.items():
+        if seq not in step_by_seq:
+            raise ReleaseError(f"step {seq} is not on this route")
+        if qty <= 0:
+            raise ReleaseError(f"quantity for step {seq} must be positive")
+    total = sum(quantities.values())
+    if total > item.total_qty:
+        raise ReleaseError(
+            f"distributed {total} across stages but the batch is only {item.total_qty}"
+        )
+
+    move_type = db.scalars(
+        sa.select(EventType).where(
+            EventType.moves_quantity.is_(True),
+            EventType.is_rework.is_(False),
+            EventType.is_correction.is_(False),
+            EventType.is_active.is_(True),
+        ).order_by(EventType.sort_order).limit(1)
+    ).first()
+    queued_state = db.scalars(
+        sa.select(EventState).where(EventState.is_active.is_(True))
+        .order_by(EventState.sort_order).limit(1)
+    ).first()
+    if move_type is None or queued_state is None:
+        raise ReleaseError("no movement event type or entry state is seeded")
+
+    for offset, seq in enumerate(sorted(quantities, reverse=True), start=1):
+        db.add(
+            Event(
+                id=uuid.uuid4(),
+                item_id=item.id,
+                item_step_id=step_by_seq[seq].id,
+                event_type_id=move_type.id,
+                state_id=queued_state.id,
+                qty=quantities[seq],
+                occurred_at=moment + timedelta(milliseconds=offset),
+                received_at=utcnow(),
+                user_id=user.id,
+                note="initial position at release",
+            )
+        )
+    db.flush()
 
 
 def bump_revision(db: Session, item: Item, revision: str, user: User) -> Event | None:

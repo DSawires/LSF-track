@@ -74,6 +74,8 @@ on it.
 | `LSF_SECURE_COOKIES` | `false` only for local HTTP development |
 | `LSF_MAX_DEVICE_AHEAD_SECONDS` | `occurred_at` this far ahead of server receipt flags a wrong device clock |
 | `LSF_MAX_SYNC_LAG_DAYS` | events syncing later than this are flagged as late |
+| `LSF_UPLOAD_DIR` | where item photos are stored (a named volume in the compose stack) |
+| `LSF_MAX_UPLOAD_BYTES` | per-photo size cap, default 10MB |
 
 ## Tests
 
@@ -145,3 +147,13 @@ version; items already released keep the version they left against.
   reports exclude re-completions — no double-counting.
 - **`state` is `state_id`**, a foreign key to `event_states` — the spec's
   lookup-table intent, applied literally so states are as extensible as stages.
+- **Completing a step offers a one-tap "also queue at next stage"** (default
+  on). It writes two ordinary events a millisecond apart — done here, queued
+  there — so the log stays factual and the derivation needs no special case.
+- **Releasing accepts an initial per-stage distribution** for items entering
+  the system mid-production; the placements are ordinary queued events written
+  deepest-step-first at release time.
+- **Item photos** are online-only by design: the offline guarantee protects
+  the logging path, and multi-megabyte blobs don't belong in its sync queue.
+  Files are stored by row id, format-sniffed on upload, and served only
+  through an authenticated endpoint.

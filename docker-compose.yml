@@ -53,6 +53,9 @@ services:
       LSF_ADMIN_USERNAME: ${LSF_ADMIN_USERNAME:-admin}
       LSF_ADMIN_PASSWORD: ${LSF_ADMIN_PASSWORD:-}
       LSF_DEMO: ${LSF_DEMO:-false}
+      LSF_UPLOAD_DIR: /srv/lsf/data/uploads
+    volumes:
+      - uploads:/srv/lsf/data
     restart: unless-stopped
 
   proxy:
@@ -72,3 +75,4 @@ services:
 volumes:
   pgdata:
   caddy_data:
+  uploads:

@@ -65,6 +65,10 @@ class RouteTemplateCreate(BaseModel):
 class ReleaseRequest(BaseModel):
     route_template_id: uuid.UUID
     drawing_revision: str | None = None
+    # Where the quantities already are, keyed by step seq — for onboarding an
+    # item that is mid-production when it enters the system. Anything not
+    # distributed starts as unstarted.
+    initial_quantities: dict[int, int] = Field(default_factory=dict)
 
 
 class RevisionBumpRequest(BaseModel):

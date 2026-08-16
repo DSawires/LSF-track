@@ -57,8 +57,13 @@ async function sync() {
   if (syncRunning) return;
   syncRunning = true;
   try {
-    const queue = (await LSF_DB.queueAll()).filter((q) => q._status === "pending");
-    if (queue.length) {
+    // Loop, because entries can be enqueued *while* a drain is in flight (the
+    // auto-queue second event, or a fast pair of taps) and the syncRunning
+    // guard swallows the sync() call they trigger. Bounded so a server that
+    // rejects nothing but stores nothing can't spin us.
+    for (let round = 0; round < 5; round++) {
+      const queue = (await LSF_DB.queueAll()).filter((q) => q._status === "pending");
+      if (!queue.length) break;
       const events = queue.map(({ _queued_at, _status, _reason, ...event }) => event);
       const { results } = await api("/api/events/batch", {
         method: "POST",
@@ -278,6 +283,7 @@ function viewItems() {
   const stages = (S.ref?.stages || []).filter((s) => s.is_active);
   const filterProject = sessionStorage.getItem("f-project") || "";
   const filterStage = sessionStorage.getItem("f-stage") || "";
+  const filterText = (sessionStorage.getItem("f-q") || "").toLowerCase();
 
   const rows = S.items.filter((item) => {
     if (!item.is_released) return false;
@@ -286,10 +292,16 @@ function viewItems() {
       const at = (item.state?.positions || []).some((p) => p.stage_id === filterStage);
       if (!at) return false;
     }
+    if (filterText) {
+      const haystack = `${item.code} ${item.description}`.toLowerCase();
+      if (!haystack.includes(filterText)) return false;
+    }
     return true;
   });
 
   $view.innerHTML = `
+    <input id="f-q" type="search" placeholder="Search code or description"
+           value="${esc(sessionStorage.getItem("f-q") || "")}" style="margin-bottom:8px">
     <div class="filters">
       <select id="f-project">
         <option value="">All projects</option>
@@ -309,6 +321,22 @@ function viewItems() {
   };
   document.getElementById("f-stage").onchange = (e) => {
     sessionStorage.setItem("f-stage", e.target.value); render();
+  };
+  // Filter the list live but don't re-render around the keyboard; the input
+  // keeps focus and the rows below it re-draw.
+  document.getElementById("f-q").oninput = (e) => {
+    sessionStorage.setItem("f-q", e.target.value);
+    const list = document.querySelector(".row-list");
+    if (list) {
+      const needle = e.target.value.toLowerCase();
+      const filtered = S.items.filter((item) => {
+        if (!item.is_released) return false;
+        if (filterProject && item.project_id !== filterProject) return false;
+        if (filterStage && !(item.state?.positions || []).some((p) => p.stage_id === filterStage)) return false;
+        return !needle || `${item.code} ${item.description}`.toLowerCase().includes(needle);
+      });
+      list.innerHTML = filtered.map(itemRow).join("") || `<p class="muted">No items match.</p>`;
+    }
   };
 }
 
@@ -375,6 +403,16 @@ function viewLogScreen(itemId) {
     : 0;
   const reasons = (S.ref.reason_codes || []).filter((r) => r.is_active);
 
+  // Completing a non-final step usually means the units move straight to the
+  // next stage's queue; offer to log both in one tap.
+  const selectedState = states.find((s) => s.id === logSel.stateId);
+  const stepIndex = steps.findIndex((s) => s.id === logSel.stepId);
+  const nextStep = stepIndex >= 0 ? steps[stepIndex + 1] : null;
+  const nextStage = nextStep ? stageById(nextStep.stage_id) : null;
+  const offerAutoQueue = !!(
+    selectedState?.is_complete && nextStep && type && !type.is_rework
+  );
+
   $view.innerHTML = `
     <div class="card">
       <div class="spread">
@@ -425,8 +463,24 @@ function viewLogScreen(itemId) {
       <p class="muted" style="margin-top:5px">${available} available at the previous step</p>
       <p class="warn-text" id="qty-warn" hidden>More than is available upstream — it will be stored and flagged for review.</p>
 
+      ${offerAutoQueue ? `
+      <label style="display:flex;align-items:center;gap:10px;margin-top:14px;font-size:15px;color:var(--text)">
+        <input type="checkbox" id="auto-queue" checked style="width:22px;height:22px;flex:none">
+        Also queue at ${esc(nextStage?.name || "next stage")}
+      </label>` : ""}
+
       <div style="height:12px"></div>
       <button class="primary" id="log-go">Log entry</button>
+    </div>
+
+    <div class="card">
+      <h2>Photos <span class="muted" id="photo-count"></span></h2>
+      <div id="photos" class="muted">Loading…</div>
+      <div style="height:8px"></div>
+      <label class="ghost" style="display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
+        ${S.online ? "Add photo" : "Photos need a connection"}
+        <input type="file" id="photo-file" accept="image/*" capture="environment" hidden ${S.online ? "" : "disabled"}>
+      </label>
     </div>
 
     <div class="card">
@@ -454,6 +508,7 @@ function viewLogScreen(itemId) {
 
   document.getElementById("log-go").onclick = async () => {
     const reasonSelect = document.getElementById("sel-reason");
+    const qty = Number($qty.value) || 1;
     await logEvent({
       id: crypto.randomUUID(),
       item_id: item.id,
@@ -461,17 +516,57 @@ function viewLogScreen(itemId) {
       station_id: stage?.requires_station ? logSel.stationId : null,
       event_type_id: logSel.typeId,
       state_id: logSel.stateId,
-      qty: Number($qty.value) || 1,
+      qty,
       reason_code_id: reasonSelect ? reasonSelect.value : null,
       occurred_at: new Date().toISOString(),
       note: null,
       supersedes_event_id: null,
       user_id: S.user?.id || null,
     });
+    // One tap, two facts: done here, queued there. The +1ms keeps the replay
+    // order deterministic so the queue event always pulls the units the
+    // completion just produced.
+    if (offerAutoQueue && document.getElementById("auto-queue")?.checked) {
+      await logEvent({
+        id: crypto.randomUUID(),
+        item_id: item.id,
+        item_step_id: nextStep.id,
+        station_id: null,
+        event_type_id: logSel.typeId,
+        state_id: states[0].id,
+        qty,
+        reason_code_id: null,
+        occurred_at: new Date(Date.now() + 1).toISOString(),
+        note: null,
+        supersedes_event_id: null,
+        user_id: S.user?.id || null,
+      });
+    }
     rerender();
   };
 
+  const photoInput = document.getElementById("photo-file");
+  photoInput.onchange = async () => {
+    const file = photoInput.files[0];
+    if (!file) return;
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const response = await fetch(`/api/items/${item.id}/images`, {
+        method: "POST", body: form, credentials: "same-origin",
+      });
+      if (!response.ok) throw new Error();
+      toast("Photo added");
+      loadPhotos(item);
+    } catch {
+      toast("Upload failed");
+    } finally {
+      photoInput.value = "";
+    }
+  };
+
   loadRecent(item);
+  loadPhotos(item);
 }
 
 function wireSeg(id, onPick) {
@@ -499,6 +594,27 @@ function defaultTarget(item, steps, states) {
     return { stepId: steps[stepIdx].id, stateId: states[(next - 1) % states.length].id };
   }
   return fallback;
+}
+
+async function loadPhotos(item) {
+  const target = document.getElementById("photos");
+  if (!target) return;
+  try {
+    const { images } = await api(`/api/items/${item.id}/images`);
+    if (!target.isConnected) return;
+    document.getElementById("photo-count").textContent = images.length ? `(${images.length})` : "";
+    target.innerHTML = images.length
+      ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+          ${images.map((img) => `
+            <a href="${img.url}" target="_blank" rel="noopener">
+              <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy"
+                   style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;border:1px solid var(--line)">
+            </a>`).join("")}
+         </div>`
+      : `<span class="muted">No photos yet.</span>`;
+  } catch {
+    if (target.isConnected) target.textContent = "Offline — photos unavailable.";
+  }
 }
 
 async function loadRecent(item) {
@@ -549,12 +665,23 @@ async function loadRecent(item) {
 /* -------------------------------------------------------------- reports -- */
 
 async function viewReports() {
+  const projects = S.ref?.projects || [];
+  const stages = (S.ref?.stages || []).filter((s) => s.is_active);
+  const fProject = sessionStorage.getItem("r-project") || "";
+  const fStage = sessionStorage.getItem("r-stage") || "";
+  const fDays = sessionStorage.getItem("r-days") || "";
+
   $view.innerHTML = `<p class="muted">Loading reports…</p>`;
   let wip, aging, exceptions;
   try {
+    const wipQuery = fProject ? `?project_id=${fProject}` : "";
+    const agingParams = new URLSearchParams({ limit: "40" });
+    if (fProject) agingParams.set("project_id", fProject);
+    if (fStage) agingParams.set("stage_id", fStage);
+    if (fDays) agingParams.set("min_days", fDays);
     [wip, aging, exceptions] = await Promise.all([
-      api("/api/reports/wip"),
-      api("/api/reports/aging?limit=40"),
+      api(`/api/reports/wip${wipQuery}`),
+      api(`/api/reports/aging?${agingParams}`),
       api("/api/reports/exceptions"),
     ]);
   } catch {
@@ -566,6 +693,21 @@ async function viewReports() {
   const stateCodes = wip.states.map((s) => s.code);
 
   $view.innerHTML = `
+    <div class="filters">
+      <select id="r-project">
+        <option value="">All projects</option>
+        ${projects.map((p) => `<option value="${p.id}" ${p.id === fProject ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
+      </select>
+      <select id="r-stage">
+        <option value="">All stages</option>
+        ${stages.map((s) => `<option value="${s.id}" ${s.id === fStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
+      </select>
+      <select id="r-days">
+        <option value="">Any age</option>
+        ${[1, 2, 3, 5, 7, 14].map((d) => `<option value="${d}" ${String(d) === fDays ? "selected" : ""}>≥ ${d}d</option>`).join("")}
+      </select>
+    </div>
+
     <div class="card">
       <h2>WIP by stage</h2>
       ${wip.stages.map((row) => `
@@ -609,6 +751,13 @@ async function viewReports() {
           <div class="muted">${esc(row.detail)}</div>
         </div>`).join("")}
     </div>` : ""}`;
+
+  for (const [id, key] of [["r-project", "r-project"], ["r-stage", "r-stage"], ["r-days", "r-days"]]) {
+    document.getElementById(id).onchange = (e) => {
+      sessionStorage.setItem(key, e.target.value);
+      render();
+    };
+  }
 }
 
 /* --------------------------------------------------------------- office -- */
@@ -693,6 +842,10 @@ function viewOffice() {
             </select>
             <button class="ghost" data-release="${item.id}" ${S.online ? "" : "disabled"} style="width:auto;padding:8px 16px">Release</button>
           </div>
+          <details style="margin-top:8px">
+            <summary class="muted" style="cursor:pointer">Already mid-production? Distribute the ${item.total_qty} pcs</summary>
+            <div data-dist-for="${item.id}" style="margin-top:6px"></div>
+          </details>
         </div>`).join("") || `<p class="muted">Nothing waiting.</p>`}
     </div>`;
 
@@ -786,16 +939,50 @@ function viewOffice() {
     }
   };
 
+  // Optional initial distribution: qty inputs per step of the selected route,
+  // for items entering the system already mid-production.
+  const renderDistribution = (itemId) => {
+    const select = $view.querySelector(`[data-route-for="${itemId}"]`);
+    const container = $view.querySelector(`[data-dist-for="${itemId}"]`);
+    if (!select || !container) return;
+    const template = templates.find((t) => t.id === select.value);
+    container.innerHTML = (template?.steps || []).map((step) => `
+      <div class="spread" style="padding:4px 0">
+        <span class="muted">${step.seq} · ${esc(stageById(step.stage_id)?.name || "?")}</span>
+        <input type="number" inputmode="numeric" min="0" placeholder="0"
+               data-dist-seq="${step.seq}" style="width:90px;padding:8px;text-align:center">
+      </div>`).join("");
+  };
+
+  $view.querySelectorAll("[data-route-for]").forEach((select) => {
+    const itemId = select.dataset.routeFor;
+    renderDistribution(itemId);
+    select.addEventListener("change", () => renderDistribution(itemId));
+  });
+
   $view.querySelectorAll("[data-release]").forEach((button) => {
     button.onclick = async () => {
       const itemId = button.dataset.release;
       const select = $view.querySelector(`[data-route-for="${itemId}"]`);
       const template = templates.find((t) => t.id === select.value);
-      if (!confirm(`Release against ${template.name} v${template.version}? The route is frozen from here.`)) return;
+
+      const distribution = {};
+      $view.querySelectorAll(`[data-dist-for="${itemId}"] [data-dist-seq]`).forEach((input) => {
+        const qty = Number(input.value);
+        if (qty > 0) distribution[input.dataset.distSeq] = qty;
+      });
+      const distributed = Object.values(distribution).reduce((a, b) => a + b, 0);
+      const summary = distributed
+        ? ` ${distributed} pcs start mid-route; the rest start unstarted.`
+        : "";
+      if (!confirm(`Release against ${template.name} v${template.version}? The route is frozen from here.${summary}`)) return;
       try {
         await api(`/api/items/${itemId}/release`, {
           method: "POST",
-          body: JSON.stringify({ route_template_id: select.value }),
+          body: JSON.stringify({
+            route_template_id: select.value,
+            initial_quantities: distribution,
+          }),
         });
         toast("Released to production");
         await sync();

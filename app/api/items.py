@@ -44,10 +44,14 @@ def list_items(
     project_id: uuid.UUID | None = None,
     stage_id: uuid.UUID | None = None,
     released: bool | None = None,
+    q: str | None = None,
 ) -> dict:
     query = sa.select(Item).options(selectinload(Item.steps)).order_by(Item.code)
     if project_id is not None:
         query = query.where(Item.project_id == project_id)
+    if q:
+        needle = f"%{q.strip()}%"
+        query = query.where(Item.code.ilike(needle) | Item.description.ilike(needle))
     if released is True:
         query = query.where(Item.released_at.is_not(None))
     elif released is False:
@@ -153,7 +157,14 @@ def release(
     if template is None or not template.is_published:
         raise HTTPException(422, "unknown route template")
     try:
-        release_item(db, item, template, user, drawing_revision=payload.drawing_revision)
+        release_item(
+            db,
+            item,
+            template,
+            user,
+            drawing_revision=payload.drawing_revision,
+            initial_quantities=payload.initial_quantities,
+        )
     except ReleaseError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     db.refresh(item)

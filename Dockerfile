@@ -18,7 +18,11 @@ COPY migrations migrations
 COPY seeds seeds
 COPY static static
 
-RUN useradd --create-home lsf
+RUN useradd --create-home lsf \
+    # Present in the image so the named volume inherits this ownership on first
+    # mount; without it the volume comes up root-owned and uploads fail.
+    && mkdir -p /srv/lsf/data/uploads \
+    && chown -R lsf /srv/lsf/data
 USER lsf
 
 EXPOSE 8000

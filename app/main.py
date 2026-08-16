@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, events, items, office, reference, reports
+from app.api import auth, events, images, items, office, reference, reports
 from app.config import get_settings
 
 app = FastAPI(title="LSF Track", docs_url="/api/docs", openapi_url="/api/openapi.json")
@@ -15,6 +15,7 @@ app.include_router(auth.router)
 app.include_router(reference.router)
 app.include_router(items.router)
 app.include_router(office.router)
+app.include_router(images.router)
 app.include_router(events.router)
 app.include_router(reports.router)
 

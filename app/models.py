@@ -225,6 +225,22 @@ class ItemStep(Base):
     stage: Mapped[Stage] = relationship()
 
 
+class ItemImage(Base):
+    """A photo attached to an item. The file lives on disk under LSF_UPLOAD_DIR;
+    this row is the authoritative record of what was uploaded and by whom."""
+
+    __tablename__ = "item_images"
+
+    id: Mapped[uuid.UUID] = _pk()
+    item_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("items.id"), index=True)
+    filename: Mapped[str] = mapped_column(sa.String(255))
+    content_type: Mapped[str] = mapped_column(sa.String(64))
+    size_bytes: Mapped[int] = mapped_column(sa.Integer)
+    uploaded_by_user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"))
+    uploaded_at: Mapped[datetime] = mapped_column(default=utcnow)
+    note: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+
+
 class Event(Base):
     """The log. Insert only: no UPDATE, no DELETE, anywhere, ever.
 

@@ -59,6 +59,8 @@ class Settings:
     secure_cookies: bool
     max_device_ahead_seconds: int
     max_sync_lag_days: int
+    upload_dir: str
+    max_upload_bytes: int
 
     @property
     def session_max_age_seconds(self) -> int:
@@ -76,4 +78,6 @@ def get_settings() -> Settings:
         secure_cookies=_bool("LSF_SECURE_COOKIES", True),
         max_device_ahead_seconds=_int("LSF_MAX_DEVICE_AHEAD_SECONDS", 3600),
         max_sync_lag_days=_int("LSF_MAX_SYNC_LAG_DAYS", 14),
+        upload_dir=os.environ.get("LSF_UPLOAD_DIR", "data/uploads"),
+        max_upload_bytes=_int("LSF_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
     )
