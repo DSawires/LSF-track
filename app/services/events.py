@@ -247,6 +247,24 @@ def _validate_availability(db, item: Item, item_step, payload, event_type: Event
         blame = next((a for a in after if a.event_id == payload.id), after[-1])
         raise EventRejected(f"the log cannot support this move: {blame.detail}", "qty")
 
+    # allows_partial_qty=False: this stage moves whole batches, never splits.
+    # Enforced as "nothing may be left behind upstream": after the replay with
+    # this event included, every position before the target must be empty.
+    stage = vocab.stages.get(item_step.stage_id)
+    if stage is not None and not stage.allows_partial_qty and not event_type.is_rework:
+        kept, _anomalies = effective_events(events + [candidate])
+        ledger = ItemLedger(item, steps, vocab)
+        ledger.apply_all(kept)
+        left_behind = ledger.available_upstream(item_step.id, payload.state_id)
+        if left_behind:
+            raise EventRejected(
+                (
+                    f"stage '{stage.name}' does not allow partial quantities; "
+                    f"this move would leave {left_behind} behind"
+                ),
+                "qty",
+            )
+
 
 def _attribute_user(db: Session, payload, session_user: User) -> uuid.UUID:
     """Credit the engineer who logged it, not whoever happened to drain the queue.

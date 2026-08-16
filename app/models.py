@@ -118,7 +118,6 @@ class EventType(Base):
     moves_quantity: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     requires_item_step: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     requires_reason_code: Mapped[bool] = mapped_column(sa.Boolean, default=False)
-    counts_toward_completion: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
 
 class ReasonCode(Base):

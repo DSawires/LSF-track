@@ -26,6 +26,7 @@ from app.models import (
     ItemStep,
     RouteTemplate,
     RouteTemplateStep,
+    Stage,
     User,
 )
 
@@ -55,6 +56,19 @@ def release_item(
     )
     if not template_steps:
         raise ReleaseError(f"route {route_template.code} v{route_template.version} has no steps")
+
+    # Route creation validates this too, but the flag can be flipped on a stage
+    # *after* templates referencing it exist. A mid-route terminal stage would
+    # count units finished there and hide them from every later step.
+    stages = {s.id: s for s in db.scalars(sa.select(Stage))}
+    for template_step in template_steps[:-1]:
+        stage = stages.get(template_step.stage_id)
+        if stage is not None and stage.is_terminal:
+            raise ReleaseError(
+                f"stage '{stage.name}' is terminal but not the last step of "
+                f"{route_template.code} v{route_template.version}; fix the route "
+                f"or the stage flag before releasing against it"
+            )
 
     revision = drawing_revision or item.drawing_revision
     moment = released_at or utcnow()

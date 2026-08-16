@@ -62,6 +62,47 @@ class ProjectCreate(BaseModel):
     client: str | None = Field(default=None, max_length=160)
 
 
+class StageCreate(BaseModel):
+    """A new stage, added at runtime by an admin — no deploy, no migration.
+
+    Behaviour is expressed ONLY through these flags; nothing in the codebase
+    branches on the code string.
+    """
+
+    code: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9_]+$")
+    name: str = Field(min_length=1, max_length=120)
+    sort_order: int = 0
+    requires_station: bool = False
+    requires_external_po: bool = False
+    allows_partial_qty: bool = True
+    is_terminal: bool = False
+
+
+class StageUpdate(BaseModel):
+    """Everything but the code, which is the stage's identity."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    sort_order: int | None = None
+    is_active: bool | None = None
+    requires_station: bool | None = None
+    requires_external_po: bool | None = None
+    allows_partial_qty: bool | None = None
+    is_terminal: bool | None = None
+
+
+class StationCreate(BaseModel):
+    stage_id: uuid.UUID
+    code: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9_]+$")
+    name: str = Field(min_length=1, max_length=120)
+    sort_order: int = 0
+
+
+class StationUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    sort_order: int | None = None
+    is_active: bool | None = None
+
+
 class RouteTemplateCreate(BaseModel):
     """Steps in order. Posting an existing code creates the next version."""
 

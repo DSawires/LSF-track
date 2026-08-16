@@ -733,6 +733,8 @@ function viewLogScreen(itemId) {
         <button id="qty-plus">+</button>
       </div>
       <p class="muted" style="margin-top:5px">${available} available at the previous step</p>
+      ${stage?.requires_external_po ? `<p class="muted">External supplier stage — time in state is supplier lead time.</p>` : ""}
+      ${stage && !stage.allows_partial_qty ? `<p class="muted">Whole-batch stage — a move that leaves units behind is rejected.</p>` : ""}
       <p class="warn-text" id="qty-warn" hidden>More than is available upstream — the server will reject this entry until the earlier steps are logged. It will wait under the sync pill with a Retry button.</p>
 
       ${offerAutoQueue ? `
@@ -1090,6 +1092,13 @@ async function viewReports() {
 /* Stage sequence being assembled in the "New route" card. Survives re-renders
    of the Office view within a session. */
 let routeDraft = [];
+/* Where the next tapped stage lands in the draft: an index, or null to append.
+   This is how a stage gets slotted BETWEEN two existing steps — the versioned
+   template then carries the insertion with seq gaps of 10. */
+let routeInsertAt = null;
+
+const slugify = (text) =>
+  text.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
 function viewOffice() {
   const projects = S.ref?.projects || [];
@@ -1143,12 +1152,8 @@ function viewOffice() {
       <div class="seg" id="nr-stages">
         ${stages.map((s) => `<button data-add-stage="${s.id}">${esc(s.name)}</button>`).join("")}
       </div>
-      <label>Sequence${routeDraft.length ? " — tap a step to remove it" : ""}</label>
-      <div id="nr-seq">
-        ${routeDraft.map((stageId, i) =>
-          `<span class="badge qty" data-remove-step="${i}" style="margin:0 6px 6px 0;padding:6px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`
-        ).join("") || `<span class="muted">Empty — a route needs at least one stage.</span>`}
-      </div>
+      <label>Sequence${routeDraft.length ? " — tap a step to remove it, tap a ＋ to insert there" : ""}</label>
+      <div id="nr-seq"></div>
       <p class="muted" id="nr-version-hint" style="margin-top:6px"></p>
       <div style="height:12px"></div>
       <button class="primary" id="nr-go" ${S.online && routeDraft.length ? "" : "disabled"}>Create route</button>
@@ -1187,6 +1192,26 @@ function viewOffice() {
       <div id="mg-projects"></div>
       <label>Route versions</label>
       <div id="mg-routes"></div>
+    </div>
+
+    <div class="card">
+      <h2>Stages &amp; stations</h2>
+      <p class="muted" style="margin-bottom:8px">Adding a stage needs no deploy and no code
+      change: add it here with its behaviour flags, add stations if it has physical
+      instances, then create a new route version with the stage slotted in. Items already
+      in production keep the route they were released against.</p>
+      <div id="mg-stages" class="muted">Loading…</div>
+      <details style="margin-top:12px">
+        <summary class="muted" style="cursor:pointer">New stage</summary>
+        <div class="field-grid" style="margin-top:8px">
+          <div><label for="ns-name">Name</label><input id="ns-name" placeholder="Glass shop"></div>
+          <div><label for="ns-sort">Sort order</label><input id="ns-sort" type="number" inputmode="numeric"></div>
+        </div>
+        <div id="ns-flags"></div>
+        <div style="height:8px"></div>
+        <button class="primary" id="ns-go" ${S.online ? "" : "disabled"}>Add stage</button>
+        <p class="warn-text" id="ns-err" hidden></p>
+      </details>
     </div>` : ""}`;
 
   document.getElementById("ni-go").onclick = async () => {
@@ -1247,18 +1272,42 @@ function viewOffice() {
 
   // ---- route builder: updates in place so typed inputs survive ----
   const renderSeq = () => {
-    document.getElementById("nr-seq").innerHTML = routeDraft.map((stageId, i) =>
-      `<span class="badge qty" data-remove-step="${i}" style="margin:0 6px 6px 0;padding:6px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`
-    ).join("") || `<span class="muted">Empty — a route needs at least one stage.</span>`;
+    const chip = (stageId, i) =>
+      `<span class="badge qty" data-remove-step="${i}" style="margin:0 4px 6px 0;padding:8px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`;
+    const slot = (i) =>
+      `<button data-insert-at="${i}" class="insert-slot${routeInsertAt === i ? " on" : ""}" title="Insert here">＋</button>`;
+    document.getElementById("nr-seq").innerHTML = routeDraft.length
+      ? routeDraft.map((stageId, i) => slot(i) + chip(stageId, i)).join("") + slot(routeDraft.length)
+      : `<span class="muted">Empty — a route needs at least one stage.</span>`;
     document.getElementById("nr-go").disabled = !S.online || !routeDraft.length;
-    document.querySelectorAll("[data-remove-step]").forEach((chip) => {
-      chip.onclick = () => { routeDraft.splice(Number(chip.dataset.removeStep), 1); renderSeq(); };
+    document.querySelectorAll("[data-remove-step]").forEach((el) => {
+      el.onclick = () => {
+        routeDraft.splice(Number(el.dataset.removeStep), 1);
+        routeInsertAt = null;
+        renderSeq();
+      };
+    });
+    document.querySelectorAll("[data-insert-at]").forEach((el) => {
+      el.onclick = () => {
+        const at = Number(el.dataset.insertAt);
+        routeInsertAt = routeInsertAt === at ? null : at;
+        renderSeq();
+      };
     });
   };
   renderSeq();
 
   document.querySelectorAll("[data-add-stage]").forEach((button) => {
-    button.onclick = () => { routeDraft.push(button.dataset.addStage); renderSeq(); };
+    button.onclick = () => {
+      if (routeInsertAt === null || routeInsertAt >= routeDraft.length) {
+        routeDraft.push(button.dataset.addStage);
+        routeInsertAt = null;
+      } else {
+        routeDraft.splice(routeInsertAt, 0, button.dataset.addStage);
+        routeInsertAt += 1; // consecutive taps keep inserting in order
+      }
+      renderSeq();
+    };
   });
 
   const versionHint = () => {
@@ -1284,6 +1333,7 @@ function viewOffice() {
         }),
       });
       routeDraft = [];
+      routeInsertAt = null;
       toast(`Route ${created.code} v${created.version} created`);
       await sync();
     } catch (error) {
@@ -1313,7 +1363,10 @@ function viewOffice() {
     select.addEventListener("change", () => renderDistribution(itemId));
   });
 
-  if (S.user?.is_admin) loadManage();
+  if (S.user?.is_admin) {
+    loadManage();
+    renderStageAdmin();
+  }
 
   $view.querySelectorAll("[data-release]").forEach((button) => {
     button.onclick = async () => {
@@ -1346,6 +1399,146 @@ function viewOffice() {
       }
     };
   });
+}
+
+/* ----------------------------------------------- stage admin (runtime) -- */
+
+/* The behaviour flags a stage can carry. Labels only — nothing here branches
+   on what any particular stage means. */
+const STAGE_FLAGS = [
+  ["requires_station", "Has physical stations"],
+  ["requires_external_po", "External supplier (lead time, PO)"],
+  ["allows_partial_qty", "Allows partial quantities"],
+  ["is_terminal", "Terminal — completes the item"],
+];
+
+function flagCheckboxes(prefix, values) {
+  return STAGE_FLAGS.map(([key, label]) => `
+    <label style="display:flex;align-items:center;gap:10px;font-size:14px;color:var(--text);margin:6px 0">
+      <input type="checkbox" data-flag="${prefix}:${key}" ${values[key] ? "checked" : ""}
+             style="width:22px;height:22px;flex:none">
+      ${label}
+    </label>`).join("");
+}
+
+function readFlags(prefix) {
+  const out = {};
+  for (const [key] of STAGE_FLAGS) {
+    const box = document.querySelector(`[data-flag="${prefix}:${key}"]`);
+    if (box) out[key] = box.checked;
+  }
+  return out;
+}
+
+function renderStageAdmin() {
+  const target = document.getElementById("mg-stages");
+  if (!target) return;
+
+  const stages = [...(S.ref?.stages || [])].sort((a, b) => a.sort_order - b.sort_order);
+  target.classList.remove("muted");
+  target.innerHTML = stages.map((s) => {
+    const stations = (S.ref?.stations || []).filter((st) => st.stage_id === s.id);
+    const flagSummary = STAGE_FLAGS.filter(([k]) => s[k]).map(([, l]) => l.split(" — ")[0].split(" (")[0]).join(" · ");
+    return `
+      <details style="padding:4px 0;border-bottom:1px solid var(--line)">
+        <summary style="cursor:pointer;padding:6px 0">
+          <strong>${esc(s.name)}</strong>${s.is_active ? "" : ` <span class="badge">inactive</span>`}
+          <br><span class="muted">${esc(flagSummary || "no flags")}${stations.length ? ` · stations: ${stations.map((st) => esc(st.name) + (st.is_active ? "" : " (off)")).join(", ")}` : ""}</span>
+        </summary>
+        <div style="padding:8px 0 12px">
+          <div class="field-grid">
+            <div><label>Name</label><input data-stage-name="${s.id}" value="${esc(s.name)}"></div>
+            <div><label>Sort order</label><input data-stage-sort="${s.id}" type="number" inputmode="numeric" value="${s.sort_order}"></div>
+          </div>
+          ${flagCheckboxes(s.id, s)}
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+            <button class="ghost" data-stage-save="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
+            <button class="ghost" data-stage-toggle="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${s.is_active ? "Deactivate" : "Reactivate"}</button>
+          </div>
+          <label style="margin-top:10px">Add station</label>
+          <div class="qty-row">
+            <input data-station-name="${s.id}" placeholder="e.g. ${esc(s.name)} ${stations.length + 1}" style="flex:1;text-align:left;padding:10px">
+            <button class="ghost" data-station-add="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Add</button>
+          </div>
+        </div>
+      </details>`;
+  }).join("") || `<span class="muted">No stages yet.</span>`;
+
+  const patchStage = async (stageId, body, doneMessage) => {
+    try {
+      await api(`/api/stages/${stageId}`, { method: "PATCH", body: JSON.stringify(body) });
+      toast(doneMessage);
+      await sync(); // refreshes S.ref, re-renders the office view
+    } catch (error) {
+      alert(error.body?.detail || "Could not update the stage.");
+    }
+  };
+
+  target.querySelectorAll("[data-stage-save]").forEach((button) => {
+    button.onclick = () => {
+      const id = button.dataset.stageSave;
+      patchStage(id, {
+        name: document.querySelector(`[data-stage-name="${id}"]`).value.trim(),
+        sort_order: Number(document.querySelector(`[data-stage-sort="${id}"]`).value) || 0,
+        ...readFlags(id),
+      }, "Stage updated");
+    };
+  });
+  target.querySelectorAll("[data-stage-toggle]").forEach((button) => {
+    button.onclick = () => {
+      const stage = S.ref.stages.find((s) => s.id === button.dataset.stageToggle);
+      patchStage(stage.id, { is_active: !stage.is_active },
+        stage.is_active ? "Stage deactivated" : "Stage reactivated");
+    };
+  });
+  target.querySelectorAll("[data-station-add]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.stationAdd;
+      const name = document.querySelector(`[data-station-name="${id}"]`).value.trim();
+      if (!name) return;
+      try {
+        await api("/api/stations", {
+          method: "POST",
+          body: JSON.stringify({ stage_id: id, code: slugify(name), name }),
+        });
+        toast("Station added");
+        await sync();
+      } catch (error) {
+        alert(error.body?.detail || "Could not add the station.");
+      }
+    };
+  });
+
+  // ---- new stage form ----
+  const flags = document.getElementById("ns-flags");
+  if (flags && !flags.innerHTML) {
+    flags.innerHTML = flagCheckboxes("new", { allows_partial_qty: true });
+    const maxSort = Math.max(0, ...stages.map((s) => s.sort_order));
+    document.getElementById("ns-sort").value = maxSort + 10;
+  }
+  const go = document.getElementById("ns-go");
+  if (go) go.onclick = async () => {
+    const err = document.getElementById("ns-err");
+    err.hidden = true;
+    const name = document.getElementById("ns-name").value.trim();
+    if (!name) { err.textContent = "The stage needs a name."; err.hidden = false; return; }
+    try {
+      await api("/api/stages", {
+        method: "POST",
+        body: JSON.stringify({
+          code: slugify(name),
+          name,
+          sort_order: Number(document.getElementById("ns-sort").value) || 0,
+          ...readFlags("new"),
+        }),
+      });
+      toast(`Stage ${name} added — slot it into a route version to use it`);
+      await sync();
+    } catch (error) {
+      err.textContent = error.body?.detail || "Could not add the stage.";
+      err.hidden = false;
+    }
+  };
 }
 
 /* Admin management lists: items (incl. archived), projects, route versions,

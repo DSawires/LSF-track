@@ -1,9 +1,13 @@
 """Idempotent seed data.
 
 This file and the tests are the only places stage, station, state and event-type
-codes may appear as string literals. Running it twice changes nothing; running it
-against a factory that has since added its own stages touches only the rows named
-here, matched by code.
+codes may appear as string literals. Running it twice changes nothing.
+
+Insert-if-missing ONLY, never update: stages and their behaviour flags are
+runtime data that the factory tunes through the admin UI, and the entrypoint
+re-runs this seed on every container start. An upsert here would silently
+revert an operator's edits on each restart -- the exact failure the
+"stages are data, not code" rule exists to prevent.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ EVENT_TYPES = [
         "rework_return",
         "Rework return",
         20,
-        {"is_rework": True, "requires_reason_code": True, "counts_toward_completion": False},
+        {"is_rework": True, "requires_reason_code": True},
     ),
     (
         "correction",
@@ -80,18 +84,15 @@ REASON_CODES = [
 ]
 
 
-def _upsert(db: Session, model, code: str, values: dict) -> None:
+def _insert_if_missing(db: Session, model, code: str, values: dict) -> None:
     row = db.scalars(sa.select(model).where(model.code == code)).first()
     if row is None:
         db.add(model(code=code, **values))
-    else:
-        for key, value in values.items():
-            setattr(row, key, value)
 
 
 def run(db: Session) -> None:
     for code, name, sort, requires_station, external_po, terminal in STAGES:
-        _upsert(
+        _insert_if_missing(
             db,
             Stage,
             code,
@@ -107,7 +108,7 @@ def run(db: Session) -> None:
 
     stage_ids = {s.code: s.id for s in db.scalars(sa.select(Stage))}
     for code, stage_code, name, sort in STATIONS:
-        _upsert(
+        _insert_if_missing(
             db,
             Station,
             code,
@@ -115,14 +116,14 @@ def run(db: Session) -> None:
         )
 
     for code, name, sort, is_complete in STATES:
-        _upsert(
+        _insert_if_missing(
             db, EventState, code, {"name": name, "sort_order": sort, "is_complete": is_complete}
         )
 
     for code, name, sort, flags in EVENT_TYPES:
-        _upsert(db, EventType, code, {"name": name, "sort_order": sort, **flags})
+        _insert_if_missing(db, EventType, code, {"name": name, "sort_order": sort, **flags})
 
     for code, name, sort in REASON_CODES:
-        _upsert(db, ReasonCode, code, {"name": name, "sort_order": sort})
+        _insert_if_missing(db, ReasonCode, code, {"name": name, "sort_order": sort})
 
     db.flush()

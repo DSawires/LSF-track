@@ -94,7 +94,6 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "moves_quantity": t.moves_quantity,
                 "requires_item_step": t.requires_item_step,
                 "requires_reason_code": t.requires_reason_code,
-                "counts_toward_completion": t.counts_toward_completion,
             }
             for t in event_types
         ],

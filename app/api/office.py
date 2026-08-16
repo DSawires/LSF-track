@@ -1,9 +1,15 @@
-"""Technical-office setup: projects and route templates.
+"""Technical-office setup: projects, route templates, stages and stations.
 
 Route templates are append-only in spirit: posting steps under an existing code
 creates the *next version* rather than editing the old one, because items already
 released hold a snapshot of whatever version they left against, and published
 history should stay explainable.
+
+Stages and stations are the runtime vocabulary the whole design revolves
+around: adding one here is the "no deploy, no migration, no code change"
+procedure from CLAUDE.md, so these endpoints exist precisely so that a
+non-developer can perform it. Admin-only, because a typo'd behaviour flag
+changes how the ledger treats every future event at that stage.
 """
 
 from __future__ import annotations
@@ -16,10 +22,113 @@ import uuid
 
 from app.db import get_db
 from app.deps import current_user, require_admin
-from app.models import Item, Project, RouteTemplate, RouteTemplateStep, Stage, User
-from app.schemas import ProjectCreate, RouteTemplateCreate
+from app.models import Item, Project, RouteTemplate, RouteTemplateStep, Stage, Station, User
+from app.schemas import (
+    ProjectCreate,
+    RouteTemplateCreate,
+    StageCreate,
+    StageUpdate,
+    StationCreate,
+    StationUpdate,
+)
 
 router = APIRouter(prefix="/api", tags=["office"])
+
+
+def _stage_payload(stage: Stage) -> dict:
+    return {
+        "id": str(stage.id),
+        "code": stage.code,
+        "name": stage.name,
+        "sort_order": stage.sort_order,
+        "is_active": stage.is_active,
+        "requires_station": stage.requires_station,
+        "requires_external_po": stage.requires_external_po,
+        "allows_partial_qty": stage.allows_partial_qty,
+        "is_terminal": stage.is_terminal,
+    }
+
+
+@router.post("/stages", status_code=status.HTTP_201_CREATED)
+def create_stage(
+    payload: StageCreate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    if db.scalars(sa.select(Stage).where(Stage.code == payload.code)).first() is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"stage {payload.code} already exists")
+    stage = Stage(
+        code=payload.code,
+        name=payload.name.strip(),
+        sort_order=payload.sort_order,
+        requires_station=payload.requires_station,
+        requires_external_po=payload.requires_external_po,
+        allows_partial_qty=payload.allows_partial_qty,
+        is_terminal=payload.is_terminal,
+    )
+    db.add(stage)
+    db.flush()
+    return _stage_payload(stage)
+
+
+@router.patch("/stages/{stage_id}")
+def update_stage(
+    stage_id: uuid.UUID,
+    payload: StageUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    stage = db.get(Stage, stage_id)
+    if stage is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown stage")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(stage, field, value)
+    db.flush()
+    return _stage_payload(stage)
+
+
+@router.post("/stations", status_code=status.HTTP_201_CREATED)
+def create_station(
+    payload: StationCreate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    if db.get(Stage, payload.stage_id) is None:
+        raise HTTPException(422, "unknown stage")
+    if db.scalars(sa.select(Station).where(Station.code == payload.code)).first() is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"station {payload.code} already exists")
+    station = Station(
+        stage_id=payload.stage_id,
+        code=payload.code,
+        name=payload.name.strip(),
+        sort_order=payload.sort_order,
+    )
+    db.add(station)
+    db.flush()
+    return {
+        "id": str(station.id),
+        "stage_id": str(station.stage_id),
+        "code": station.code,
+        "name": station.name,
+        "sort_order": station.sort_order,
+        "is_active": station.is_active,
+    }
+
+
+@router.patch("/stations/{station_id}")
+def update_station(
+    station_id: uuid.UUID,
+    payload: StationUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    station = db.get(Station, station_id)
+    if station is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown station")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(station, field, value)
+    db.flush()
+    return {"ok": True}
 
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
@@ -101,6 +210,15 @@ def create_route_template(
     for stage_id in payload.stage_ids:
         if stage_id not in stages:
             raise HTTPException(422, f"unknown stage {stage_id}")
+    # A terminal stage completes units for good (the ledger counts them
+    # finished there); anywhere but last, the steps after it would silently
+    # never see the work.
+    for stage_id in payload.stage_ids[:-1]:
+        if stages[stage_id].is_terminal:
+            raise HTTPException(
+                422,
+                f"stage '{stages[stage_id].name}' is terminal and must be the last step",
+            )
 
     latest = db.scalars(
         sa.select(RouteTemplate)
