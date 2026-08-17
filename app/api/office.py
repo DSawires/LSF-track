@@ -181,15 +181,22 @@ def archive_project(
     project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown project")
-    active_items = db.scalar(
-        sa.select(sa.func.count())
-        .select_from(Item)
-        .where(Item.project_id == project_id, Item.is_active.is_(True))
+    # Only THIS project's items can block it. The message names them, because
+    # "2 active items" against a flat item list is how an admin ends up blaming
+    # another job's work for a project that will not archive.
+    blocking = list(
+        db.scalars(
+            sa.select(Item.code)
+            .where(Item.project_id == project_id, Item.is_active.is_(True))
+            .order_by(Item.code)
+        )
     )
-    if active_items:
+    if blocking:
+        named = ", ".join(blocking[:5]) + (" …" if len(blocking) > 5 else "")
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"project has {active_items} active item(s); remove or archive them first",
+            f"project has {len(blocking)} active item(s) in it ({named}); "
+            "remove or archive those first",
         )
     project.is_active = False
     db.flush()

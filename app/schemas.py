@@ -121,6 +121,13 @@ class StationUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class ImageNoteUpdate(BaseModel):
+    """The words that go with a snag photo. Written after the shutter, because
+    on the floor the photo is taken first and described second."""
+
+    note: str = Field(default="", max_length=255)
+
+
 class RouteTemplateCreate(BaseModel):
     """Steps in order. Posting an existing code creates the next version."""
 

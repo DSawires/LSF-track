@@ -1,4 +1,4 @@
-# LSF Track
+# Life Style Track
 
 Production tracking for a bespoke contract furniture factory. Engineers on the
 floor log the movement of item batches through production stages from their

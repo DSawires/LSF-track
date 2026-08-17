@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "LSF Track",
-  "short_name": "LSF Track",
+  "name": "Life Style Track",
+  "short_name": "Life Style",
   "description": "Factory production tracking: log item movement through stages from the floor, fully offline-capable.",
   "start_url": "/",
   "scope": "/",

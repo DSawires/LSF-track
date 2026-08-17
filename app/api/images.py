@@ -24,6 +24,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import current_user
 from app.models import Item, ItemImage, User
+from app.schemas import ImageNoteUpdate
 from app.storage import get_storage
 
 router = APIRouter(prefix="/api", tags=["images"])
@@ -136,6 +137,23 @@ def list_images(
         .order_by(ItemImage.uploaded_at.desc())
     )
     return {"images": [_image_payload(image) for image in rows]}
+
+
+@router.patch("/images/{image_id}")
+def update_image_note(
+    image_id: uuid.UUID,
+    payload: ImageNoteUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Describe a snag after the fact. Only the note is editable: the bytes an
+    image id names never change, which is what lets them be cached forever."""
+    image = db.get(ItemImage, image_id)
+    if image is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown image")
+    image.note = payload.note.strip()[:255] or None
+    db.flush()
+    return _image_payload(image)
 
 
 @router.get("/images/{image_id}")

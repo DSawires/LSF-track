@@ -1,4 +1,4 @@
-/* LSF Track — the whole client.
+/* Life Style Track — the whole client.
 
    Ground rules, mirroring CLAUDE.md:
    - Logging never touches the network. Writes go to the IndexedDB queue, the UI
@@ -502,7 +502,7 @@ function viewLogin() {
   const pendingCount = S.pending.filter((q) => q._status === "pending").length;
   $view.innerHTML = `
     <div class="login-wrap">
-      <h2 style="text-align:center;font-size:22px;margin-bottom:12px">LSF Track</h2>
+      <h2 style="text-align:center;font-size:22px;margin-bottom:12px">Life Style Track</h2>
       <form class="card" id="login-form">
         <label for="login-user">Username</label>
         <input id="login-user" autocapitalize="none" autocomplete="username" enterkeyhint="next" required>
@@ -938,6 +938,12 @@ function viewLogScreen(itemId, fromKey) {
       <h2>Photos <span class="muted" id="photo-count"></span></h2>
       <div id="photos" class="muted">Loading…</div>
       <div style="height:8px"></div>
+      <div id="photo-progress" hidden>
+        <div class="bar-track" id="photo-track"><div class="bar-fill" id="photo-bar" style="width:0"></div></div>
+        <p id="photo-status" class="muted" style="margin:4px 0 8px" role="status" aria-live="polite"></p>
+      </div>
+      <input id="photo-note" maxlength="255" placeholder="Describe the snag (optional)"
+             style="margin-bottom:8px" ${S.online ? "" : "disabled"}>
       <label class="ghost" style="display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
         ${S.online ? "Add snag photo" : "Photos need a connection"}
         <input type="file" id="photo-file" accept="image/*" capture="environment" hidden ${S.online ? "" : "disabled"}>
@@ -1024,35 +1030,38 @@ function viewLogScreen(itemId, fromKey) {
     rerender();
   };
 
-  const wireUpload = (inputId, kind, doneMessage, refreshList) => {
+  const wireUpload = (inputId, kind, doneMessage, refreshList, noteInputId) => {
     const input = document.getElementById(inputId);
     if (!input) return;
     input.onchange = async () => {
       const file = input.files[0];
       if (!file) return;
-      const form = new FormData();
-      form.append("file", file);
-      form.append("kind", kind);
+      if (photoStatus.busy) { toast("A photo is already uploading."); return; }
+      const noteInput = noteInputId ? document.getElementById(noteInputId) : null;
+      photoStatus.start();
       try {
-        const response = await fetch(`/api/items/${item.id}/images`, {
-          method: "POST", body: form, credentials: "same-origin",
+        await uploadImage(item.id, file, {
+          kind,
+          note: noteInput?.value.trim() || "",
+          onProgress: photoStatus.set,
         });
-        if (!response.ok) throw new Error();
+        photoStatus.done();
         toast(doneMessage);
+        if (noteInput) noteInput.value = ""; // kept on failure, so a retry has it
         logScreenCache.fetchedAt = 0; // the photo list just changed
         if (refreshList) {
           await sync(); // pulls the new icon_url into S.items, re-renders
         } else {
           loadPhotos(item);
         }
-      } catch {
-        toast("Upload failed");
+      } catch (error) {
+        photoStatus.fail(error.detail);
       } finally {
         input.value = "";
       }
     };
   };
-  wireUpload("photo-file", "snag", "Snag photo added", false);
+  wireUpload("photo-file", "snag", "Snag photo added", false, "photo-note");
 
   loadRecent(item);
   loadPhotos(item);
@@ -1136,6 +1145,86 @@ function cacheSet(item, key, value) {
   logScreenCache.fetchedAt = Date.now();
 }
 
+/* Photo upload is the one request in the app big enough to watch go by: a
+   camera file over factory Wi-Fi is megabytes and seconds, and an unmarked
+   wait reads as a freeze. fetch() cannot report how far a body has got, so
+   this is the one XMLHttpRequest in the codebase.
+
+   Rejects with .detail set to the server's own words — "not a recognised image
+   format", "image exceeds 10MB" — because "Upload failed" leaves an engineer
+   with a photo, a snag, and nothing to do about either. */
+function uploadImage(itemId, file, { kind = "snag", note = "", onProgress } = {}) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("kind", kind);
+    form.append("note", note);
+
+    const fail = (detail) => reject(Object.assign(new Error("upload failed"), { detail }));
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/items/${itemId}/images`);
+    xhr.withCredentials = true;
+    xhr.timeout = 120000; // a dead spot must not leave the bar stuck forever
+    xhr.upload.onprogress = (e) => {
+      if (onProgress && e.lengthComputable) onProgress(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText); } catch { /* not JSON; fall through */ }
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(body); return; }
+      if (xhr.status === 401) {
+        S.needsLogin = true;
+        fail("Session expired — sign in again, then add the photo.");
+      } else {
+        fail(body.detail ? rejectReason({ body }) : `The server refused it (HTTP ${xhr.status}).`);
+      }
+    };
+    xhr.onerror = () => fail("No connection — the photo was not sent. Try again in range.");
+    xhr.ontimeout = () => fail("Timed out — the connection dropped mid-upload. Try again.");
+    xhr.onabort = () => fail("Upload cancelled.");
+    xhr.send(form);
+  });
+}
+
+/* Failures stay on screen rather than passing by in a toast: a message that
+   vanishes is how "it sometimes just doesn't work" gets started. */
+const photoStatus = {
+  busy: false,
+  start() {
+    photoStatus.busy = true;
+    const box = document.getElementById("photo-progress");
+    if (!box) return;
+    box.hidden = false;
+    document.getElementById("photo-track").hidden = false;
+    photoStatus.set(0);
+  },
+  set(fraction) {
+    const bar = document.getElementById("photo-bar");
+    if (!bar) return;
+    const percent = Math.round(fraction * 100);
+    bar.style.width = `${percent}%`;
+    const text = document.getElementById("photo-status");
+    text.className = "muted";
+    // The bytes are up but the server still has to sniff, cap and store them.
+    text.textContent = percent < 100 ? `Sending photo… ${percent}%` : "Saving on the server…";
+  },
+  done() {
+    photoStatus.busy = false;
+    const box = document.getElementById("photo-progress");
+    if (box) box.hidden = true;
+  },
+  fail(reason) {
+    photoStatus.busy = false;
+    const box = document.getElementById("photo-progress");
+    if (!box) return;
+    box.hidden = false;
+    document.getElementById("photo-track").hidden = true;
+    const text = document.getElementById("photo-status");
+    text.className = "warn-text";
+    text.textContent = reason || "Upload failed.";
+  },
+};
+
 async function loadPhotos(item) {
   const target = document.getElementById("photos");
   if (!target) return;
@@ -1148,13 +1237,38 @@ async function loadPhotos(item) {
     target.innerHTML = images.length
       ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
           ${images.map((img) => `
-            <a href="${img.url}" target="_blank" rel="noopener" style="position:relative;display:block">
-              <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy"
-                   style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;border:1px solid var(--line)">
-              ${img.kind === "icon" ? `<span class="badge" style="position:absolute;top:4px;left:4px;background:rgba(0,0,0,.55)">icon</span>` : ""}
-            </a>`).join("")}
+            <div>
+              <a href="${img.url}" target="_blank" rel="noopener" style="position:relative;display:block">
+                <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy"
+                     style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;border:1px solid var(--line)">
+                ${img.kind === "icon" ? `<span class="badge" style="position:absolute;top:4px;left:4px;background:rgba(0,0,0,.55)">icon</span>` : ""}
+              </a>
+              <button class="ghost" data-note-for="${img.id}" ${S.online ? "" : "disabled"}
+                      style="width:100%;margin-top:4px;padding:6px 4px;min-height:36px;font-size:12px;text-align:left;overflow:hidden;overflow-wrap:anywhere"
+                      title="${esc(img.note || "")}">${img.note ? esc(img.note) : "+ note"}</button>
+            </div>`).join("")}
          </div>`
       : `<span class="muted">No photos yet.</span>`;
+
+    // The note is written after the shutter: on the floor you photograph the
+    // snag first and find the words for it second.
+    target.querySelectorAll("[data-note-for]").forEach((button) => {
+      const image = images.find((img) => img.id === button.dataset.noteFor);
+      button.onclick = async () => {
+        const note = prompt("What is the snag?", image.note || "");
+        if (note === null) return;
+        try {
+          await api(`/api/images/${image.id}`, {
+            method: "PATCH", body: JSON.stringify({ note: note.trim() }),
+          });
+          toast(note.trim() ? "Note saved" : "Note cleared");
+          logScreenCache.fetchedAt = 0;
+          loadPhotos(item);
+        } catch (error) {
+          alert(error.body?.detail || "Could not save the note.");
+        }
+      };
+    });
   } catch {
     if (target.isConnected) target.textContent = "Offline — photos unavailable.";
   }
@@ -1522,15 +1636,14 @@ function viewOffice() {
       });
       const iconFile = document.getElementById("ni-icon").files[0];
       if (iconFile) {
-        const form = new FormData();
-        form.append("file", iconFile);
-        form.append("kind", "icon");
-        const uploaded = await fetch(`/api/items/${created.id}/images`, {
-          method: "POST", body: form, credentials: "same-origin",
-        });
         // The item exists either way; a failed icon shouldn't look like a
-        // failed creation.
-        toast(uploaded.ok ? "Item created with icon" : "Item created — icon upload failed");
+        // failed creation — but it should say what went wrong with the icon.
+        try {
+          await uploadImage(created.id, iconFile, { kind: "icon" });
+          toast("Item created with icon");
+        } catch (error) {
+          toast(`Item created — icon not uploaded: ${error.detail}`);
+        }
       } else {
         toast("Item created");
       }
@@ -2031,11 +2144,16 @@ async function loadManage() {
       <button class="ghost" ${attr}="${id}" style="flex:none">${action}</button>
     </div>`;
 
+  // Which project each item belongs to: this list spans every job, and
+  // archiving a project means clearing ITS items — you have to be able to see
+  // which ones those are.
+  const projectCode = new Map((S.ref?.projects || []).map((p) => [p.id, p.code]));
+
   try {
     const { items } = await api("/api/items?include_archived=true");
     if (!$items.isConnected) return;
     $items.innerHTML = items.map((item) => row(
-      esc(item.code),
+      `${esc(item.code)} <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>`,
       `${esc(item.description)} · ${!item.is_active ? "archived" : item.is_released ? "released" : "not released"}`,
       "data-rm-item", item.id, item.is_active ? "Remove" : "Archived",
     )).join("") || `<span class="muted">No items.</span>`;

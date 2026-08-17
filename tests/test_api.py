@@ -494,3 +494,21 @@ def test_unpublish_route_version(world, client):
     assert result.json() == {"unpublished": True}
     listed = client.get("/api/reference").json()["route_templates"]
     assert [t["is_published"] for t in listed if t["id"] == str(route.id)] == [False]
+
+
+def test_archiving_a_project_ignores_items_in_other_projects(client, factory):
+    """Only a project's own items hold it open. An unrelated job being busy is
+    not a reason to refuse, and the refusal names the items that are."""
+    from app.models import Project
+
+    empty = Project(code="EMPTY", name="Nothing here")
+    factory.db.add(empty)
+    factory.db.flush()
+    busy = factory.item("BUSY-1", 10)  # active, and in a different project
+    factory.db.commit()
+
+    assert client.delete(f"/api/projects/{empty.id}").json() == {"archived": True}
+
+    refused = client.delete(f"/api/projects/{factory.project.id}")
+    assert refused.status_code == 409
+    assert busy.code in refused.json()["detail"]

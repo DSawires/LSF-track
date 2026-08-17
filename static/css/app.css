@@ -68,7 +68,17 @@ header {
   border-bottom: 1px solid var(--line);
 }
 
-header h1 { font-size: 17px; font-weight: 650; flex: 1; }
+/* The name is longer than the bar on a small phone; it truncates rather than
+   pushing the sync pill off the edge. */
+header h1 {
+  font-size: 17px;
+  font-weight: 650;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 #sync-pill {
   display: flex;
@@ -334,6 +344,9 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
   font-size: 14px;
   z-index: 50;
   transition: opacity 0.3s;
+  /* Wide enough to carry a reason, not just a verdict. */
+  max-width: min(92vw, 420px);
+  text-align: center;
 }
 
 .warn-text { color: var(--warn); font-size: 13px; margin-top: 6px; }
@@ -349,6 +362,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .bar-track { background: var(--panel-2); border-radius: 4px; height: 8px; overflow: hidden; }
 .bar-fill { background: var(--accent); height: 100%; }
+
+/* The upload bar moves, unlike the report bars it borrows its look from. */
+#photo-bar { transition: width 0.15s linear; }
 
 .filters { display: flex; gap: 8px; margin-bottom: 12px; }
 .filters select { flex: 1; padding: 10px; }

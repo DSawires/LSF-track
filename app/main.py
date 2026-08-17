@@ -66,7 +66,7 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="LSF Track",
+    title="Life Style Track",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
     lifespan=_lifespan,
