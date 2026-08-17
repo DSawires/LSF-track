@@ -212,7 +212,11 @@ version; items already released keep the version they left against.
   events (single + batch), reports.
 - `static/` — the PWA. `js/db.js` is the IndexedDB queue and cache; `js/app.js`
   renders everything from the reference payload and never names a stage, state
-  or event type by its code; `sw.js` caches the shell (server-stamped version),
+  or event type by its code. It syncs every 30 seconds but only redraws when
+  the payload actually changed (ages are compared at the one decimal place the
+  UI prints), and a redraw carries the user's typing, ticked boxes, open panels
+  and scroll position across — a refresh must never cost someone their work.
+  `sw.js` caches the shell (server-stamped version),
   drains the queue via Background Sync, and serves last-known API data offline
   with a staleness marker.
 - `migrations/`, `seeds/`, `manage.py` — Alembic, insert-if-missing seed data

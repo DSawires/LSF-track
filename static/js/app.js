@@ -178,7 +178,7 @@ async function sync() {
   }
   S.pending = await LSF_DB.queueAll();
   renderPill();
-  render(true); // background refresh; defers if the user is mid-form
+  render(true); // background refresh: skipped unless the data actually moved
 }
 
 /* The pill always shows the pending count AND the last sync together — an
@@ -347,10 +347,106 @@ function navigate(hash) { location.hash = hash; }
 // Wrapped so the Event object is not mistaken for the `background` flag.
 window.addEventListener("hashchange", () => render());
 
-/* Fields the user has actually typed into since the last deliberate render.
-   A background sync must not clobber them with freshly-rendered defaults. */
+/* A background sync re-renders whatever view is open, and a re-render throws
+   away everything the user has done to the DOM that is not in the payload:
+   text typed, boxes ticked, panels opened, where they had scrolled to. Two
+   defences, in order of value:
+
+   1. Don't re-render at all unless the data actually changed (fingerprint).
+   2. When it does change, carry the user's work across (snapshot/restore).
+
+   Together they mean a 30-second tick on an idle floor is invisible, and a
+   tick that does carry news costs the user nothing. */
+
+/* A stable name for a form field across renders. Ids where they exist;
+   otherwise the chain of data-* attributes down from the view, because the
+   office forms key their fields by entity id rather than by id attribute --
+   and a bare `data-dist-seq="10"` repeats once per item, so the ancestor
+   `data-dist-for="<item id>"` is what makes it unique. */
+function fieldKey(el) {
+  if (el.id) return `#${el.id}`;
+  const parts = [];
+  for (let node = el; node && node !== $view; node = node.parentElement) {
+    const data = node.getAttributeNames().filter((name) => name.startsWith("data-"));
+    if (data.length) parts.unshift(data.map((n) => `${n}=${node.getAttribute(n)}`).join(","));
+  }
+  return parts.length ? parts.join("/") : null;
+}
+
+/* Fields the user has actually touched since the last deliberate render. A
+   background sync must not clobber them with freshly-rendered defaults. */
 const dirtyFields = new Set();
-$view.addEventListener("input", (e) => { if (e.target.id) dirtyFields.add(e.target.id); });
+$view.addEventListener("input", (e) => {
+  const key = fieldKey(e.target);
+  if (key) dirtyFields.add(key);
+});
+
+let lastSnapshot = { fields: {}, panels: {}, dirty: new Set(), scrollTop: 0, background: false };
+
+function snapshotView(background) {
+  const fields = {};
+  $view.querySelectorAll("input, select, textarea").forEach((el) => {
+    const key = fieldKey(el);
+    // A file input's value can only ever be set back to "", so leave it be.
+    if (!key || el.type === "file") return;
+    if (el.type === "checkbox" || el.type === "radio") fields[key] = { checked: el.checked };
+    else if (el.value) fields[key] = { value: el.value };
+  });
+  const panels = {};
+  $view.querySelectorAll("details[data-panel]").forEach((el) => { panels[el.dataset.panel] = el.open; });
+  return { fields, panels, dirty: new Set(dirtyFields), scrollTop: $view.scrollTop, background };
+}
+
+function restoreView(snapshot) {
+  $view.querySelectorAll("input, select, textarea").forEach((el) => {
+    const key = fieldKey(el);
+    const saved = key && el.type !== "file" ? snapshot.fields[key] : null;
+    if (!saved) return;
+    // Restore into empty fields (text inputs with no default), and into any
+    // field the user had edited — even if the fresh render gave it a default,
+    // like the qty box does. An untouched field takes the fresh value, so an
+    // edit made on another phone still shows up.
+    if ("checked" in saved) {
+      if (snapshot.dirty.has(key)) el.checked = saved.checked;
+    } else if (!el.value || snapshot.dirty.has(key)) {
+      el.value = saved.value;
+    }
+  });
+  // Which panels were open belongs to the user's session, not to the data —
+  // but only a background refresh has to preserve it. Deliberate navigation
+  // should land on a fresh view, the way it does today.
+  if (!snapshot.background) return;
+  $view.querySelectorAll("details[data-panel]").forEach((el) => {
+    if (el.dataset.panel in snapshot.panels) el.open = snapshot.panels[el.dataset.panel];
+  });
+}
+
+/* Everything the open view is drawn from, normalised so that values which tick
+   on their own do not read as news: the server clock, and ages that are only
+   ever printed to one decimal place. Equal fingerprints mean a re-render would
+   produce the same DOM, so it is skipped — which is most 30-second ticks. */
+function viewFingerprint(hash) {
+  return JSON.stringify(
+    [
+      hash,
+      S.user?.id,
+      S.online,
+      S.needsLogin,
+      // The sync screen is the one view that prints a relative time.
+      hash.startsWith("#/sync") ? S.lastSync : null,
+      S.pending,
+      S.ref,
+      S.items,
+    ],
+    (key, value) => {
+      if (key === "server_time") return undefined;
+      if (key === "days_in_state") return Math.round(value * 10);
+      return value;
+    },
+  );
+}
+
+let renderedFingerprint = null;
 
 function render(background = false) {
   const hash = location.hash || "#/items";
@@ -369,17 +465,20 @@ function render(background = false) {
   document.querySelectorAll("#tabs a").forEach((a) =>
     a.classList.toggle("active", a.dataset.tab === route));
 
-  // A background sync re-renders whatever view is open. Don't let that eat a
-  // half-typed form: skip the refresh entirely while a field is focused (the
-  // next sync catches up), and carry user-typed values over regardless.
+  // Skip the refresh entirely while a field is focused: the next sync catches
+  // up, and nothing is worth interrupting someone mid-keystroke for.
   const typing = $view.contains(document.activeElement) &&
     /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
   if (background && typing) return;
+
+  // Nothing the view is built from has moved, so rebuilding it would only
+  // destroy what the user is in the middle of. Checked after the focus guard
+  // so a deferred tick still renders once the field is left.
+  const fingerprint = viewFingerprint(hash);
+  if (background && fingerprint === renderedFingerprint) return;
+
   if (!background) dirtyFields.clear();
-  const saved = {};
-  $view.querySelectorAll("input[id], select[id]").forEach((el) => {
-    if (el.value) saved[el.id] = el.value;
-  });
+  lastSnapshot = snapshotView(background);
 
   if (route === "login") viewLogin();
   else if (route === "sync") viewSyncStatus();
@@ -388,13 +487,12 @@ function render(background = false) {
   else if (route === "office") viewOffice();
   else viewItems();
 
-  for (const [id, value] of Object.entries(saved)) {
-    const el = document.getElementById(id);
-    // Restore into empty fields (text inputs with no default), and into any
-    // field the user had edited — even if the fresh render gave it a default,
-    // like the qty box does.
-    if (el && (!el.value || dirtyFields.has(id))) el.value = value;
-  }
+  restoreView(lastSnapshot);
+  // Scroll is restored here and not in restoreView(), because the async lists
+  // call that back much later — by which time the user may have scrolled and
+  // would not thank us for putting them back.
+  if (background && lastSnapshot.scrollTop) $view.scrollTop = lastSnapshot.scrollTop;
+  renderedFingerprint = fingerprint;
 }
 
 /* ---------------------------------------------------------------- login -- */
@@ -824,7 +922,7 @@ function viewLogScreen(itemId, fromKey) {
         Also queue at ${esc(nextStage?.name || "next stage")}
       </label>` : ""}
 
-      <details ${logSel.note ? "open" : ""} style="margin-top:12px">
+      <details data-panel="log-note" ${logSel.note ? "open" : ""} style="margin-top:12px">
         <summary class="muted" style="cursor:pointer">Add note${logSel.note ? " ·" : ""}</summary>
         <input id="log-note" maxlength="2000" placeholder="e.g. rack 3, waiting on fittings"
                value="${esc(logSel.note)}" style="margin-top:6px">
@@ -1324,7 +1422,7 @@ function viewOffice() {
             </select>
             <button class="ghost" data-release="${item.id}" ${S.online ? "" : "disabled"} style="width:auto;padding:8px 16px">Release</button>
           </div>
-          <details style="margin-top:8px">
+          <details data-panel="dist:${item.id}" style="margin-top:8px">
             <summary class="muted" style="cursor:pointer">Already mid-production? Distribute the ${item.total_qty} pcs</summary>
             <div data-dist-for="${item.id}" style="margin-top:6px"></div>
           </details>
@@ -1371,7 +1469,7 @@ function viewOffice() {
       instances, then create a new route version with the stage slotted in. Items already
       in production keep the route they were released against.</p>
       <div id="mg-stages" class="muted">Loading…</div>
-      <details style="margin-top:12px">
+      <details data-panel="new-stage" style="margin-top:12px">
         <summary class="muted" style="cursor:pointer">New stage</summary>
         <div class="field-grid" style="margin-top:8px">
           <div><label for="ns-name">Name</label><input id="ns-name" placeholder="Glass shop"></div>
@@ -1389,7 +1487,7 @@ function viewOffice() {
     <div class="card">
       <h2>Users</h2>
       <div id="mg-users" class="muted">Loading…</div>
-      <details style="margin-top:12px">
+      <details data-panel="new-user" style="margin-top:12px">
         <summary class="muted" style="cursor:pointer">New user</summary>
         <div class="field-grid" style="margin-top:8px">
           <div><label for="nu-username">Username</label><input id="nu-username" autocapitalize="none" autocomplete="off"></div>
@@ -1660,7 +1758,7 @@ function renderStageAdmin() {
       s.max_days_in_state != null ? `ages at ${s.max_days_in_state}d` : "",
     ].filter(Boolean).join(" · ");
     return `
-      <details style="padding:4px 0;border-bottom:1px solid var(--line)">
+      <details data-panel="stage:${s.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
         <summary style="cursor:pointer;padding:6px 0">
           <strong>${esc(s.name)}</strong>${s.is_active ? "" : ` <span class="badge">inactive</span>`}
           <br><span class="muted">${esc(flagSummary || "no flags")}${stations.length ? ` · stations: ${stations.map((st) => esc(st.name) + (st.is_active ? "" : " (off)")).join(", ")}` : ""}</span>
@@ -1831,7 +1929,7 @@ async function loadUsers() {
 
   target.classList.remove("muted");
   target.innerHTML = users.map((u) => `
-    <details style="padding:4px 0;border-bottom:1px solid var(--line)">
+    <details data-panel="user:${u.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
       <summary style="cursor:pointer;padding:6px 0">
         <strong>${esc(u.display_name)}</strong> <span class="muted">${esc(u.username)}</span>
         ${u.is_admin ? `<span class="badge">admin</span>` : ""}${u.is_active ? "" : ` <span class="badge">deactivated</span>`}
@@ -1864,6 +1962,10 @@ async function loadUsers() {
       alert(error.body?.detail || "Could not update the user.");
     }
   };
+
+  // This list lands after render() has already restored the view, so it has to
+  // put the user's open panels and half-typed names back itself.
+  restoreView(lastSnapshot);
 
   target.querySelectorAll("[data-user-save]").forEach((b) => {
     b.onclick = () => patchUser(b.dataset.userSave, {
