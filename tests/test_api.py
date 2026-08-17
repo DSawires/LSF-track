@@ -611,3 +611,34 @@ def test_project_rename_and_reactivate(client, factory):
 
     assert client.delete(f"/api/projects/{project_id}").json() == {"archived": True}
     assert client.patch(f"/api/projects/{project_id}", json={"is_active": True}).json()["is_active"] is True
+
+
+def test_item_editing_is_admin_only(client, factory):
+    """Floor engineers log, release and bump revisions -- all of which append
+    to the log. Renaming an item or resizing its batch re-labels what everyone
+    else already logged, so it stays with admins."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.models import User
+    from app.security import hash_password
+
+    item = factory.item("LOCKED-1", 10)
+    factory.db.add(User(
+        username="floor2",
+        display_name="Floor Engineer",
+        password_hash=hash_password("floor-pw"),
+        is_admin=False,
+    ))
+    factory.db.commit()
+
+    with TestClient(app) as floor:
+        assert floor.post(
+            "/api/auth/login", json={"username": "floor2", "password": "floor-pw"}
+        ).status_code == 200
+        assert floor.patch(
+            f"/api/items/{item.id}", json={"code": "SNEAKY-1"}
+        ).status_code == 403
+
+    # the admin session still can
+    assert client.patch(f"/api/items/{item.id}", json={"code": "RENAMED-1"}).status_code == 200
