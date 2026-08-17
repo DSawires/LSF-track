@@ -56,6 +56,7 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "requires_external_po": s.requires_external_po,
                 "allows_partial_qty": s.allows_partial_qty,
                 "is_terminal": s.is_terminal,
+                "max_days_in_state": s.max_days_in_state,
             }
             for s in stages
         ],
@@ -77,6 +78,8 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "name": s.name,
                 "sort_order": s.sort_order,
                 "is_complete": s.is_complete,
+                "is_initial": s.is_initial,
+                "is_active": s.is_active,
             }
             for s in states
         ],
@@ -94,7 +97,6 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "moves_quantity": t.moves_quantity,
                 "requires_item_step": t.requires_item_step,
                 "requires_reason_code": t.requires_reason_code,
-                "counts_toward_completion": t.counts_toward_completion,
             }
             for t in event_types
         ],

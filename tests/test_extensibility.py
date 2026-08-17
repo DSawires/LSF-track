@@ -85,6 +85,156 @@ def test_queue_depth_comes_from_state_order_not_name(factory):
     assert wip["queue_state_code"] == "queued"
 
 
+def test_stage_and_station_added_through_the_admin_api(world, client):
+    """The full CLAUDE.md procedure, end to end, through HTTP: add a stage and
+    a station via the admin endpoints, cut a new route version with the stage
+    slotted in, release an item, log against it, and see it in the WIP report.
+    Zero code changes, zero deploys."""
+    factory, _route, _item = world
+
+    stage = client.post("/api/stages", json={
+        "code": "glass_shop",
+        "name": "Glass shop",
+        "sort_order": 45,
+        "requires_station": True,
+    }).json()
+    station = client.post("/api/stations", json={
+        "stage_id": stage["id"],
+        "code": "glass_shop_1",
+        "name": "Glass shop 1",
+    })
+    assert station.status_code == 201
+
+    carpentry = next(
+        s for s in client.get("/api/reference").json()["stages"] if s["code"] == "carpentry"
+    )
+    route = client.post("/api/routes", json={
+        "code": "glazed", "name": "Glazed casegoods",
+        "stage_ids": [carpentry["id"], stage["id"]],
+    }).json()
+
+    item = client.post("/api/items", json={
+        "code": "GLZ-1", "project_id": _project_id(client), "description": "Glazed cabinet",
+        "total_qty": 4, "drawing_revision": "A",
+    }).json()
+    assert client.post(f"/api/items/{item['id']}/release", json={
+        "route_template_id": route["id"],
+    }).status_code == 200
+
+    steps = client.get(f"/api/items/{item['id']}").json()["steps"]
+    glass_step = next(s for s in steps if s["stage_id"] == stage["id"])
+    states = client.get("/api/reference").json()["states"]
+    queued = next(s for s in states if s["sort_order"] == min(x["sort_order"] for x in states))
+    move = next(
+        t for t in client.get("/api/reference").json()["event_types"]
+        if t["moves_quantity"] and not t["is_rework"] and not t["is_correction"]
+    )
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    posted = client.post("/api/events", json={
+        "id": str(_uuid.uuid4()),
+        "item_id": item["id"],
+        "item_step_id": glass_step["id"],
+        "station_id": station.json()["id"],
+        "event_type_id": move["id"],
+        "state_id": queued["id"],
+        "qty": 4,
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+    })
+    assert posted.status_code == 201
+
+    wip = client.get("/api/reports/wip").json()
+    row = next(r for r in wip["stages"] if r["stage"]["code"] == "glass_shop")
+    assert row["total_qty"] == 4
+
+
+def _project_id(client) -> str:
+    return client.get("/api/reference").json()["projects"][0]["id"]
+
+
+def test_stage_admin_endpoints_require_admin(factory, client):
+    """Floor engineers log events; only admins reshape the factory."""
+    import sqlalchemy as sa
+
+    from app.models import User
+    from app.security import hash_password
+
+    factory.db.add(User(
+        username="floor",
+        display_name="Floor Engineer",
+        password_hash=hash_password("floor-pw"),
+        is_admin=False,
+    ))
+    factory.db.commit()
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as floor:
+        assert floor.post(
+            "/api/auth/login", json={"username": "floor", "password": "floor-pw"}
+        ).status_code == 200
+        denied = floor.post("/api/stages", json={"code": "sneaky", "name": "Sneaky"})
+        assert denied.status_code == 403
+        some_stage = factory.db.scalars(sa.select(type(factory.stage("paint"))).limit(1)).first()
+        assert floor.patch(
+            f"/api/stages/{some_stage.id}", json={"is_terminal": True}
+        ).status_code == 403
+        assert floor.post("/api/stations", json={
+            "stage_id": str(some_stage.id), "code": "sneaky_1", "name": "Sneaky 1",
+        }).status_code == 403
+
+
+def test_terminal_stage_must_be_last_in_a_route(world, client):
+    factory, _route, _item = world
+    reference = client.get("/api/reference").json()
+    packing = next(s for s in reference["stages"] if s["is_terminal"])
+    carpentry = next(s for s in reference["stages"] if s["code"] == "carpentry")
+
+    response = client.post("/api/routes", json={
+        "code": "backwards", "name": "Backwards",
+        "stage_ids": [packing["id"], carpentry["id"]],
+    })
+    assert response.status_code == 422
+    assert "terminal" in response.json()["detail"]
+
+
+def test_seed_rerun_does_not_clobber_operator_edits(factory):
+    """The entrypoint reruns the seed on every container start; a behaviour
+    flag tuned through the admin UI must survive it."""
+    from seeds.seed import run as run_seed
+
+    paint = factory.stage("paint")
+    paint.requires_station = False
+    paint.name = "Paint & lacquer"
+    factory.db.flush()
+
+    run_seed(factory.db)
+    factory.db.flush()
+    factory.db.refresh(paint)
+    assert paint.requires_station is False
+    assert paint.name == "Paint & lacquer"
+
+
+def test_whole_batch_stage_rejects_partial_moves(factory):
+    """allows_partial_qty=False is enforced, not decorative: a move that leaves
+    units behind upstream is rejected."""
+    import pytest
+
+    from app.services.events import EventRejected
+
+    factory.add_stage("kiln", sort=25, allows_partial_qty=False)
+    route = factory.route("r-kiln", ["carpentry", "kiln"])
+    item = factory.item("KILN-1", 20, route)
+
+    factory.log(item, 10, "completed", 20, at=hours_ago(5), station_code="carpentry_1")
+    with pytest.raises(EventRejected, match="partial"):
+        factory.log(item, 20, "queued", 8, at=hours_ago(2))
+    # The whole batch moves fine.
+    factory.log(item, 20, "queued", 20, at=hours_ago(1))
+
+
 def test_no_stage_codes_hardcoded_outside_seeds_and_tests():
     """Enforce CLAUDE.md rule 2 mechanically: the seeded stage codes must not
     appear as literals anywhere in app/."""

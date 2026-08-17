@@ -56,6 +56,16 @@ const LSF_DB = (() => {
           if (req.result) s.put({ ...req.result, _status: "rejected", _reason: reason });
         };
       }),
+    // Back to pending: the engineer's recovery path for a false rejection
+    // (e.g. an over-advance whose upstream event synced from another device
+    // after this one was refused).
+    markPending: (id) =>
+      tx("queue", "readwrite", (s) => {
+        const req = s.get(id);
+        req.onsuccess = () => {
+          if (req.result) s.put({ ...req.result, _status: "pending", _reason: undefined });
+        };
+      }),
     dropRejected: (id) => tx("queue", "readwrite", (s) => s.delete(id)),
 
     // ---- kv cache ----

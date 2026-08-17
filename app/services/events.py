@@ -6,12 +6,13 @@ Idempotency: the client generates the UUID, so a retry after a lost response fin
 the row already there and returns it. Re-posting is never an error and never
 duplicates.
 
-Rejections are rare and structural. An event that reaches this function is stored
-unless it is literally unprocessable -- an unknown id, a step that belongs to
-another item. Arithmetic that does not add up (a batch advancing more units than
-exist upstream) is *stored and flagged*, because the engineer logged it hours ago on
-a phone with no signal and has long since walked away. Losing their entry at sync
-time is the one failure this system cannot afford.
+Rejections are structural or arithmetic, never silent. An unknown id, a step that
+belongs to another item, or a move of more units than the log holds upstream of the
+target all return a 422 with a reason. Nothing is dropped without the client being
+told: the phone quarantines a rejected entry where the engineer can see the reason,
+retry it (the recovery path when the missing upstream entry syncs later from another
+device), or discard it. Batches are applied in occurred_at order so an offline
+session's own sequence of entries always validates against itself.
 """
 
 from __future__ import annotations
@@ -19,12 +20,13 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.db import utcnow
+from app.ledger import ItemLedger, effective_events
 from app.models import (
     Event,
     EventState,
@@ -37,6 +39,11 @@ from app.models import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# Hard ceiling on how far ahead of the server clock an occurred_at may be.
+# Distinct from settings.max_device_ahead_seconds, which only *flags*.
+_MAX_FUTURE = timedelta(days=7)
 
 
 class EventRejected(Exception):
@@ -131,6 +138,16 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         # and the target is excluded from the derivation the moment it lands.
 
     occurred_at = _require_aware(payload.occurred_at, "occurred_at")
+    if occurred_at > utcnow() + _MAX_FUTURE:
+        # Small clock drift is stored and flagged (see clock_anomalies); a
+        # timestamp days in the future is garbage that would sort after every
+        # honest event forever -- and an append-only log can never remove it.
+        raise EventRejected(
+            "occurred_at is more than a week in the future; fix the device clock",
+            "occurred_at",
+        )
+
+    _validate_availability(db, item, item_step, payload, event_type)
 
     event = Event(
         id=payload.id,
@@ -145,6 +162,9 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         # Never from the client: this is how a wrong device clock is detected.
         received_at=utcnow(),
         user_id=_attribute_user(db, payload, session_user),
+        # Always the authenticated session, so the claimed attribution above is
+        # auditable: the log records both who saw the work and who posted it.
+        submitted_by_user_id=session_user.id,
         note=payload.note,
         supersedes_event_id=payload.supersedes_event_id,
     )
@@ -161,6 +181,89 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
             raise
         return EventWrite(event=stored, created=False)
     return EventWrite(event=event, created=True)
+
+
+def _validate_availability(db, item: Item, item_step, payload, event_type: EventType) -> None:
+    """Reject a move the log cannot support.
+
+    CLAUDE.md: a batch advancing more units than exist upstream is a validation
+    error, not a stored fact. The test is a simulation, not a running-total
+    check: replay the item's whole log in occurred_at order *with the candidate
+    included*, and reject only if that replay over-advances where the log
+    without it did not. Judging the whole timeline matters because events sync
+    out of order -- a downstream event arriving before its upstream partner
+    must not be refused when the replay will seat both correctly once the
+    partner lands (the ledger deliberately lets skipped intermediate logs
+    resolve themselves).
+
+    A genuine rejection is recoverable: the client quarantines the entry with
+    this reason and offers a retry, which is how it resolves once the state of
+    the log changes (a correction voids the conflicting entry, or the missing
+    upstream event syncs in from another device).
+    """
+    if not event_type.moves_quantity or payload.qty <= 0:
+        return
+    if item_step is None or payload.state_id is None:
+        return
+
+    # Replays this item's log as it stands, including events inserted earlier
+    # in the same batch (they are in the session already). Cheap at this
+    # factory's volume; see services.derivation for the scaling escape hatch.
+    from app.services.derivation import load_vocabulary
+
+    vocab = load_vocabulary(db)
+    steps = list(db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item.id)))
+    events = list(db.scalars(sa.select(Event).where(Event.item_id == item.id)))
+
+    def over_advances(candidate_rows: list) -> list:
+        kept, _anomalies = effective_events(candidate_rows)
+        ledger = ItemLedger(item, steps, vocab)
+        ledger.apply_all(kept)
+        return [a for a in ledger.anomalies if a.code == "over_advance"]
+
+    probe = ItemLedger(item, steps, vocab)
+    if not probe.has_position(item_step.id, payload.state_id):
+        raise EventRejected(
+            "step and state do not name a position on this item's route", "state_id"
+        )
+
+    # A detached stand-in, never added to the session: the replay only reads
+    # attributes.
+    candidate = Event(
+        id=payload.id,
+        item_id=item.id,
+        item_step_id=item_step.id,
+        station_id=payload.station_id,
+        event_type_id=event_type.id,
+        state_id=payload.state_id,
+        qty=payload.qty,
+        occurred_at=payload.occurred_at,
+        received_at=utcnow(),
+        supersedes_event_id=payload.supersedes_event_id,
+    )
+    before = over_advances(events)
+    after = over_advances(events + [candidate])
+    if len(after) > len(before):
+        blame = next((a for a in after if a.event_id == payload.id), after[-1])
+        raise EventRejected(f"the log cannot support this move: {blame.detail}", "qty")
+
+    # allows_partial_qty=False: this stage moves whole batches, never splits.
+    # Enforced as "nothing may be left behind upstream": after the replay with
+    # this event included, every position before the target must be empty.
+    stage = vocab.stages.get(item_step.stage_id)
+    if stage is not None and not stage.allows_partial_qty and not event_type.is_rework:
+        kept, _anomalies = effective_events(events + [candidate])
+        ledger = ItemLedger(item, steps, vocab)
+        ledger.apply_all(kept)
+        left_behind = ledger.available_upstream(item_step.id, payload.state_id)
+        if left_behind:
+            raise EventRejected(
+                (
+                    f"stage '{stage.name}' does not allow partial quantities; "
+                    f"this move would leave {left_behind} behind"
+                ),
+                "qty",
+            )
 
 
 def _attribute_user(db: Session, payload, session_user: User) -> uuid.UUID:
@@ -186,7 +289,31 @@ def _require_aware(moment: datetime, field: str) -> datetime:
 
 
 def _differs(existing: Event, payload) -> bool:
-    for field in ("item_id", "item_step_id", "station_id", "event_type_id", "state_id", "qty"):
+    """Every field the client controls. A UUID reused with ANY different
+    content is the client bug the divergent flag exists to catch -- including
+    a different timestamp or a different superseded target."""
+    fields = (
+        "item_id",
+        "item_step_id",
+        "station_id",
+        "event_type_id",
+        "state_id",
+        "qty",
+        "reason_code_id",
+        "supersedes_event_id",
+        "note",
+    )
+    for field in fields:
         if getattr(existing, field) != getattr(payload, field, None):
             return True
+    payload_occurred = getattr(payload, "occurred_at", None)
+    if payload_occurred is not None and payload_occurred.tzinfo is not None:
+        if existing.occurred_at != payload_occurred:
+            return True
+    # user_id=None means "the session user", which legitimately varies between
+    # the original post and a replay drained by a colleague's phone -- only a
+    # non-null claim that names someone else counts as divergence.
+    claimed = getattr(payload, "user_id", None)
+    if claimed is not None and existing.user_id != claimed:
+        return True
     return False

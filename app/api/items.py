@@ -6,9 +6,19 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, selectinload
 
-from app.db import get_db
+from app.db import get_db, utcnow
 from app.deps import current_user, require_admin
-from app.models import Event, Item, ItemImage, ItemStep, Project, RouteTemplate, Stage, User
+from app.models import (
+    Event,
+    EventType,
+    Item,
+    ItemImage,
+    ItemStep,
+    Project,
+    RouteTemplate,
+    Stage,
+    User,
+)
 from app.schemas import ItemCreate, ReleaseRequest, RevisionBumpRequest
 from app.services import reports
 from app.services.release import ReleaseError, bump_revision, release_item
@@ -70,8 +80,14 @@ def list_items(
     if project_id is not None:
         query = query.where(Item.project_id == project_id)
     if q:
-        needle = f"%{q.strip()}%"
-        query = query.where(Item.code.ilike(needle) | Item.description.ilike(needle))
+        # Escape LIKE wildcards so a literal % or _ in the search box matches
+        # itself instead of exploding into a scan.
+        cleaned = q.strip().replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        needle = f"%{cleaned}%"
+        query = query.where(
+            Item.code.ilike(needle, escape="\\")
+            | Item.description.ilike(needle, escape="\\")
+        )
     if released is True:
         query = query.where(Item.released_at.is_not(None))
     elif released is False:
@@ -120,24 +136,31 @@ def item_events(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
     limit: int = 20,
+    offset: int = 0,
 ) -> dict:
-    """Most recent events for an item, newest first.
+    """Most recent events for an item, newest first, with offset paging so
+    older history stays reachable.
 
     This is what the phone shows under "recent entries", and where a correction
     picks the event it supersedes.
     """
+    # Function-local to break the router import cycle (events imports nothing
+    # from items, but both are imported by main before either is complete).
     from app.api.events import _event_payload
-    from app.models import Event
 
     if db.get(Item, item_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
+    total = db.scalar(
+        sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item_id)
+    )
     rows = db.scalars(
         sa.select(Event)
         .where(Event.item_id == item_id)
         .order_by(Event.occurred_at.desc(), Event.received_at.desc())
-        .limit(min(limit, 100))
+        .offset(max(offset, 0))
+        .limit(min(max(limit, 1), 100))
     )
-    return {"events": [_event_payload(e) for e in rows]}
+    return {"events": [_event_payload(e) for e in rows], "total": total}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -217,6 +240,27 @@ def remove_item(
     )
     if has_events:
         item.is_active = False
+        # Archiving removes the item's quantities from WIP; that must be a
+        # fact in the log (who, when), not a silent flag flip.
+        archive_type = db.scalars(
+            sa.select(EventType)
+            .where(EventType.is_archive.is_(True), EventType.is_active.is_(True))
+            .limit(1)
+        ).first()
+        if archive_type is not None:
+            db.add(
+                Event(
+                    id=uuid.uuid4(),
+                    item_id=item.id,
+                    event_type_id=archive_type.id,
+                    qty=0,
+                    occurred_at=utcnow(),
+                    received_at=utcnow(),
+                    user_id=admin.id,
+                    submitted_by_user_id=admin.id,
+                    note="item archived",
+                )
+            )
         db.flush()
         return {"archived": True, "deleted": False}
 

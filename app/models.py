@@ -58,6 +58,9 @@ class Stage(Base):
     requires_external_po: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     allows_partial_qty: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     is_terminal: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # Days in one state at this stage before the aging report and item cards
+    # flag it. NULL = no opinion (outsourced work sits for weeks by design).
+    max_days_in_state: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
 
     stations: Mapped[list[Station]] = relationship(back_populates="stage")
 
@@ -90,6 +93,10 @@ class EventState(Base):
     name: Mapped[str] = mapped_column(sa.String(64))
     sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
     is_complete: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # The state new work enters a step in (the queue). A flag rather than
+    # "lowest sort_order", so inserting a state that sorts before the queue
+    # cannot silently change what auto-queue and queue-depth mean.
+    is_initial: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
 
@@ -111,14 +118,14 @@ class EventType(Base):
     # Behaviour flags.
     is_correction: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_rework: Mapped[bool] = mapped_column(sa.Boolean, default=False)
-    # The two item-level events the server itself writes. Flagged rather than looked
+    # The item-level events the server itself writes. Flagged rather than looked
     # up by code, so the server never depends on a particular spelling.
     is_release: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_revision_bump: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    is_archive: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     moves_quantity: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     requires_item_step: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     requires_reason_code: Mapped[bool] = mapped_column(sa.Boolean, default=False)
-    counts_toward_completion: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
 
 class ReasonCode(Base):
@@ -274,6 +281,12 @@ class Event(Base):
     occurred_at: Mapped[datetime] = mapped_column(index=True)
     received_at: Mapped[datetime] = mapped_column(default=utcnow, index=True)
     user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"), index=True)
+    # user_id is the engineer who saw the work happen (client-claimed, for shared
+    # floor devices); submitted_by_user_id is the authenticated session that
+    # actually posted the row. Nullable only because rows predate the column.
+    submitted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("users.id"), nullable=True
+    )
     note: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     supersedes_event_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("events.id"), nullable=True, index=True

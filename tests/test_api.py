@@ -67,11 +67,52 @@ def test_divergent_replay_returns_stored_row(world, client):
     body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
     assert client.post("/api/events", json=body).status_code == 201
 
-    tampered = {**body, "qty": 999}
+    tampered = {**body, "qty": 49}
     response = client.post("/api/events", json=tampered)
     assert response.status_code == 201
     assert response.json()["divergent"] is True
     assert response.json()["event"]["qty"] == 50  # stored row wins
+
+
+def test_divergence_covers_every_client_field_not_just_the_movement(world, client):
+    """A reused UUID with only a different timestamp (or note) is still the
+    client bug the divergent flag exists to catch."""
+    factory, _route, item = world
+    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    assert client.post("/api/events", json=body).status_code == 201
+
+    shifted = {**body, "occurred_at": hours_ago(6).isoformat()}
+    assert client.post("/api/events", json=shifted).json()["divergent"] is True
+
+    noted = {**body, "note": "actually the other rack"}
+    assert client.post("/api/events", json=noted).json()["divergent"] is True
+
+    verbatim = client.post("/api/events", json=body)
+    assert verbatim.json()["divergent"] is False
+
+
+def test_archiving_an_item_writes_an_audit_event(world, client):
+    factory, _route, item = world
+    assert client.post(
+        "/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    ).status_code == 201
+
+    result = client.delete(f"/api/items/{item.id}")
+    assert result.json()["archived"] is True
+
+    factory.db.expire_all()
+    from app.models import EventType
+
+    archive_type = factory.db.scalars(
+        sa.select(EventType).where(EventType.is_archive.is_(True))
+    ).one()
+    audit = factory.db.scalars(
+        sa.select(Event).where(
+            Event.item_id == item.id, Event.event_type_id == archive_type.id
+        )
+    ).all()
+    assert len(audit) == 1
+    assert audit[0].submitted_by_user_id is not None
 
 
 def test_batch_sync_reports_per_event_outcomes(world, client):
@@ -108,6 +149,50 @@ def test_batch_with_internal_duplicate_stores_once_and_acks_both(world, client):
         )
     ).all()
     assert len(stored) == 2
+
+
+def test_received_at_is_server_set_and_cannot_be_smuggled(world, client):
+    from datetime import datetime, timezone
+
+    factory, _route, item = world
+    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    body["received_at"] = "1999-01-01T00:00:00+00:00"  # ignored: not a schema field
+
+    response = client.post("/api/events", json=body)
+    assert response.status_code == 201
+    received = datetime.fromisoformat(response.json()["event"]["received_at"])
+    assert abs((datetime.now(timezone.utc) - received).total_seconds()) < 60
+
+
+def test_batch_applies_in_occurred_at_order(world, client):
+    """A queue assembled out of order (retries, interleaved devices) must not
+    reject its own internally-consistent sequence: entries are applied by
+    occurred_at, so the downstream move validates against the upstream one that
+    occurred first, whatever the array order."""
+    factory, _route, item = world
+    later = _event_body(
+        factory, item, 20, "queued", 50, "paint_1",
+        occurred_at=hours_ago(1).isoformat(),
+    )
+    earlier = _event_body(
+        factory, item, 10, "completed", 50, "carpentry_1",
+        occurred_at=hours_ago(2).isoformat(),
+    )
+
+    response = client.post("/api/events/batch", json={"events": [later, earlier]})
+    assert response.status_code == 200
+    results = {r["id"]: r for r in response.json()["results"]}
+    assert results[earlier["id"]]["status"] == "stored"
+    assert results[later["id"]]["status"] == "stored"
+
+
+def test_over_advance_rejected_over_http_with_reason(world, client):
+    factory, _route, item = world
+    body = _event_body(factory, item, 10, "queued", item.total_qty + 1, "carpentry_1")
+    response = client.post("/api/events", json=body)
+    assert response.status_code == 422
+    assert response.json()["detail"]["field"] == "qty"
+    assert f"only {item.total_qty}" in response.json()["detail"]["reason"]
 
 
 def test_item_recent_events_endpoint(world, client):

@@ -9,7 +9,7 @@ import sqlalchemy as sa
 
 os.environ["LSF_DATABASE_URL"] = "sqlite://"
 os.environ["LSF_SECURE_COOKIES"] = "false"
-os.environ["LSF_SECRET_KEY"] = "test-secret"
+os.environ["LSF_SECRET_KEY"] = "test-secret-key-long-enough-to-pass-the-length-check"
 
 from app import db as app_db  # noqa: E402
 from app.db import Base, utcnow  # noqa: E402
@@ -64,6 +64,13 @@ def _clean_throttle():
     get_storage.cache_clear()
 
 
+# Set LSF_TEST_DATABASE_URL (e.g. postgresql+psycopg://...) to run the suite
+# against a real server instead of per-test SQLite files. CI does this: the
+# SAVEPOINT race handling, varchar length limits, and UUID behaviour genuinely
+# differ between dialects, and production runs on PostgreSQL.
+_EXTERNAL_DB = os.environ.get("LSF_TEST_DATABASE_URL", "").strip()
+
+
 @pytest.fixture()
 def db(tmp_path):
     # File-backed rather than :memory:, because the API tests hit the app through
@@ -71,10 +78,12 @@ def db(tmp_path):
     # SQLite would give each thread its own empty database.
     from app.config import get_settings
 
-    os.environ["LSF_DATABASE_URL"] = f"sqlite:///{tmp_path}/test.sqlite3"
+    os.environ["LSF_DATABASE_URL"] = _EXTERNAL_DB or f"sqlite:///{tmp_path}/test.sqlite3"
     get_settings.cache_clear()
     app_db.reset_engine()
     engine = app_db.get_engine()
+    if _EXTERNAL_DB:
+        Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     session = app_db.get_sessionmaker()()
     try:
@@ -82,6 +91,8 @@ def db(tmp_path):
         session.rollback()
     finally:
         session.close()
+        if _EXTERNAL_DB:
+            Base.metadata.drop_all(app_db.get_engine())
         app_db.reset_engine()
         get_settings.cache_clear()
 

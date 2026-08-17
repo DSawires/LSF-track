@@ -31,8 +31,11 @@ def aging(
     stage_id: uuid.UUID | None = None,
     min_days: float | None = None,
 ) -> dict:
+    # Uncapped only in the absence of a client value; a request can't demand
+    # every row of an old factory's log in one response.
+    capped = min(limit, 500) if limit is not None else 200
     return reports.aging_report(
-        db, limit=limit, project_id=project_id, stage_id=stage_id, min_days=min_days
+        db, limit=capped, project_id=project_id, stage_id=stage_id, min_days=min_days
     )
 
 

@@ -8,6 +8,7 @@ outage for that person.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 from fastapi import Depends, HTTPException, Request, Response, status
@@ -25,9 +26,17 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_settings().secret_key, salt="lsf-session")
 
 
+def _password_fingerprint(user: User) -> str:
+    # Binding the token to the password hash makes sessions revocable: change
+    # the password (or reset it after a lost phone) and every token issued
+    # before the change dies on its next request. A digest, not the hash
+    # itself -- the cookie must not leak offline-crackable material.
+    return hashlib.sha256(user.password_hash.encode()).hexdigest()[:16]
+
+
 def issue_session(response: Response, user: User) -> None:
     settings = get_settings()
-    token = _serializer().dumps({"uid": str(user.id)})
+    token = _serializer().dumps({"uid": str(user.id), "pwf": _password_fingerprint(user)})
     response.set_cookie(
         COOKIE_NAME,
         token,
@@ -62,6 +71,9 @@ def current_user(
     user = db.get(User, uuid.UUID(data["uid"]))
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "unknown user")
+    if data.get("pwf") != _password_fingerprint(user):
+        # Password changed since this token was issued; the old session is dead.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session revoked")
 
     # Slide the expiry on every authenticated request, so an app in daily use never
     # expires out from under someone.

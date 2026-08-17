@@ -15,10 +15,11 @@ RUN apt-get update \
     && apt-get purge -y curl gnupg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Dependencies first, so code edits don't bust this layer. The install reads the
-# dependency list straight from pyproject.toml — one source of truth.
-COPY pyproject.toml ./
-RUN pip install .
+# Dependencies first, so code edits don't bust this layer. Pinned via
+# requirements.lock so two builds of the same commit install the same bytes;
+# regenerate with a fresh venv + `pip freeze` when bumping (see README).
+COPY requirements.lock ./
+RUN pip install -r requirements.lock
 
 COPY alembic.ini manage.py ./
 COPY --chmod=755 docker-entrypoint.sh ./
@@ -35,4 +36,8 @@ RUN useradd --create-home lsf \
 USER lsf
 
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=6s --start-period=60s --retries=3 \
+    CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"
+
 ENTRYPOINT ["./docker-entrypoint.sh"]

@@ -25,6 +25,7 @@ const S = {
 const $view = document.getElementById("view");
 const $pill = document.getElementById("sync-pill");
 const $pillText = document.getElementById("sync-text");
+$pill.onclick = () => { if (!S.needsLogin || S.user) navigate("#/sync"); };
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -32,7 +33,7 @@ const esc = (s) =>
 
 /* ------------------------------------------------------------------ api -- */
 
-async function api(path, options = {}) {
+async function apiResponse(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
     credentials: "same-origin",
@@ -46,56 +47,132 @@ async function api(path, options = {}) {
     const body = await response.json().catch(() => ({}));
     throw Object.assign(new Error("request failed"), { status: response.status, body });
   }
-  return response.json();
+  return response;
 }
+
+async function api(path, options = {}) {
+  return (await apiResponse(path, options)).json();
+}
+
+// A fetch() that never reached a server throws a bare TypeError; errors from
+// apiResponse carry .status (HTTP) or .auth (401). The distinction decides
+// retry-later versus quarantine.
+const isNetworkError = (error) => !error.status && !error.auth;
 
 /* ----------------------------------------------------------------- sync -- */
 
 let syncRunning = false;
+const BATCH_CHUNK = 100; // the server caps a batch at 500; stay well under it
+
+async function drainQueue() {
+  // Loop, because entries can be enqueued *while* a drain is in flight (the
+  // auto-queue second event, or a fast pair of taps) and the syncRunning
+  // guard swallows the sync() call they trigger. Bounded so a server that
+  // rejects nothing but stores nothing can't spin us.
+  for (let round = 0; round < 10; round++) {
+    const queue = (await LSF_DB.queueAll()).filter((q) => q._status === "pending");
+    if (!queue.length) return;
+    const events = queue
+      .slice(0, BATCH_CHUNK)
+      .map(({ _queued_at, _status, _reason, ...event }) => event);
+    let results;
+    try {
+      ({ results } = await api("/api/events/batch", {
+        method: "POST",
+        body: JSON.stringify({ events }),
+      }));
+    } catch (error) {
+      // Only a batch-level 4xx falls back to one-at-a-time posting: one
+      // malformed entry fails request validation for all 100, and the poison
+      // entry must quarantine alone instead of wedging the queue. Network
+      // failures and 5xx are retried whole next sync.
+      if (!(error.status >= 400 && error.status < 500)) throw error;
+      results = await drainOneByOne(events);
+    }
+    let divergent = 0;
+    let progressed = false;
+    for (const result of results) {
+      if (result.status === "stored" || result.status === "duplicate") {
+        await LSF_DB.ack(result.id);
+        progressed = true;
+        if (result.divergent) divergent += 1;
+      } else if (result.status === "rejected") {
+        await LSF_DB.markRejected(result.id, result.reason || "rejected");
+        progressed = true;
+      }
+      // status "error": a server-side failure on that entry. Leave it pending;
+      // it retries next sync rather than being quarantined for a server bug.
+    }
+    if (divergent) {
+      toast(`${divergent} ${divergent === 1 ? "entry" : "entries"} already existed with different details`);
+    }
+    if (!progressed) return; // all errors: stop looping, wait for the next sync
+  }
+}
+
+async function drainOneByOne(events) {
+  const results = [];
+  for (const event of events) {
+    try {
+      const { divergent } = await api("/api/events", {
+        method: "POST",
+        body: JSON.stringify(event),
+      });
+      results.push({ id: event.id, status: "stored", divergent });
+    } catch (error) {
+      if (!(error.status >= 400 && error.status < 500)) throw error;
+      results.push({ id: event.id, status: "rejected", reason: rejectReason(error) });
+    }
+  }
+  return results;
+}
+
+function rejectReason(error) {
+  const detail = error.body?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail?.reason) return detail.reason; // EventRejected shape
+  if (Array.isArray(detail) && detail.length) {
+    // Pydantic validation error shape
+    const first = detail[0];
+    return `${(first.loc || []).slice(1).join(".")}: ${first.msg}`.replace(/^: /, "");
+  }
+  return "rejected by server";
+}
 
 async function sync() {
   if (syncRunning) return;
   syncRunning = true;
   try {
-    // Loop, because entries can be enqueued *while* a drain is in flight (the
-    // auto-queue second event, or a fast pair of taps) and the syncRunning
-    // guard swallows the sync() call they trigger. Bounded so a server that
-    // rejects nothing but stores nothing can't spin us.
-    for (let round = 0; round < 5; round++) {
-      const queue = (await LSF_DB.queueAll()).filter((q) => q._status === "pending");
-      if (!queue.length) break;
-      const events = queue.map(({ _queued_at, _status, _reason, ...event }) => event);
-      const { results } = await api("/api/events/batch", {
-        method: "POST",
-        body: JSON.stringify({ events }),
-      });
-      for (const result of results) {
-        if (result.status === "stored" || result.status === "duplicate") {
-          await LSF_DB.ack(result.id);
-        } else {
-          await LSF_DB.markRejected(result.id, result.reason || "rejected");
-        }
+    try {
+      await drainQueue();
+    } catch (error) {
+      if (error.auth) {
+        // Never touch the queue on a 401: the entries outlive the session, and
+        // render() keeps the app usable from cache until the engineer can sign
+        // in again. Nothing here navigates away from the floor.
+      } else if (isNetworkError(error)) {
+        S.online = false; // network failed; queue stays, we try again later
       }
+      // 5xx: the server is reachable but unwell; the queue stays and the pill
+      // does not lie about being offline.
     }
-    // Queue drained (or empty): refresh the offline caches.
-    S.ref = await api("/api/reference");
-    await LSF_DB.put("reference", S.ref);
-    const itemsPayload = await api("/api/items");
-    S.items = itemsPayload.items;
-    await LSF_DB.put("items", S.items);
-    S.lastSync = Date.now();
-    await LSF_DB.put("lastSync", S.lastSync);
-    S.needsLogin = false;
-    S.online = true;
-  } catch (error) {
-    if (error.auth) {
-      // Never touch the queue on a 401. The entries outlive the session.
-      renderPill();
-      if (!location.hash.startsWith("#/login")) navigate("#/login");
-      syncRunning = false;
-      return;
+    // Refresh the offline caches in their own try: a wedged drain must never
+    // freeze reference data, and a failed refresh must never look like a
+    // failed drain.
+    try {
+      S.ref = await api("/api/reference");
+      await LSF_DB.put("reference", S.ref);
+      const itemsPayload = await api("/api/items");
+      S.items = itemsPayload.items;
+      await LSF_DB.put("items", S.items);
+      S.lastSync = Date.now();
+      await LSF_DB.put("lastSync", S.lastSync);
+      S.needsLogin = false;
+      S.online = true;
+    } catch (error) {
+      if (isNetworkError(error)) S.online = false;
+      // A 5xx is not "offline": the server is reachable, leave the flag alone.
     }
-    S.online = false; // network failed; queue stays, we try again later
   } finally {
     syncRunning = false;
   }
@@ -104,19 +181,23 @@ async function sync() {
   render(true); // background refresh; defers if the user is mid-form
 }
 
+/* The pill always shows the pending count AND the last sync together — an
+   engineer with a queue wants to know exactly how long the phone has been out
+   of contact, not one or the other. */
 function renderPill() {
   const pending = S.pending.filter((q) => q._status === "pending").length;
   const rejected = S.pending.filter((q) => q._status === "rejected").length;
   $pill.classList.toggle("offline", !S.online || S.needsLogin);
-  $pill.classList.toggle("pending", pending > 0);
-  let text;
-  if (pending) text = `${pending} pending`;
-  else if (S.lastSync) text = `synced ${timeAgo(S.lastSync)}`;
-  else text = S.online ? "synced" : "offline";
-  if (!S.online) text = `offline · ${text}`;
-  if (S.needsLogin) text = "sign-in needed";
-  if (rejected) text += ` · ${rejected} rejected`;
-  $pillText.textContent = text;
+  $pill.classList.toggle("pending", pending > 0 || rejected > 0);
+  const parts = [];
+  if (pending) parts.push(`${pending} pending`);
+  if (rejected) parts.push(`${rejected} rejected`);
+  if (!S.online) parts.push("offline");
+  else if (S.needsLogin) parts.push("sign-in needed");
+  parts.push(S.lastSync ? `synced ${timeAgo(S.lastSync)}` : "never synced");
+  $pillText.textContent = parts.join(" · ");
+  const banner = document.getElementById("session-banner");
+  if (banner) banner.hidden = !(S.needsLogin && S.user);
 }
 
 function timeAgo(timestamp) {
@@ -129,22 +210,57 @@ function timeAgo(timestamp) {
 
 window.addEventListener("online", () => { S.online = true; sync(); });
 window.addEventListener("offline", () => { S.online = false; renderPill(); });
+document.addEventListener("visibilitychange", () => {
+  // A phone coming out of a pocket shouldn't wait for the 30s tick.
+  if (!document.hidden) sync();
+});
 setInterval(sync, 30000);
 setInterval(renderPill, 60000);
 
 /* -------------------------------------------------------------- logging -- */
 
+function newId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  // Insecure origins don't get crypto.randomUUID; build a v4 by hand rather
+  // than silently failing on the one tap that matters.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function requestBackgroundSync() {
+  // Ask the browser to drain the queue even if the app is closed before
+  // connectivity returns. The 30s interval remains the fallback.
+  if ("serviceWorker" in navigator && "SyncManager" in window) {
+    navigator.serviceWorker.ready
+      .then((registration) => registration.sync.register("lsf-drain"))
+      .catch(() => {});
+  }
+}
+
 async function logEvent(event) {
-  await LSF_DB.enqueue(event);
+  try {
+    await LSF_DB.enqueue(event);
+  } catch {
+    // IndexedDB refused the write (quota, private browsing, corruption). The
+    // one thing worse than an error is pretending the entry was recorded.
+    toast("NOT saved — device storage failed");
+    return false;
+  }
   S.pending = await LSF_DB.queueAll();
   renderPill();
   toast("Logged ✓");
+  requestBackgroundSync();
   sync(); // fire and forget; the queue survives if this fails
+  return true;
 }
 
 function toast(message) {
   const el = document.createElement("div");
   el.className = "toast";
+  el.setAttribute("role", "status"); // announced by screen readers
   el.textContent = message;
   document.body.appendChild(el);
   setTimeout(() => { el.style.opacity = "0"; }, 1400);
@@ -197,6 +313,33 @@ function pendingCountFor(itemId) {
   return S.pending.filter((q) => q._status === "pending" && q.item_id === itemId).length;
 }
 
+/* The position one past (stepId, stateId) on this item's chain — where a batch
+   resting there naturally advances to. (null, null) means unstarted; returns
+   null past the end of the route. */
+function positionAfter(item, stepId, stateId) {
+  const states = stateOrder();
+  const steps = [...item.steps].sort((a, b) => a.seq - b.seq);
+  const next = positionIndex(item, stepId, stateId) + 1;
+  if (!steps.length || !states.length || next > steps.length * states.length) return null;
+  return {
+    stepId: steps[Math.floor((next - 1) / states.length)].id,
+    stateId: states[(next - 1) % states.length].id,
+  };
+}
+
+/* Stable key for one sub-batch position, used in the URL so a tapped batch
+   survives the navigation: #/items/{id}/{stepId}.{stateId} */
+function positionKey(p) {
+  return p.is_unstarted ? "unstarted" : `${p.item_step_id}.${p.state_id}`;
+}
+
+function findPosition(item, key) {
+  const positions = item.state?.positions || [];
+  if (key === "unstarted") return positions.find((p) => p.is_unstarted) || null;
+  const [stepId, stateId] = key.split(".");
+  return positions.find((p) => p.item_step_id === stepId && p.state_id === stateId) || null;
+}
+
 /* -------------------------------------------------------------- routing -- */
 
 function navigate(hash) { location.hash = hash; }
@@ -204,39 +347,53 @@ function navigate(hash) { location.hash = hash; }
 // Wrapped so the Event object is not mistaken for the `background` flag.
 window.addEventListener("hashchange", () => render());
 
+/* Fields the user has actually typed into since the last deliberate render.
+   A background sync must not clobber them with freshly-rendered defaults. */
+const dirtyFields = new Set();
+$view.addEventListener("input", (e) => { if (e.target.id) dirtyFields.add(e.target.id); });
+
 function render(background = false) {
   const hash = location.hash || "#/items";
   document.getElementById("topbar").hidden = false;
   document.getElementById("tabs").hidden = S.needsLogin && !S.user;
 
-  if (S.needsLogin || (!S.user && !S.ref)) {
+  // Only force the login screen when there is no cached identity to work
+  // with. A session expiring mid-shift must NOT lock an engineer out of an
+  // offline-first app: they keep logging from cache (the banner explains),
+  // and the queue drains after the next successful sign-in.
+  if (!S.user && (S.needsLogin || !S.ref)) {
     if (hash !== "#/login") { navigate("#/login"); return; }
   }
 
-  const [, route, arg] = hash.split("/");
+  const [, route, arg, arg2] = hash.split("/");
   document.querySelectorAll("#tabs a").forEach((a) =>
     a.classList.toggle("active", a.dataset.tab === route));
 
   // A background sync re-renders whatever view is open. Don't let that eat a
   // half-typed form: skip the refresh entirely while a field is focused (the
-  // next sync catches up), and carry non-empty field values over regardless.
+  // next sync catches up), and carry user-typed values over regardless.
   const typing = $view.contains(document.activeElement) &&
     /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
   if (background && typing) return;
+  if (!background) dirtyFields.clear();
   const saved = {};
   $view.querySelectorAll("input[id], select[id]").forEach((el) => {
     if (el.value) saved[el.id] = el.value;
   });
 
   if (route === "login") viewLogin();
-  else if (route === "items" && arg) viewLogScreen(arg);
+  else if (route === "sync") viewSyncStatus();
+  else if (route === "items" && arg) viewLogScreen(arg, arg2);
   else if (route === "reports") viewReports();
   else if (route === "office") viewOffice();
   else viewItems();
 
   for (const [id, value] of Object.entries(saved)) {
     const el = document.getElementById(id);
-    if (el && !el.value) el.value = value;
+    // Restore into empty fields (text inputs with no default), and into any
+    // field the user had edited — even if the fresh render gave it a default,
+    // like the qty box does.
+    if (el && (!el.value || dirtyFields.has(id))) el.value = value;
   }
 }
 
@@ -244,20 +401,27 @@ function render(background = false) {
 
 function viewLogin() {
   document.getElementById("tabs").hidden = true;
+  const pendingCount = S.pending.filter((q) => q._status === "pending").length;
   $view.innerHTML = `
     <div class="login-wrap">
-      <h1>LSF Track</h1>
-      <div class="card">
-        <label>Username</label>
-        <input id="login-user" autocapitalize="none" autocomplete="username">
-        <label>Password</label>
-        <input id="login-pass" type="password" autocomplete="current-password">
+      <h2 style="text-align:center;font-size:22px;margin-bottom:12px">LSF Track</h2>
+      <form class="card" id="login-form">
+        <label for="login-user">Username</label>
+        <input id="login-user" autocapitalize="none" autocomplete="username" enterkeyhint="next" required>
+        <label for="login-pass">Password</label>
+        <input id="login-pass" type="password" autocomplete="current-password" enterkeyhint="go" required>
         <div style="height:14px"></div>
-        <button class="primary" id="login-go">Sign in</button>
-        <p id="login-err" class="warn-text" hidden>Wrong username or password.</p>
-      </div>
+        <button class="primary" id="login-go" type="submit">Sign in</button>
+        <p id="login-err" class="warn-text" role="alert" hidden></p>
+        ${pendingCount ? `<p class="muted" style="margin-top:10px">${pendingCount} queued ${pendingCount === 1 ? "entry is" : "entries are"} safe on this device and will sync after sign-in.</p>` : ""}
+      </form>
     </div>`;
-  document.getElementById("login-go").onclick = async () => {
+  document.getElementById("login-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const err = document.getElementById("login-err");
+    const button = document.getElementById("login-go");
+    err.hidden = true;
+    button.disabled = true;
     try {
       const body = JSON.stringify({
         username: document.getElementById("login-user").value.trim(),
@@ -270,15 +434,127 @@ function viewLogin() {
       document.getElementById("tabs").hidden = false;
       navigate("#/items");
       sync();
-    } catch {
-      document.getElementById("login-err").hidden = false;
+    } catch (error) {
+      // "Wrong password" when the real problem is no signal is an infuriating
+      // dead end on the floor — name the actual failure.
+      if (error.auth) err.textContent = "Wrong username or password.";
+      else if (error.status === 429) err.textContent = error.body?.detail || "Too many attempts — wait a minute and try again.";
+      else if (error.status) err.textContent = "The server had a problem — try again shortly.";
+      else err.textContent = "No connection. Sign-in needs the network; queued entries are safe and will sync later.";
+      err.hidden = false;
+    } finally {
+      button.disabled = false;
     }
+  };
+}
+
+/* ---------------------------------------------------------- sync status -- */
+
+/* Tapping the pill lands here: what exactly is pending, what was rejected and
+   why, and the two honest actions for a reject — retry (the false-rejection
+   path: upstream events may have landed since) or discard. */
+function viewSyncStatus() {
+  const pending = S.pending.filter((q) => q._status === "pending");
+  const rejected = S.pending.filter((q) => q._status === "rejected");
+
+  const describe = (q) => {
+    const item = S.items.find((i) => i.id === q.item_id);
+    const step = item?.steps?.find((s) => s.id === q.item_step_id);
+    const stage = step ? stageById(step.stage_id) : null;
+    const type = S.ref?.event_types.find((t) => t.id === q.event_type_id);
+    const what = [
+      type?.name || "entry",
+      stage?.name,
+      q.state_id ? stateName(q.state_id) : "",
+      q.qty ? `${q.qty} pcs` : "",
+    ].filter(Boolean).join(" · ");
+    return { code: item?.code || "unknown item", what, when: new Date(q._queued_at || Date.now()).toLocaleString() };
+  };
+
+  const entryRow = (q, actions) => {
+    const d = describe(q);
+    return `
+      <div style="padding:8px 0;border-bottom:1px solid var(--line)">
+        <div class="spread">
+          <strong>${esc(d.code)}</strong>
+          <span class="muted">${esc(d.when)}</span>
+        </div>
+        <div class="muted">${esc(d.what)}</div>
+        ${q._reason ? `<div class="warn-text" style="margin:4px 0">${esc(q._reason)}</div>` : ""}
+        ${actions ? `
+        <div style="display:flex;gap:8px;margin-top:6px">
+          <button class="ghost" data-retry="${q.id}" style="width:auto;padding:8px 16px">Retry</button>
+          <button class="ghost" data-discard="${q.id}" style="width:auto;padding:8px 16px">Discard</button>
+        </div>` : ""}
+      </div>`;
+  };
+
+  $view.innerHTML = `
+    <div class="card">
+      <div class="spread">
+        <span>Signed in as <strong>${esc(S.user?.display_name || S.user?.username || "nobody")}</strong>${S.user?.is_admin ? ` <span class="badge">admin</span>` : ""}</span>
+        ${S.user ? `<button class="ghost" id="sign-out" style="width:auto;padding:8px 16px;flex:none">Sign out</button>` : ""}
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Waiting to sync (${pending.length})</h2>
+      ${pending.map((q) => entryRow(q, false)).join("") || `<p class="muted">Nothing waiting — everything has reached the server.</p>`}
+      <p class="muted" style="margin-top:8px">${S.lastSync ? `Last synced ${timeAgo(S.lastSync)}.` : "Never synced from this device."}${S.online ? "" : " Currently offline; entries are safe here until the network returns."}</p>
+    </div>
+
+    ${rejected.length ? `
+    <div class="card">
+      <h2>Rejected by the server (${rejected.length})</h2>
+      <p class="muted" style="margin-bottom:6px">These did not go in. Retry if the situation has changed (e.g. the missing upstream entry has since synced); discard if the entry was a mistake.</p>
+      ${rejected.map((q) => entryRow(q, true)).join("")}
+    </div>` : ""}`;
+
+  $view.querySelectorAll("[data-retry]").forEach((button) => {
+    button.onclick = async () => {
+      await LSF_DB.markPending(button.dataset.retry);
+      S.pending = await LSF_DB.queueAll();
+      renderPill();
+      render();
+      sync();
+    };
+  });
+  $view.querySelectorAll("[data-discard]").forEach((button) => {
+    button.onclick = async () => {
+      if (!confirm("Discard this entry? It was never stored on the server and will be gone for good.")) return;
+      await LSF_DB.dropRejected(button.dataset.discard);
+      S.pending = await LSF_DB.queueAll();
+      renderPill();
+      render();
+    };
+  });
+
+  const signOut = document.getElementById("sign-out");
+  if (signOut) signOut.onclick = async () => {
+    const waiting = pending.length;
+    if (waiting && !confirm(`${waiting} ${waiting === 1 ? "entry has" : "entries have"} not synced yet. ${waiting === 1 ? "It stays" : "They stay"} on this device and will sync after the next sign-in. Sign out anyway?`)) return;
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } catch {
+      // Offline: the server cookie outlives this, but the local identity and
+      // cached data still clear so the next user starts clean.
+    }
+    S.user = null;
+    S.needsLogin = true;
+    await LSF_DB.put("user", null);
+    // The next user of a shared phone must not see this user's cached reports.
+    navigator.serviceWorker?.controller?.postMessage("purge-data");
+    renderPill();
+    navigate("#/login");
   };
 }
 
 /* ---------------------------------------------------------------- items -- */
 
 function viewItems() {
+  // Back on the list: the next sub-batch tap is a fresh arrival, even if it
+  // is the same batch as last time.
+  logSel._fromKey = null;
   const projects = S.ref?.projects || [];
   const stages = (S.ref?.stages || []).filter((s) => s.is_active);
   const filterProject = sessionStorage.getItem("f-project") || "";
@@ -341,42 +617,53 @@ function viewItems() {
 }
 
 function itemRow(item) {
-  // One line per sub-batch, mirroring the aging report: a split batch reads as
-  // its positions, not as one blob with badges.
+  // One line per sub-batch, mirroring the aging report — and each line is its
+  // own tap target: tapping the 40 pcs at carpentry opens the log screen
+  // aimed at moving THOSE 40, independent of the 50 sitting at paint. This is
+  // the whole workflow: create the item at its project total, then advance
+  // batches through production one position at a time.
   const positions = item.state?.positions || [];
   const completed = item.state?.completed_qty || 0;
   const pending = pendingCountFor(item.id);
 
+  const where = (p) => p.is_unstarted
+    ? "Not started"
+    : `${p.stage_name} · ${stateName(p.state_id)}`;
+
   const lines = positions.map((p) => `
-    <div class="spread" style="padding:3px 0 3px 10px;border-left:2px solid var(--line)">
-      <span class="muted">${p.is_unstarted ? "Not started" : `${esc(p.stage_name)} · ${esc(stateName(p.state_id))}`}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
-      <span style="white-space:nowrap">
+    <a class="pos-row" href="#/items/${item.id}/${positionKey(p)}"
+       aria-label="Advance ${p.qty} pcs from ${esc(where(p))}">
+      <span class="muted" style="min-width:0">${esc(where(p))}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
+      <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
         <span class="badge qty">${p.qty}</span>${p.is_unstarted ? "" : `
-        <span class="badge${p.days_in_state >= 3 ? " age-hot" : ""}">${p.days_in_state.toFixed(1)}d</span>`}
+        <span class="badge${p.overdue ? " age-hot" : ""}">${p.days_in_state.toFixed(1)}d</span>`}
+        <span class="chev" aria-hidden="true">›</span>
       </span>
-    </div>`).join("");
+    </a>`).join("");
 
   return `
-    <a href="#/items/${item.id}">
-      <div style="display:flex;gap:10px;align-items:flex-start">
-        ${item.icon_url ? `<img src="${item.icon_url}" alt="" loading="lazy"
-          style="width:44px;height:44px;object-fit:cover;border-radius:8px;border:1px solid var(--line);flex:none">` : ""}
-        <div style="flex:1;min-width:0">
-          <div class="spread">
-            <strong>${esc(item.code)}</strong>
-            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+    <div>
+      <a class="item-head" href="#/items/${item.id}">
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          ${item.icon_url ? `<img src="${item.icon_url}" alt="" loading="lazy"
+            style="width:44px;height:44px;object-fit:cover;border-radius:8px;border:1px solid var(--line);flex:none">` : ""}
+          <div style="flex:1;min-width:0">
+            <div class="spread">
+              <strong>${esc(item.code)}</strong>
+              <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+            </div>
+            <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
           </div>
-          <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
         </div>
-      </div>
-      ${lines || `<span class="badge">not started</span>`}
+      </a>
+      ${lines || `<a class="item-head" href="#/items/${item.id}"><span class="badge">not started</span></a>`}
       ${completed ? `
       <div class="spread" style="padding:3px 0 3px 10px;border-left:2px solid var(--good)">
         <span class="muted">Completed</span>
         <span class="badge qty" style="color:var(--good)">${completed}</span>
       </div>` : ""}
       ${pending ? `<div style="margin-top:4px"><span class="badge pending">${pending} pending</span></div>` : ""}
-    </a>`;
+    </div>`;
 }
 
 function stateName(stateId) {
@@ -385,9 +672,12 @@ function stateName(stateId) {
 
 /* ----------------------------------------------------------- log screen -- */
 
-const logSel = { stepId: null, stateId: null, typeId: null, stationId: null, reasonId: null };
+const logSel = {
+  stepId: null, stateId: null, typeId: null, stationId: null, reasonId: null,
+  note: "", qtyDefault: null, _fromKey: null,
+};
 
-function viewLogScreen(itemId) {
+function viewLogScreen(itemId, fromKey) {
   const item = S.items.find((i) => i.id === itemId);
   if (!item) { navigate("#/items"); return; }
 
@@ -402,6 +692,27 @@ function viewLogScreen(itemId) {
   }
   const type = movableTypes.find((t) => t.id === logSel.typeId);
 
+  // Arrived by tapping a specific sub-batch on the item card: aim the form at
+  // moving THAT batch — target its next position, default the quantity to its
+  // size. Applied once per arrival (the guard), so segment taps and background
+  // re-renders don't fight the engineer's own adjustments afterwards.
+  const fromPos = fromKey ? findPosition(item, fromKey) : null;
+  if (fromPos && logSel._fromKey !== `${itemId}/${fromKey}`) {
+    logSel._fromKey = `${itemId}/${fromKey}`;
+    const target = positionAfter(
+      item,
+      fromPos.is_unstarted ? null : fromPos.item_step_id,
+      fromPos.is_unstarted ? null : fromPos.state_id,
+    );
+    if (target) {
+      logSel.typeId = defaultType?.id || logSel.typeId;
+      logSel.stepId = target.stepId;
+      logSel.stateId = target.stateId;
+      logSel.stationId = null;
+      logSel.qtyDefault = fromPos.qty;
+    }
+  }
+
   // The track constrains the picker: only steps where units rest, plus the
   // immediate next step, are offered. Rework may target any step at or before
   // the furthest units. Free jumps down the route would negate the route.
@@ -411,6 +722,7 @@ function viewLogScreen(itemId) {
     const target = defaultTarget(item, steps, states);
     logSel.stepId = allowed.has(target.stepId) ? target.stepId : shownSteps[0]?.id;
     logSel.stateId = target.stateId;
+    logSel.qtyDefault = null; // the batch context can't survive a target reset
   }
   if (!states.some((s) => s.id === logSel.stateId)) logSel.stateId = states[0]?.id;
 
@@ -426,6 +738,12 @@ function viewLogScreen(itemId) {
     ? availableUpstream(item, step.id, logSel.stateId, !!type?.is_rework)
     : 0;
   const reasons = (S.ref.reason_codes || []).filter((r) => r.is_active);
+  // Keep the tracked selection valid: a re-render must not silently reset the
+  // reason to the first option, and an empty reason list must never turn into
+  // an empty-string id in the payload.
+  if (type?.requires_reason_code && !reasons.some((r) => r.id === logSel.reasonId)) {
+    logSel.reasonId = reasons[0]?.id || null;
+  }
 
   // Completing a non-final step usually means the units move straight to the
   // next stage's queue; offer to log both in one tap.
@@ -453,45 +771,54 @@ function viewLogScreen(itemId) {
     </div>
 
     <div class="card">
+      ${fromPos && logSel.qtyDefault != null ? `
+      <div class="batch-context">
+        Moving the batch of <strong>${fromPos.qty}</strong> from
+        <strong>${esc(fromPos.is_unstarted ? "Not started" : `${fromPos.stage_name} · ${stateName(fromPos.state_id)}`)}</strong>
+        — adjust anything below before logging.
+      </div>` : ""}
       ${movableTypes.length > 1 ? `
-      <label>Entry type</label>
-      <div class="seg" id="seg-type">
-        ${movableTypes.map((t) => `<button data-id="${t.id}" class="${t.id === logSel.typeId ? "on" : ""}">${esc(t.name)}</button>`).join("")}
+      <label id="lbl-type">Entry type</label>
+      <div class="seg" id="seg-type" role="group" aria-labelledby="lbl-type">
+        ${movableTypes.map((t) => `<button data-id="${t.id}" class="${t.id === logSel.typeId ? "on" : ""}" aria-pressed="${t.id === logSel.typeId}">${esc(t.name)}</button>`).join("")}
       </div>` : ""}
 
-      <label>Stage</label>
-      <div class="seg" id="seg-step">
+      <label id="lbl-step">Stage</label>
+      <div class="seg" id="seg-step" role="group" aria-labelledby="lbl-step">
         ${shownSteps.map((s) => {
           const st = stageById(s.stage_id);
-          return `<button data-id="${s.id}" class="${s.id === logSel.stepId ? "on" : ""}">${esc(st?.name || "?")}</button>`;
+          return `<button data-id="${s.id}" class="${s.id === logSel.stepId ? "on" : ""}" aria-pressed="${s.id === logSel.stepId}">${esc(st?.name || "?")}</button>`;
         }).join("")}
       </div>
 
-      <label>State</label>
-      <div class="seg" id="seg-state">
-        ${states.map((s) => `<button data-id="${s.id}" class="${s.id === logSel.stateId ? "on" : ""}">${esc(s.name)}</button>`).join("")}
+      <label id="lbl-state">State</label>
+      <div class="seg" id="seg-state" role="group" aria-labelledby="lbl-state">
+        ${states.filter((s) => s.is_active !== false).map((s) => `<button data-id="${s.id}" class="${s.id === logSel.stateId ? "on" : ""}" aria-pressed="${s.id === logSel.stateId}">${esc(s.name)}</button>`).join("")}
       </div>
 
       ${stage?.requires_station ? `
-      <label>Station</label>
-      <div class="seg" id="seg-station">
-        ${stations.map((st) => `<button data-id="${st.id}" class="${st.id === logSel.stationId ? "on" : ""}">${esc(st.name)}</button>`).join("")}
+      <label id="lbl-station">Station</label>
+      <div class="seg" id="seg-station" role="group" aria-labelledby="lbl-station">
+        ${stations.map((st) => `<button data-id="${st.id}" class="${st.id === logSel.stationId ? "on" : ""}" aria-pressed="${st.id === logSel.stationId}">${esc(st.name)}</button>`).join("")}
       </div>` : ""}
 
       ${type?.requires_reason_code ? `
-      <label>Reason</label>
+      <label for="sel-reason">Reason</label>
       <select id="sel-reason">
         ${reasons.map((r) => `<option value="${r.id}" ${r.id === logSel.reasonId ? "selected" : ""}>${esc(r.name)}</option>`).join("")}
       </select>` : ""}
 
-      <label>Quantity</label>
+      <label for="qty">Quantity</label>
       <div class="qty-row">
-        <button id="qty-minus">−</button>
-        <input id="qty" type="number" inputmode="numeric" min="1" value="${available || 1}">
-        <button id="qty-plus">+</button>
+        <button id="qty-minus" aria-label="One fewer">−</button>
+        <input id="qty" type="number" inputmode="numeric" min="1"
+               value="${logSel.qtyDefault != null ? Math.min(logSel.qtyDefault, available || logSel.qtyDefault) : (available || 1)}">
+        <button id="qty-plus" aria-label="One more">+</button>
       </div>
       <p class="muted" style="margin-top:5px">${available} available at the previous step</p>
-      <p class="warn-text" id="qty-warn" hidden>More than is available upstream — it will be stored and flagged for review.</p>
+      ${stage?.requires_external_po ? `<p class="muted">External supplier stage — time in state is supplier lead time.</p>` : ""}
+      ${stage && !stage.allows_partial_qty ? `<p class="muted">Whole-batch stage — a move that leaves units behind is rejected.</p>` : ""}
+      <p class="warn-text" id="qty-warn" hidden>More than is available upstream — the server will reject this entry until the earlier steps are logged. It will wait under the sync pill with a Retry button.</p>
 
       ${offerAutoQueue ? `
       <label style="display:flex;align-items:center;gap:10px;margin-top:14px;font-size:15px;color:var(--text)">
@@ -499,8 +826,16 @@ function viewLogScreen(itemId) {
         Also queue at ${esc(nextStage?.name || "next stage")}
       </label>` : ""}
 
-      <div style="height:12px"></div>
-      <button class="primary" id="log-go">Log entry</button>
+      <details ${logSel.note ? "open" : ""} style="margin-top:12px">
+        <summary class="muted" style="cursor:pointer">Add note${logSel.note ? " ·" : ""}</summary>
+        <input id="log-note" maxlength="2000" placeholder="e.g. rack 3, waiting on fittings"
+               value="${esc(logSel.note)}" style="margin-top:6px">
+      </details>
+
+      <div style="height:12px" aria-hidden="true"></div>
+      <div class="action-sticky">
+        <button class="primary" id="log-go">Log entry</button>
+      </div>
     </div>
 
     <div class="card">
@@ -518,7 +853,7 @@ function viewLogScreen(itemId) {
       <div id="recent" class="muted">Loading…</div>
     </div>`;
 
-  const rerender = () => viewLogScreen(itemId);
+  const rerender = () => viewLogScreen(itemId, fromKey);
   wireSeg("seg-type", (id) => { logSel.typeId = id; rerender(); });
   wireSeg("seg-step", (id) => { logSel.stepId = id; logSel.stationId = null; rerender(); });
   wireSeg("seg-state", (id) => { logSel.stateId = id; rerender(); });
@@ -527,6 +862,12 @@ function viewLogScreen(itemId) {
     if (stage) localStorage.setItem(`station:${stage.id}`, id);
     rerender();
   });
+  const $reason = document.getElementById("sel-reason");
+  if ($reason) $reason.onchange = (e) => { logSel.reasonId = e.target.value || null; };
+  // Tracked in logSel like every other selection, so a segment tap's re-render
+  // cannot eat a half-typed note.
+  const $note = document.getElementById("log-note");
+  if ($note) $note.oninput = (e) => { logSel.note = e.target.value; };
 
   const $qty = document.getElementById("qty");
   const warn = () => {
@@ -537,33 +878,44 @@ function viewLogScreen(itemId) {
   document.getElementById("qty-plus").onclick = () => { $qty.value = Number($qty.value) + 1; warn(); };
 
   document.getElementById("log-go").onclick = async () => {
-    const reasonSelect = document.getElementById("sel-reason");
     const qty = Number($qty.value) || 1;
-    await logEvent({
-      id: crypto.randomUUID(),
+    const logged = await logEvent({
+      id: newId(),
       item_id: item.id,
       item_step_id: logSel.stepId,
       station_id: stage?.requires_station ? logSel.stationId : null,
       event_type_id: logSel.typeId,
       state_id: logSel.stateId,
       qty,
-      reason_code_id: reasonSelect ? reasonSelect.value : null,
+      reason_code_id: type?.requires_reason_code ? logSel.reasonId : null,
       occurred_at: new Date().toISOString(),
-      note: null,
+      note: logSel.note.trim() || null,
       supersedes_event_id: null,
       user_id: S.user?.id || null,
     });
+    if (!logged) return;
+    logSel.note = "";
+    logSel.qtyDefault = null;
+    logSel._fromKey = null;
+    if (fromKey) {
+      // The batch has moved on; drop its key from the URL without a reload so
+      // the next render defaults normally.
+      history.replaceState(null, "", `#/items/${item.id}`);
+      fromKey = undefined;
+    }
     // One tap, two facts: done here, queued there. The +1ms keeps the replay
     // order deterministic so the queue event always pulls the units the
     // completion just produced.
     if (offerAutoQueue && document.getElementById("auto-queue")?.checked) {
       await logEvent({
-        id: crypto.randomUUID(),
+        id: newId(),
         item_id: item.id,
         item_step_id: nextStep.id,
         station_id: null,
         event_type_id: logSel.typeId,
-        state_id: states[0].id,
+        // The queue state is flagged, not positional: a state added at a lower
+        // sort_order must not change what "queue at next stage" writes.
+        state_id: (states.find((s) => s.is_initial) || states[0]).id,
         qty,
         reason_code_id: null,
         occurred_at: new Date(Date.now() + 1).toISOString(),
@@ -572,6 +924,7 @@ function viewLogScreen(itemId) {
         user_id: S.user?.id || null,
       });
     }
+    dirtyFields.clear(); // the form resets to fresh defaults after a log
     rerender();
   };
 
@@ -590,6 +943,7 @@ function viewLogScreen(itemId) {
         });
         if (!response.ok) throw new Error();
         toast(doneMessage);
+        logScreenCache.fetchedAt = 0; // the photo list just changed
         if (refreshList) {
           await sync(); // pulls the new icon_url into S.items, re-renders
         } else {
@@ -664,11 +1018,35 @@ function defaultTarget(item, steps, states) {
   return fallback;
 }
 
+/* Segment taps re-render the whole log screen; without this, every tap
+   re-fires the photos and recent-entries requests over the patchy link the
+   app is designed around. Cached per item for a short window. */
+const logScreenCache = { itemId: null, images: null, events: null, fetchedAt: 0 };
+const LOG_CACHE_MS = 30000;
+
+function cachedFor(item, key) {
+  const fresh = logScreenCache.itemId === item.id
+    && Date.now() - logScreenCache.fetchedAt < LOG_CACHE_MS;
+  return fresh ? logScreenCache[key] : null;
+}
+
+function cacheSet(item, key, value) {
+  if (logScreenCache.itemId !== item.id) {
+    logScreenCache.itemId = item.id;
+    logScreenCache.images = null;
+    logScreenCache.events = null;
+  }
+  logScreenCache[key] = value;
+  logScreenCache.fetchedAt = Date.now();
+}
+
 async function loadPhotos(item) {
   const target = document.getElementById("photos");
   if (!target) return;
   try {
-    const { images } = await api(`/api/items/${item.id}/images`);
+    const cached = cachedFor(item, "images");
+    const { images } = cached ? { images: cached } : await api(`/api/items/${item.id}/images`);
+    cacheSet(item, "images", images);
     if (!target.isConnected) return;
     document.getElementById("photo-count").textContent = images.length ? `(${images.length})` : "";
     target.innerHTML = images.length
@@ -690,7 +1068,9 @@ async function loadRecent(item) {
   const target = document.getElementById("recent");
   const correctionType = (S.ref.event_types || []).find((t) => t.is_correction && t.is_active);
   try {
-    const { events } = await api(`/api/items/${item.id}/events?limit=8`);
+    const cached = cachedFor(item, "events");
+    const { events } = cached ? { events: cached } : await api(`/api/items/${item.id}/events?limit=8`);
+    cacheSet(item, "events", events);
     if (!target.isConnected) return;
     target.innerHTML = events.map((e) => {
       const type = S.ref.event_types.find((t) => t.id === e.event_type_id);
@@ -702,7 +1082,7 @@ async function loadRecent(item) {
       const canVoid = correctionType && type?.moves_quantity && !e.superseded;
       return `
         <div class="spread" style="padding:6px 0;border-bottom:1px solid var(--line)">
-          <span>${esc(label)}<br><span class="muted">${new Date(e.occurred_at).toLocaleString()}</span></span>
+          <span>${esc(label)}<br><span class="muted">${new Date(e.occurred_at).toLocaleString()}</span>${e.note ? `<br><span class="muted">“${esc(e.note)}”</span>` : ""}</span>
           ${canVoid ? `<button class="ghost" data-void="${e.id}" data-step="${e.item_step_id || ""}" data-state="${e.state_id || ""}">Void</button>` : ""}
         </div>`;
     }).join("") || "No entries yet.";
@@ -710,7 +1090,7 @@ async function loadRecent(item) {
       button.onclick = async () => {
         if (!confirm("Void this entry? A correction event will be logged; history is kept.")) return;
         await logEvent({
-          id: crypto.randomUUID(),
+          id: newId(),
           item_id: item.id,
           item_step_id: null,
           station_id: null,
@@ -723,6 +1103,7 @@ async function loadRecent(item) {
           supersedes_event_id: button.dataset.void,
           user_id: S.user?.id || null,
         });
+        logScreenCache.fetchedAt = 0; // show the void immediately
         loadRecent(item);
       };
     });
@@ -742,6 +1123,13 @@ async function viewReports() {
 
   $view.innerHTML = `<p class="muted">Loading reports…</p>`;
   let wip, aging, exceptions;
+  let cachedFrom = null; // set when the service worker served last-known data
+  const fetchReport = async (path) => {
+    const response = await apiResponse(path);
+    const marker = response.headers.get("X-LSF-From-Cache");
+    if (marker) cachedFrom = marker;
+    return response.json();
+  };
   try {
     const wipQuery = fProject ? `?project_id=${fProject}` : "";
     const agingParams = new URLSearchParams({ limit: "40" });
@@ -749,19 +1137,23 @@ async function viewReports() {
     if (fStage) agingParams.set("stage_id", fStage);
     if (fDays) agingParams.set("min_days", fDays);
     [wip, aging, exceptions] = await Promise.all([
-      api(`/api/reports/wip${wipQuery}`),
-      api(`/api/reports/aging?${agingParams}`),
-      api("/api/reports/exceptions"),
+      fetchReport(`/api/reports/wip${wipQuery}`),
+      fetchReport(`/api/reports/aging?${agingParams}`),
+      fetchReport("/api/reports/exceptions"),
     ]);
   } catch {
     $view.innerHTML = `<p class="muted">Reports need a connection — they are computed from the full log on the server.</p>`;
     return;
   }
+  const staleNote = cachedFrom
+    ? `<p class="warn-text" style="margin-bottom:8px">Offline — showing last-known reports${cachedFrom !== "1" ? ` from ${new Date(cachedFrom).toLocaleString()}` : ""}.</p>`
+    : "";
 
   const maxQty = Math.max(1, ...wip.stages.map((s) => s.total_qty));
   const stateCodes = wip.states.map((s) => s.code);
 
   $view.innerHTML = `
+    ${staleNote}
     <div class="filters">
       <select id="r-project">
         <option value="">All projects</option>
@@ -797,18 +1189,20 @@ async function viewReports() {
 
     <div class="card">
       <h2>Aging — days in current state</h2>
+      <div class="table-scroll">
       <table>
-        <thead><tr><th>Item</th><th>Where</th><th class="num">Qty</th><th class="num">Days</th></tr></thead>
+        <thead><tr><th scope="col">Item</th><th scope="col">Where</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Days</th></tr></thead>
         <tbody>
           ${aging.rows.map((row) => `
             <tr>
               <td><a href="#/items/${row.item.id}" style="color:inherit">${esc(row.item.code)}</a></td>
               <td>${esc(row.label)}${row.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</td>
               <td class="num">${row.qty}</td>
-              <td class="num" style="${row.days_in_state >= 3 ? "color:var(--warn)" : ""}">${row.days_in_state.toFixed(1)}</td>
+              <td class="num" style="${row.overdue ? "color:var(--warn);font-weight:700" : ""}">${row.days_in_state.toFixed(1)}${row.overdue ? " ⚠" : ""}</td>
             </tr>`).join("")}
         </tbody>
       </table>
+      </div>
     </div>
 
     ${exceptions.rows.length ? `
@@ -834,12 +1228,34 @@ async function viewReports() {
 /* Stage sequence being assembled in the "New route" card. Survives re-renders
    of the Office view within a session. */
 let routeDraft = [];
+/* Where the next tapped stage lands in the draft: an index, or null to append.
+   This is how a stage gets slotted BETWEEN two existing steps — the versioned
+   template then carries the insertion with seq gaps of 10. */
+let routeInsertAt = null;
+
+const slugify = (text) =>
+  text.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+/* "B" -> "C", "C3" -> "C4" — a placeholder suggestion, never applied. */
+function nextRevision(current) {
+  const match = /^(.*?)(\d+)$/.exec(current);
+  if (match) return match[1] + (Number(match[2]) + 1);
+  if (/^[A-Za-z]$/.test(current) && current.toUpperCase() !== "Z") {
+    return String.fromCharCode(current.toUpperCase().charCodeAt(0) + 1);
+  }
+  return `${current}1`;
+}
 
 function viewOffice() {
   const projects = S.ref?.projects || [];
   const templates = (S.ref?.route_templates || []).filter((t) => t.is_published);
   const stages = (S.ref?.stages || []).filter((s) => s.is_active);
   const unreleased = S.items.filter((i) => !i.is_released);
+  const released = S.items.filter((i) => i.is_released);
+  const inFlight = (item) =>
+    (item.state?.positions || [])
+      .filter((p) => !p.is_unstarted)
+      .reduce((sum, p) => sum + p.qty, 0);
 
   $view.innerHTML = `
     <div class="card">
@@ -887,12 +1303,8 @@ function viewOffice() {
       <div class="seg" id="nr-stages">
         ${stages.map((s) => `<button data-add-stage="${s.id}">${esc(s.name)}</button>`).join("")}
       </div>
-      <label>Sequence${routeDraft.length ? " — tap a step to remove it" : ""}</label>
-      <div id="nr-seq">
-        ${routeDraft.map((stageId, i) =>
-          `<span class="badge qty" data-remove-step="${i}" style="margin:0 6px 6px 0;padding:6px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`
-        ).join("") || `<span class="muted">Empty — a route needs at least one stage.</span>`}
-      </div>
+      <label>Sequence${routeDraft.length ? " — tap a step to remove it, tap a ＋ to insert there" : ""}</label>
+      <div id="nr-seq"></div>
       <p class="muted" id="nr-version-hint" style="margin-top:6px"></p>
       <div style="height:12px"></div>
       <button class="primary" id="nr-go" ${S.online && routeDraft.length ? "" : "disabled"}>Create route</button>
@@ -921,6 +1333,27 @@ function viewOffice() {
         </div>`).join("") || `<p class="muted">Nothing waiting.</p>`}
     </div>
 
+    ${released.length ? `
+    <div class="card">
+      <h2>Drawing revisions</h2>
+      <p class="muted" style="margin-bottom:8px">A bump records that a new drawing was issued
+      after release: everything already in production was built to the old revision, and the
+      quantity affected is derived from the log, never typed in.</p>
+      ${released.map((item) => `
+        <div style="padding:10px 0;border-bottom:1px solid var(--line)">
+          <div class="spread">
+            <strong>${esc(item.code)}</strong>
+            <span class="muted">rev ${esc(item.drawing_revision)} · ${inFlight(item)} pcs in flight</span>
+          </div>
+          <div class="qty-row" style="margin-top:6px">
+            <input data-rev-for="${item.id}" placeholder="new rev, e.g. ${esc(nextRevision(item.drawing_revision))}"
+                   autocapitalize="characters" maxlength="32" style="flex:1;text-align:left;padding:10px">
+            <button class="ghost" data-bump="${item.id}" ${S.online ? "" : "disabled"}
+                    style="width:auto;padding:8px 16px">Bump</button>
+          </div>
+        </div>`).join("")}
+    </div>` : ""}
+
     ${S.user?.is_admin ? `
     <div class="card">
       <h2>Manage</h2>
@@ -931,6 +1364,49 @@ function viewOffice() {
       <div id="mg-projects"></div>
       <label>Route versions</label>
       <div id="mg-routes"></div>
+    </div>
+
+    <div class="card">
+      <h2>Stages &amp; stations</h2>
+      <p class="muted" style="margin-bottom:8px">Adding a stage needs no deploy and no code
+      change: add it here with its behaviour flags, add stations if it has physical
+      instances, then create a new route version with the stage slotted in. Items already
+      in production keep the route they were released against.</p>
+      <div id="mg-stages" class="muted">Loading…</div>
+      <details style="margin-top:12px">
+        <summary class="muted" style="cursor:pointer">New stage</summary>
+        <div class="field-grid" style="margin-top:8px">
+          <div><label for="ns-name">Name</label><input id="ns-name" placeholder="Glass shop"></div>
+          <div><label for="ns-sort">Sort order</label><input id="ns-sort" type="number" inputmode="numeric"></div>
+        </div>
+        <label for="ns-days">Flag as aging after (days — empty for never)</label>
+        <input id="ns-days" type="number" inputmode="numeric" min="1" max="365" value="3">
+        <div id="ns-flags"></div>
+        <div style="height:8px"></div>
+        <button class="primary" id="ns-go" ${S.online ? "" : "disabled"}>Add stage</button>
+        <p class="warn-text" id="ns-err" hidden></p>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>Users</h2>
+      <div id="mg-users" class="muted">Loading…</div>
+      <details style="margin-top:12px">
+        <summary class="muted" style="cursor:pointer">New user</summary>
+        <div class="field-grid" style="margin-top:8px">
+          <div><label for="nu-username">Username</label><input id="nu-username" autocapitalize="none" autocomplete="off"></div>
+          <div><label for="nu-display">Display name</label><input id="nu-display" autocomplete="off"></div>
+        </div>
+        <label for="nu-pass">Password (min 8 characters)</label>
+        <input id="nu-pass" type="password" autocomplete="new-password">
+        <label style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:14px;color:var(--text)">
+          <input type="checkbox" id="nu-admin" style="width:22px;height:22px;flex:none">
+          Admin — can manage stages, users, and removals
+        </label>
+        <div style="height:8px"></div>
+        <button class="primary" id="nu-go" ${S.online ? "" : "disabled"}>Create user</button>
+        <p class="warn-text" id="nu-err" hidden></p>
+      </details>
     </div>` : ""}`;
 
   document.getElementById("ni-go").onclick = async () => {
@@ -991,18 +1467,42 @@ function viewOffice() {
 
   // ---- route builder: updates in place so typed inputs survive ----
   const renderSeq = () => {
-    document.getElementById("nr-seq").innerHTML = routeDraft.map((stageId, i) =>
-      `<span class="badge qty" data-remove-step="${i}" style="margin:0 6px 6px 0;padding:6px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`
-    ).join("") || `<span class="muted">Empty — a route needs at least one stage.</span>`;
+    const chip = (stageId, i) =>
+      `<span class="badge qty" data-remove-step="${i}" style="margin:0 4px 6px 0;padding:8px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`;
+    const slot = (i) =>
+      `<button data-insert-at="${i}" class="insert-slot${routeInsertAt === i ? " on" : ""}" title="Insert here">＋</button>`;
+    document.getElementById("nr-seq").innerHTML = routeDraft.length
+      ? routeDraft.map((stageId, i) => slot(i) + chip(stageId, i)).join("") + slot(routeDraft.length)
+      : `<span class="muted">Empty — a route needs at least one stage.</span>`;
     document.getElementById("nr-go").disabled = !S.online || !routeDraft.length;
-    document.querySelectorAll("[data-remove-step]").forEach((chip) => {
-      chip.onclick = () => { routeDraft.splice(Number(chip.dataset.removeStep), 1); renderSeq(); };
+    document.querySelectorAll("[data-remove-step]").forEach((el) => {
+      el.onclick = () => {
+        routeDraft.splice(Number(el.dataset.removeStep), 1);
+        routeInsertAt = null;
+        renderSeq();
+      };
+    });
+    document.querySelectorAll("[data-insert-at]").forEach((el) => {
+      el.onclick = () => {
+        const at = Number(el.dataset.insertAt);
+        routeInsertAt = routeInsertAt === at ? null : at;
+        renderSeq();
+      };
     });
   };
   renderSeq();
 
   document.querySelectorAll("[data-add-stage]").forEach((button) => {
-    button.onclick = () => { routeDraft.push(button.dataset.addStage); renderSeq(); };
+    button.onclick = () => {
+      if (routeInsertAt === null || routeInsertAt >= routeDraft.length) {
+        routeDraft.push(button.dataset.addStage);
+        routeInsertAt = null;
+      } else {
+        routeDraft.splice(routeInsertAt, 0, button.dataset.addStage);
+        routeInsertAt += 1; // consecutive taps keep inserting in order
+      }
+      renderSeq();
+    };
   });
 
   const versionHint = () => {
@@ -1028,6 +1528,7 @@ function viewOffice() {
         }),
       });
       routeDraft = [];
+      routeInsertAt = null;
       toast(`Route ${created.code} v${created.version} created`);
       await sync();
     } catch (error) {
@@ -1057,7 +1558,34 @@ function viewOffice() {
     select.addEventListener("change", () => renderDistribution(itemId));
   });
 
-  if (S.user?.is_admin) loadManage();
+  $view.querySelectorAll("[data-bump]").forEach((button) => {
+    button.onclick = async () => {
+      const item = S.items.find((i) => i.id === button.dataset.bump);
+      const revision = $view.querySelector(`[data-rev-for="${item.id}"]`).value.trim();
+      if (!revision) return;
+      const affected = inFlight(item);
+      const detail = affected
+        ? `${affected} pcs in flight were built to rev ${item.drawing_revision}.`
+        : "Nothing is in flight yet.";
+      if (!confirm(`Bump ${item.code} from rev ${item.drawing_revision} to ${revision}? ${detail}`)) return;
+      try {
+        await api(`/api/items/${item.id}/revision`, {
+          method: "POST",
+          body: JSON.stringify({ drawing_revision: revision }),
+        });
+        toast(`${item.code} bumped to rev ${revision}`);
+        await sync();
+      } catch (error) {
+        alert(error.body?.detail || "Could not bump the revision.");
+      }
+    };
+  });
+
+  if (S.user?.is_admin) {
+    loadManage();
+    renderStageAdmin();
+    loadUsers();
+  }
 
   $view.querySelectorAll("[data-release]").forEach((button) => {
     button.onclick = async () => {
@@ -1090,6 +1618,259 @@ function viewOffice() {
       }
     };
   });
+}
+
+/* ----------------------------------------------- stage admin (runtime) -- */
+
+/* The behaviour flags a stage can carry. Labels only — nothing here branches
+   on what any particular stage means. */
+const STAGE_FLAGS = [
+  ["requires_station", "Has physical stations"],
+  ["requires_external_po", "External supplier (lead time, PO)"],
+  ["allows_partial_qty", "Allows partial quantities"],
+  ["is_terminal", "Terminal — completes the item"],
+];
+
+function flagCheckboxes(prefix, values) {
+  return STAGE_FLAGS.map(([key, label]) => `
+    <label style="display:flex;align-items:center;gap:10px;font-size:14px;color:var(--text);margin:6px 0">
+      <input type="checkbox" data-flag="${prefix}:${key}" ${values[key] ? "checked" : ""}
+             style="width:22px;height:22px;flex:none">
+      ${label}
+    </label>`).join("");
+}
+
+function readFlags(prefix) {
+  const out = {};
+  for (const [key] of STAGE_FLAGS) {
+    const box = document.querySelector(`[data-flag="${prefix}:${key}"]`);
+    if (box) out[key] = box.checked;
+  }
+  return out;
+}
+
+function renderStageAdmin() {
+  const target = document.getElementById("mg-stages");
+  if (!target) return;
+
+  const stages = [...(S.ref?.stages || [])].sort((a, b) => a.sort_order - b.sort_order);
+  target.classList.remove("muted");
+  target.innerHTML = stages.map((s) => {
+    const stations = (S.ref?.stations || []).filter((st) => st.stage_id === s.id);
+    const flagSummary = [
+      ...STAGE_FLAGS.filter(([k]) => s[k]).map(([, l]) => l.split(" — ")[0].split(" (")[0]),
+      s.max_days_in_state != null ? `ages at ${s.max_days_in_state}d` : "",
+    ].filter(Boolean).join(" · ");
+    return `
+      <details style="padding:4px 0;border-bottom:1px solid var(--line)">
+        <summary style="cursor:pointer;padding:6px 0">
+          <strong>${esc(s.name)}</strong>${s.is_active ? "" : ` <span class="badge">inactive</span>`}
+          <br><span class="muted">${esc(flagSummary || "no flags")}${stations.length ? ` · stations: ${stations.map((st) => esc(st.name) + (st.is_active ? "" : " (off)")).join(", ")}` : ""}</span>
+        </summary>
+        <div style="padding:8px 0 12px">
+          <div class="field-grid">
+            <div><label>Name</label><input data-stage-name="${s.id}" value="${esc(s.name)}"></div>
+            <div><label>Sort order</label><input data-stage-sort="${s.id}" type="number" inputmode="numeric" value="${s.sort_order}"></div>
+          </div>
+          <label>Flag as aging after (days — empty for never, e.g. outsourced)</label>
+          <input data-stage-days="${s.id}" type="number" inputmode="numeric" min="1" max="365"
+                 placeholder="no threshold" value="${s.max_days_in_state ?? ""}">
+          ${flagCheckboxes(s.id, s)}
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+            <button class="ghost" data-stage-save="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
+            <button class="ghost" data-stage-toggle="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${s.is_active ? "Deactivate" : "Reactivate"}</button>
+          </div>
+          <label style="margin-top:10px">Add station</label>
+          <div class="qty-row">
+            <input data-station-name="${s.id}" placeholder="e.g. ${esc(s.name)} ${stations.length + 1}" style="flex:1;text-align:left;padding:10px">
+            <button class="ghost" data-station-add="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Add</button>
+          </div>
+        </div>
+      </details>`;
+  }).join("") || `<span class="muted">No stages yet.</span>`;
+
+  const patchStage = async (stageId, body, doneMessage) => {
+    try {
+      await api(`/api/stages/${stageId}`, { method: "PATCH", body: JSON.stringify(body) });
+      toast(doneMessage);
+      await sync(); // refreshes S.ref, re-renders the office view
+    } catch (error) {
+      alert(error.body?.detail || "Could not update the stage.");
+    }
+  };
+
+  target.querySelectorAll("[data-stage-save]").forEach((button) => {
+    button.onclick = () => {
+      const id = button.dataset.stageSave;
+      const days = document.querySelector(`[data-stage-days="${id}"]`).value.trim();
+      patchStage(id, {
+        name: document.querySelector(`[data-stage-name="${id}"]`).value.trim(),
+        sort_order: Number(document.querySelector(`[data-stage-sort="${id}"]`).value) || 0,
+        max_days_in_state: days ? Number(days) : null,
+        ...readFlags(id),
+      }, "Stage updated");
+    };
+  });
+  target.querySelectorAll("[data-stage-toggle]").forEach((button) => {
+    button.onclick = () => {
+      const stage = S.ref.stages.find((s) => s.id === button.dataset.stageToggle);
+      patchStage(stage.id, { is_active: !stage.is_active },
+        stage.is_active ? "Stage deactivated" : "Stage reactivated");
+    };
+  });
+  target.querySelectorAll("[data-station-add]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.stationAdd;
+      const name = document.querySelector(`[data-station-name="${id}"]`).value.trim();
+      if (!name) return;
+      try {
+        await api("/api/stations", {
+          method: "POST",
+          body: JSON.stringify({ stage_id: id, code: slugify(name), name }),
+        });
+        toast("Station added");
+        await sync();
+      } catch (error) {
+        alert(error.body?.detail || "Could not add the station.");
+      }
+    };
+  });
+
+  // ---- new stage form ----
+  const flags = document.getElementById("ns-flags");
+  if (flags && !flags.innerHTML) {
+    flags.innerHTML = flagCheckboxes("new", { allows_partial_qty: true });
+    const maxSort = Math.max(0, ...stages.map((s) => s.sort_order));
+    document.getElementById("ns-sort").value = maxSort + 10;
+  }
+  const go = document.getElementById("ns-go");
+  if (go) go.onclick = async () => {
+    const err = document.getElementById("ns-err");
+    err.hidden = true;
+    const name = document.getElementById("ns-name").value.trim();
+    if (!name) { err.textContent = "The stage needs a name."; err.hidden = false; return; }
+    try {
+      const days = document.getElementById("ns-days").value.trim();
+      await api("/api/stages", {
+        method: "POST",
+        body: JSON.stringify({
+          code: slugify(name),
+          name,
+          sort_order: Number(document.getElementById("ns-sort").value) || 0,
+          max_days_in_state: days ? Number(days) : null,
+          ...readFlags("new"),
+        }),
+      });
+      toast(`Stage ${name} added — slot it into a route version to use it`);
+      await sync();
+    } catch (error) {
+      err.textContent = error.body?.detail || "Could not add the stage.";
+      err.hidden = false;
+    }
+  };
+}
+
+/* ---------------------------------------------------------- user admin -- */
+
+async function loadUsers() {
+  const target = document.getElementById("mg-users");
+  if (!target) return;
+
+  let users;
+  try {
+    ({ users } = await api("/api/users"));
+  } catch {
+    target.textContent = "User management needs a connection.";
+    return;
+  }
+  if (!target.isConnected) return;
+
+  target.classList.remove("muted");
+  target.innerHTML = users.map((u) => `
+    <details style="padding:4px 0;border-bottom:1px solid var(--line)">
+      <summary style="cursor:pointer;padding:6px 0">
+        <strong>${esc(u.display_name)}</strong> <span class="muted">${esc(u.username)}</span>
+        ${u.is_admin ? `<span class="badge">admin</span>` : ""}${u.is_active ? "" : ` <span class="badge">deactivated</span>`}
+        ${u.id === S.user?.id ? ` <span class="badge qty">you</span>` : ""}
+      </summary>
+      <div style="padding:8px 0 12px">
+        <label>Display name</label>
+        <input data-user-display="${u.id}" value="${esc(u.display_name)}">
+        <label>Reset password (signs them out everywhere)</label>
+        <div class="qty-row">
+          <input data-user-pass="${u.id}" type="password" autocomplete="new-password"
+                 placeholder="min 8 characters" style="flex:1;text-align:left;padding:10px">
+          <button class="ghost" data-user-reset="${u.id}" style="width:auto;padding:10px 16px">Reset</button>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button class="ghost" data-user-save="${u.id}" style="width:auto;padding:10px 16px">Save name</button>
+          ${u.id === S.user?.id ? "" : `
+          <button class="ghost" data-user-admin="${u.id}" style="width:auto;padding:10px 16px">${u.is_admin ? "Remove admin" : "Make admin"}</button>
+          <button class="ghost" data-user-active="${u.id}" style="width:auto;padding:10px 16px">${u.is_active ? "Deactivate" : "Reactivate"}</button>`}
+        </div>
+      </div>
+    </details>`).join("");
+
+  const patchUser = async (id, body, doneMessage) => {
+    try {
+      await api(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+      toast(doneMessage);
+      loadUsers();
+    } catch (error) {
+      alert(error.body?.detail || "Could not update the user.");
+    }
+  };
+
+  target.querySelectorAll("[data-user-save]").forEach((b) => {
+    b.onclick = () => patchUser(b.dataset.userSave, {
+      display_name: target.querySelector(`[data-user-display="${b.dataset.userSave}"]`).value.trim(),
+    }, "Name updated");
+  });
+  target.querySelectorAll("[data-user-reset]").forEach((b) => {
+    b.onclick = () => {
+      const field = target.querySelector(`[data-user-pass="${b.dataset.userReset}"]`);
+      if (field.value.length < 8) { alert("Password needs at least 8 characters."); return; }
+      patchUser(b.dataset.userReset, { password: field.value }, "Password reset — their old sessions are signed out");
+    };
+  });
+  target.querySelectorAll("[data-user-admin]").forEach((b) => {
+    const user = users.find((u) => u.id === b.dataset.userAdmin);
+    b.onclick = () => patchUser(user.id, { is_admin: !user.is_admin },
+      user.is_admin ? "Admin removed" : "Now an admin");
+  });
+  target.querySelectorAll("[data-user-active]").forEach((b) => {
+    const user = users.find((u) => u.id === b.dataset.userActive);
+    b.onclick = () => {
+      if (user.is_active && !confirm(`Deactivate ${user.display_name}? They are signed out on their next request; their logged events stay.`)) return;
+      patchUser(user.id, { is_active: !user.is_active },
+        user.is_active ? "User deactivated" : "User reactivated");
+    };
+  });
+
+  const go = document.getElementById("nu-go");
+  if (go) go.onclick = async () => {
+    const err = document.getElementById("nu-err");
+    err.hidden = true;
+    try {
+      const created = await api("/api/users", {
+        method: "POST",
+        body: JSON.stringify({
+          username: document.getElementById("nu-username").value.trim().toLowerCase(),
+          display_name: document.getElementById("nu-display").value.trim(),
+          password: document.getElementById("nu-pass").value,
+          is_admin: document.getElementById("nu-admin").checked,
+        }),
+      });
+      toast(`User ${created.username} created`);
+      loadUsers();
+    } catch (error) {
+      const detail = error.body?.detail;
+      err.textContent = typeof detail === "string" ? detail
+        : Array.isArray(detail) && detail.length ? `${(detail[0].loc || []).slice(1).join(".")}: ${detail[0].msg}`
+        : "Could not create the user.";
+      err.hidden = false;
+    }
+  };
 }
 
 /* Admin management lists: items (incl. archived), projects, route versions,
@@ -1163,13 +1944,36 @@ async function loadManage() {
 async function boot() {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
+    // The worker pings after a Background Sync drain so an open page's pill
+    // catches up immediately.
+    navigator.serviceWorker.addEventListener("message", (e) => {
+      if (e.data === "queue-drained") sync();
+    });
   }
-  // Come up from cache first so the app is usable before any network round trip.
-  S.ref = (await LSF_DB.get("reference")) || null;
-  S.items = (await LSF_DB.get("items")) || [];
-  S.user = (await LSF_DB.get("user")) || null;
-  S.lastSync = (await LSF_DB.get("lastSync")) || null;
-  S.pending = await LSF_DB.queueAll();
+  // Unsynced events must not sit in storage the browser considers evictable.
+  if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+
+  try {
+    // Come up from cache first so the app is usable before any network round trip.
+    S.ref = (await LSF_DB.get("reference")) || null;
+    S.items = (await LSF_DB.get("items")) || [];
+    S.user = (await LSF_DB.get("user")) || null;
+    S.lastSync = (await LSF_DB.get("lastSync")) || null;
+    S.pending = await LSF_DB.queueAll();
+  } catch (error) {
+    // IndexedDB refused to open (private browsing, corruption, storage full).
+    // A blank white page tells the engineer nothing; this at least says why
+    // the app can't keep its offline promise on this browser.
+    document.getElementById("topbar").hidden = false;
+    $view.innerHTML = `
+      <div class="card">
+        <h2>Storage unavailable</h2>
+        <p class="muted">This browser blocked the on-device database the app needs for
+        offline logging (private browsing does this). Entries cannot be queued safely —
+        close this tab and open the app in a normal browser window.</p>
+      </div>`;
+    return;
+  }
   renderPill();
   render();
   sync();

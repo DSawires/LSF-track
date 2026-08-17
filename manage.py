@@ -141,6 +141,108 @@ def cmd_backup(_args) -> None:
     print(f"backup: wrote {key} ({size // 1024}KB) to {destination}; {min(len(existing), settings.backup_keep)} kept")
 
 
+def cmd_restore(args) -> None:
+    """Restore a pg_dump made by `manage.py backup`.
+
+        python manage.py restore backups/lsf-20260816-020000Z.sql.gz --reset --yes
+        python manage.py restore /path/to/dump.sql.gz --reset --yes
+
+    The source is a storage key (S3 or the uploads volume; see `--list`) or a
+    local file path. `--reset` drops and recreates the public schema first,
+    which is what a dump made without --clean needs to land on a non-empty
+    database. Stop the app service before restoring; events written during a
+    restore are lost with the schema.
+    """
+    import gzip
+    import os
+    import subprocess
+    import tempfile
+    from urllib.parse import unquote, urlparse
+
+    from app.config import get_settings
+    from app.storage import get_storage
+
+    settings = get_settings()
+    url = urlparse(settings.database_url)
+    if not url.scheme.startswith("postgresql"):
+        print(f"restore: {url.scheme} is not restored by psql; aborting", file=sys.stderr)
+        sys.exit(1)
+
+    storage = get_storage()
+    if args.list:
+        for key in storage.list("backups/"):
+            print(key)
+        return
+    if not args.source:
+        print("restore: give a backup key or file path (see --list)", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.yes:
+        print(
+            "restore: this OVERWRITES the current database. Re-run with --yes "
+            "(and --reset unless the schema is already empty).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Materialise the dump locally: from disk, or spooled out of storage.
+    if os.path.exists(args.source):
+        dump_path = args.source
+        cleanup = None
+    else:
+        response = storage.response(args.source, "application/gzip")
+        if response is None:
+            print(f"restore: no such backup {args.source!r}", file=sys.stderr)
+            sys.exit(1)
+        spool = tempfile.NamedTemporaryFile(suffix=".sql.gz", delete=False)
+        if hasattr(response, "path"):  # FileResponse from local storage
+            with open(response.path, "rb") as src:
+                spool.write(src.read())
+        else:  # StreamingResponse from S3
+            import asyncio
+
+            async def _drain() -> None:
+                async for chunk in response.body_iterator:
+                    spool.write(chunk)
+
+            asyncio.run(_drain())
+        spool.close()
+        dump_path = spool.name
+        cleanup = spool.name
+
+    psql_base = [
+        "psql",
+        "--no-psqlrc",
+        "-v", "ON_ERROR_STOP=1",
+        "-h", url.hostname or "localhost",
+        "-p", str(url.port or 5432),
+        "-U", unquote(url.username or "postgres"),
+        "-d", url.path.lstrip("/"),
+    ]
+    env = {**os.environ, "PGPASSWORD": unquote(url.password or "")}
+
+    try:
+        if args.reset:
+            subprocess.run(
+                psql_base + ["-c", "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"],
+                env=env,
+                check=True,
+            )
+        with subprocess.Popen(psql_base, stdin=subprocess.PIPE, env=env) as proc:
+            with gzip.open(dump_path, "rb") as gz:
+                while chunk := gz.read(256 * 1024):
+                    proc.stdin.write(chunk)
+            proc.stdin.close()
+            proc.wait()
+        if proc.returncode != 0:
+            print(f"restore: psql exited {proc.returncode}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        if cleanup:
+            os.unlink(cleanup)
+    print(f"restore: loaded {args.source}. Restart the app service.")
+
+
 def cmd_bootstrap(_args) -> None:
     """Create the admin named by LSF_ADMIN_USERNAME / LSF_ADMIN_PASSWORD.
 
@@ -217,6 +319,16 @@ def main() -> None:
 
     sub.add_parser("bootstrap").set_defaults(func=cmd_bootstrap)
     sub.add_parser("backup").set_defaults(func=cmd_backup)
+
+    p_restore = sub.add_parser("restore")
+    p_restore.add_argument("source", nargs="?", help="backup key or local file path")
+    p_restore.add_argument("--list", action="store_true", help="list available backups")
+    p_restore.add_argument("--reset", action="store_true",
+                           help="drop and recreate the public schema first")
+    p_restore.add_argument("--yes", action="store_true",
+                           help="confirm overwriting the current database")
+    p_restore.set_defaults(func=cmd_restore)
+
     sub.add_parser("demo").set_defaults(func=cmd_demo)
 
     args = parser.parse_args()

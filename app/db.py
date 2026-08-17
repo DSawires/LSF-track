@@ -79,6 +79,11 @@ def reset_engine() -> None:
     _SessionLocal = None
 
 
+def dispose_engine() -> None:
+    """Close pooled connections at shutdown; the next get_engine() rebuilds."""
+    reset_engine()
+
+
 def get_db() -> Iterator[Session]:
     session = get_sessionmaker()()
     try:

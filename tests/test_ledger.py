@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 import sqlalchemy as sa
 
-from app.models import ReasonCode
+from app.db import utcnow
+from app.models import Event, ReasonCode
 from app.services import reports
 from app.services.derivation import derive
+from app.services.events import EventRejected
 from tests.conftest import days_ago, hours_ago
 
 
@@ -66,18 +69,54 @@ def test_skipped_intermediate_state_still_resolves(factory):
     assert ledger.unstarted_qty == 0
 
 
-def test_over_advance_is_stored_and_flagged_not_rejected(factory):
+def test_over_advance_is_rejected_with_the_available_count(factory):
+    """CLAUDE.md: advancing more units than exist upstream is a validation
+    error. The reason names the number that IS available, so the engineer can
+    fix the entry rather than guess."""
     route = factory.route("r", ["carpentry", "paint"])
     item = factory.item("IT-4", 30, route)
 
     factory.log(item, 10, "completed", 30, at=hours_ago(6), station_code="carpentry_1")
     # Claims 50 moved to paint; only 30 exist.
-    factory.log(item, 20, "queued", 50, at=hours_ago(3), station_code="paint_1")
+    with pytest.raises(EventRejected) as excinfo:
+        factory.log(item, 20, "queued", 50, at=hours_ago(3), station_code="paint_1")
+    assert excinfo.value.field == "qty"
+    assert "only 30" in excinfo.value.reason
+
+    # Nothing was stored: the corrected entry goes straight in.
+    factory.log(item, 20, "queued", 30, at=hours_ago(3), station_code="paint_1")
+    assert _bucket(factory.db, item, "paint", "queued").qty == 30
+    derivation = derive(factory.db, item_ids=[item.id])
+    assert "over_advance" not in [a.code for a in derivation.anomalies]
+
+
+def test_preexisting_over_advance_rows_still_flag_on_replay(factory):
+    """Rows that predate the write-time guard (or slipped past it in a race)
+    are surfaced by the derivation, never silently normalised: the units that
+    do exist move, the shortfall is flagged, nothing is invented."""
+    route = factory.route("r", ["carpentry", "paint"])
+    item = factory.item("IT-4B", 30, route)
+    factory.log(item, 10, "completed", 30, at=hours_ago(6), station_code="carpentry_1")
+
+    step = next(s for s in item.steps if s.seq == 20)
+    factory.db.add(
+        Event(
+            id=uuid.uuid4(),
+            item_id=item.id,
+            item_step_id=step.id,
+            station_id=factory.station("paint_1").id,
+            event_type_id=factory.event_type("move").id,
+            state_id=factory.state("queued").id,
+            qty=50,
+            occurred_at=hours_ago(3),
+            received_at=utcnow(),
+            user_id=factory.user.id,
+        )
+    )
+    factory.db.flush()
 
     derivation = derive(factory.db, item_ids=[item.id])
-    codes = [a.code for a in derivation.anomalies]
-    assert "over_advance" in codes
-    # The 30 that do exist moved; nothing was invented.
+    assert "over_advance" in [a.code for a in derivation.anomalies]
     assert _bucket(factory.db, item, "paint", "queued").qty == 30
 
 
@@ -123,7 +162,10 @@ def test_rework_pulls_from_downstream_and_is_excluded_from_completion(factory):
 
 
 def test_replay_is_deterministic_regardless_of_insert_order(factory):
-    """Events synced late and out of order derive the same state."""
+    """Events synced late and out of order derive the same state, and the
+    out-of-order arrival is not falsely rejected: the availability check
+    simulates the whole occurred_at-ordered log, so a downstream event landing
+    before its upstream partner is judged by where the replay seats it."""
     route = factory.route("r", ["carpentry", "paint"])
     item = factory.item("IT-7", 10, route)
 
@@ -134,6 +176,35 @@ def test_replay_is_deterministic_regardless_of_insert_order(factory):
     assert _bucket(factory.db, item, "paint", "queued").qty == 10
     derivation = derive(factory.db, item_ids=[item.id])
     assert not [a for a in derivation.anomalies if a.code == "over_advance"]
+
+
+def test_rejected_entry_retries_in_after_a_correction_frees_the_units(factory):
+    """The recovery path the client's Retry button exists for: an entry the log
+    cannot support is rejected, the conflicting entry is voided by a
+    correction, and the retry (same client UUID) then lands."""
+    route = factory.route("r", ["carpentry", "paint"])
+    item = factory.item("IT-7B", 10, route)
+
+    wrong = factory.log(item, 20, "queued", 10, at=hours_ago(6), station_code="paint_1")
+    fix_id = uuid.uuid4()
+    # All 10 units are already sitting at paint; the log cannot also support
+    # completing 10 at carpentry *after* that move.
+    with pytest.raises(EventRejected):
+        factory.log(
+            item, 10, "completed", 10, at=hours_ago(3),
+            station_code="carpentry_1", event_id=fix_id,
+        )
+    factory.log(
+        item, 20, "queued", 0, at=hours_ago(1),
+        event_type="correction", supersedes=wrong.id,
+    )
+    factory.log(
+        item, 10, "completed", 10, at=hours_ago(3),
+        station_code="carpentry_1", event_id=fix_id,
+    )
+
+    assert _bucket(factory.db, item, "carpentry", "completed").qty == 10
+    assert _bucket(factory.db, item, "paint", "queued") is None
 
 
 def test_competing_corrections_keep_only_the_last(factory):
@@ -163,6 +234,40 @@ def test_competing_corrections_keep_only_the_last(factory):
     assert _bucket(factory.db, item, "carpentry", "completed").qty == 15
 
 
+def test_orphaned_correction_is_flagged_not_silent(factory):
+    """A correction whose target sits on a DIFFERENT item does nothing to this
+    item's derivation and must surface as an anomaly instead of sitting inert.
+    The API rejects this shape today, so the row is inserted directly -- it
+    models data that predates the guard or arrived outside the API."""
+    route = factory.route("r", ["carpentry", "paint"])
+    item = factory.item("IT-8B", 10, route)
+    other = factory.item("IT-8C", 5, route)
+    factory.log(item, 10, "completed", 10, at=hours_ago(4), station_code="carpentry_1")
+    target = factory.log(other, 10, "queued", 5, at=hours_ago(3), station_code="carpentry_1")
+
+    correction_type = factory.event_type("correction")
+    factory.db.add(
+        Event(
+            id=uuid.uuid4(),
+            item_id=item.id,
+            event_type_id=correction_type.id,
+            qty=0,
+            occurred_at=hours_ago(1),
+            received_at=utcnow(),
+            user_id=factory.user.id,
+            supersedes_event_id=target.id,  # exists, but on the other item
+        )
+    )
+    factory.db.flush()
+
+    derivation = derive(factory.db, item_ids=[item.id])
+    assert "orphaned_correction" in [a.code for a in derivation.anomalies]
+    # The correction excluded nothing: the completed units are untouched.
+    assert _bucket(factory.db, item, "carpentry", "completed").qty == 10
+    # And the other item's event, which it wrongly names, is untouched too.
+    assert _bucket(factory.db, other, "carpentry", "queued").qty == 5
+
+
 def test_aging_uses_oldest_lot_fifo(factory):
     """A partial advance must not reset the age of what stayed behind."""
     route = factory.route("r", ["carpentry", "paint"])
@@ -181,6 +286,65 @@ def test_aging_uses_oldest_lot_fifo(factory):
         and r["state"]["code"] == "queued"
     )
     assert 9.9 < row["days_in_state"] < 10.1
+
+
+def test_overdue_is_judged_against_the_stage_threshold(factory):
+    """Sitting too long is per stage, not one global number: 5 days at a
+    3-day stage is overdue, 5 days at a no-threshold stage is not."""
+    hot = factory.stage("paint")
+    hot.max_days_in_state = 3
+    calm = factory.add_stage("resting", sort=35, max_days_in_state=None)
+    route = factory.route("r-age", ["paint", "resting"])
+    item = factory.item("AGE-1", 20, route)
+
+    factory.log(item, 10, "queued", 20, at=days_ago(9), station_code="paint_1")
+    factory.log(item, 10, "completed", 10, at=days_ago(6), station_code="paint_1")
+    factory.log(item, 20, "queued", 10, at=days_ago(5))
+
+    report = reports.aging_report(factory.db)
+    by_stage = {
+        (r["stage"]["code"], r["state"]["code"]): r
+        for r in report["rows"] if r["stage"]
+    }
+    assert by_stage[("paint", "queued")]["overdue"] is True       # 9d >= 3d
+    assert by_stage[("resting", "queued")]["overdue"] is False    # no threshold
+    # The item-card payload carries the same judgement.
+    state = reports.item_state(factory.db, [item.id])[str(item.id)]
+    flags = {p["stage_code"]: p["overdue"] for p in state["positions"] if p["stage_code"]}
+    assert flags["paint"] is True
+    assert flags["resting"] is False
+
+
+def test_clock_anomalies_flag_ahead_devices_and_late_syncs(factory):
+    """CLAUDE.md: received_at exists to detect wrong device clocks and late
+    syncs -- flagged, not silently trusted."""
+    from datetime import timedelta
+
+    route = factory.route("r", ["carpentry"])
+    item = factory.item("CLK-1", 5, route)
+
+    # Synced 20 days after it happened: past the 14-day late-sync threshold.
+    factory.log(item, 10, "in_progress", 5, at=days_ago(20), station_code="carpentry_1")
+    # Device clock 3h ahead: within the 7-day hard-reject bound, past the
+    # 1h flag threshold.
+    factory.log(item, 10, "completed", 5, at=utcnow() + timedelta(hours=3), station_code="carpentry_1")
+
+    derivation = derive(factory.db, item_ids=[item.id])
+    codes = [a.code for a in derivation.anomalies]
+    assert "device_clock_ahead" in codes
+    assert "late_sync" in codes
+
+
+def test_far_future_occurred_at_is_rejected(factory):
+    from datetime import timedelta
+
+    route = factory.route("r", ["carpentry"])
+    item = factory.item("CLK-2", 5, route)
+    with pytest.raises(EventRejected, match="future"):
+        factory.log(
+            item, 10, "queued", 5,
+            at=utcnow() + timedelta(days=30), station_code="carpentry_1",
+        )
 
 
 def test_missing_station_is_flagged_only_past_the_queue(factory):

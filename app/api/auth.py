@@ -8,10 +8,15 @@ from app.db import get_db
 from app.deps import clear_session, current_user, issue_session
 from app.models import User
 from app.schemas import LoginRequest
-from app.security import verify_password
+from app.security import hash_password, verify_password
 from app.throttle import login_throttle
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+# Burned on every login attempt for a nonexistent or inactive user, so an
+# unknown username costs the same ~50ms of scrypt as a wrong password.
+# Otherwise response timing enumerates valid usernames.
+_DUMMY_HASH = hash_password("not-a-real-password")
 
 
 def _user_payload(user: User) -> dict:
@@ -45,7 +50,11 @@ def login(
         )
 
     user = db.scalars(sa.select(User).where(User.username == username)).first()
-    if user is None or not user.is_active or not verify_password(payload.password, user.password_hash):
+    if user is None or not user.is_active:
+        verify_password(payload.password, _DUMMY_HASH)
+        login_throttle.record_failure(username, ip)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong username or password")
+    if not verify_password(payload.password, user.password_hash):
         login_throttle.record_failure(username, ip)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong username or password")
     login_throttle.record_success(username)

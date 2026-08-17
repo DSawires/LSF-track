@@ -10,7 +10,7 @@ status column on `items`.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -27,8 +27,10 @@ from app.models import Event, EventState, EventType, Item, ItemStep, ReasonCode,
 
 
 def load_vocabulary(db: Session) -> Vocabulary:
+    # All rows, including inactive ones: deactivating a state or stage hides it
+    # from the pickers, but historical events referencing it must keep deriving.
     return Vocabulary(
-        states=list(db.scalars(sa.select(EventState).where(EventState.is_active.is_(True)))),
+        states=list(db.scalars(sa.select(EventState))),
         event_types={et.id: et for et in db.scalars(sa.select(EventType))},
         stages={s.id: s for s in db.scalars(sa.select(Stage))},
     )
@@ -113,7 +115,3 @@ def reference_maps(db: Session) -> dict[str, dict[uuid.UUID, object]]:
         "event_types": {row.id: row for row in db.scalars(sa.select(EventType))},
         "reason_codes": {row.id: row for row in db.scalars(sa.select(ReasonCode))},
     }
-
-
-def ids(rows: Iterable) -> list[uuid.UUID]:
-    return [row.id for row in rows]

@@ -20,6 +20,14 @@
 #
 # Set LSF_DEMO=true for a throwaway instance pre-loaded with sample data.
 
+# Bounded log files everywhere: this box runs unattended, and Docker's default
+# json-file driver grows until the disk fills.
+x-logging: &bounded-logs
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   db:
     image: postgres:16-alpine
@@ -34,6 +42,7 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+    logging: *bounded-logs
     restart: unless-stopped
 
   app:
@@ -46,10 +55,14 @@ services:
     command: ["--proxy-headers", "--forwarded-allow-ips", "*"]
     environment:
       LSF_DATABASE_URL: postgresql+psycopg://lsf:${POSTGRES_PASSWORD:-lsf}@db:5432/lsf_track
-      # Empty means an ephemeral random key: secure, but sessions reset on
-      # restart. Set a stable key for real use. Placeholder values are refused.
+      # Empty means the entrypoint generates a key ONCE and persists it on the
+      # uploads volume, so sessions survive restarts either way. Set your own
+      # to manage it; placeholder values are refused at boot.
       LSF_SECRET_KEY: ${LSF_SECRET_KEY:-}
+      # The app refuses to boot with LSF_DOMAIN set while this is false, so a
+      # TLS deployment cannot silently ship insecure cookies.
       LSF_SECURE_COOKIES: ${LSF_SECURE_COOKIES:-false}
+      LSF_DOMAIN: ${LSF_DOMAIN:-}
       LSF_ADMIN_USERNAME: ${LSF_ADMIN_USERNAME:-admin}
       LSF_ADMIN_PASSWORD: ${LSF_ADMIN_PASSWORD:-}
       LSF_DEMO: ${LSF_DEMO:-false}
@@ -65,13 +78,24 @@ services:
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
     volumes:
       - uploads:/srv/lsf/data
+    healthcheck:
+      # /health does a real SELECT 1; a container with a dead database reports
+      # unhealthy instead of green.
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
+    logging: *bounded-logs
     restart: unless-stopped
 
   backup:
     build: .
     # Same image, different job: a pg_dump shipped to storage once a day.
-    # The short initial delay lets the app service run migrations first.
-    entrypoint: ["sh", "-c", "sleep 60; while true; do python manage.py backup || echo 'backup FAILED' >&2; sleep 86400; done"]
+    # One backup shortly after boot (fresh deploys are covered), then a loop
+    # anchored to 02:00 UTC — anchored to the clock, not to container start,
+    # so a daily redeploy can never starve the schedule.
+    entrypoint: ["sh", "-c", "sleep 60; python manage.py backup || echo 'backup FAILED' >&2; while true; do now=$$(date -u +%s); next=$$(date -u -d '02:00' +%s); [ $$next -le $$now ] && next=$$((next + 86400)); sleep $$((next - now)); python manage.py backup || echo 'backup FAILED' >&2; done"]
     depends_on:
       db:
         condition: service_healthy
@@ -86,6 +110,7 @@ services:
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
     volumes:
       - uploads:/srv/lsf/data
+    logging: *bounded-logs
     restart: unless-stopped
 
   proxy:
@@ -99,7 +124,9 @@ services:
     volumes:
       - caddy_data:/data
     depends_on:
-      - app
+      app:
+        condition: service_healthy
+    logging: *bounded-logs
     restart: unless-stopped
 
 volumes:
