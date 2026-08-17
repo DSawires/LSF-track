@@ -15,7 +15,7 @@ from fastapi import Depends, HTTPException, Request, Response, status
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
+from app.config import get_settings, require_session_key
 from app.db import get_db
 from app.models import User
 
@@ -23,7 +23,10 @@ COOKIE_NAME = "lsf_session"
 
 
 def _serializer() -> URLSafeTimedSerializer:
-    return URLSafeTimedSerializer(get_settings().secret_key, salt="lsf-session")
+    # Validated here, not at settings load: an unusable key must never reach
+    # the signer, but a backup job that imports settings has no business
+    # caring about it.
+    return URLSafeTimedSerializer(require_session_key(), salt="lsf-session")
 
 
 def _password_fingerprint(user: User) -> str:

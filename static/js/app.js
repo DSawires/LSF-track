@@ -200,6 +200,31 @@ function renderPill() {
   if (banner) banner.hidden = !(S.needsLogin && S.user);
 }
 
+/* The four the stylesheet paints. A UI palette, not factory vocabulary — the
+   server takes the same four and nothing branches on which one it is. */
+const BANNER_COLORS = ["green", "yellow", "red", "neutral"];
+
+/* The admin-set banner, shown to everyone who is not an admin. It is drawn from
+   the cached reference payload rather than fetched, so a notice raised while
+   the phone had signal stays up after it loses it — a banner that disappears in
+   a dead spot is worse than none.
+
+   Colour is never the only signal: the label spells it out, for gloved hands
+   holding a phone in bad light and for anyone who cannot tell the reds from the
+   greens. */
+function renderStatusBanner() {
+  const el = document.getElementById("status-banner");
+  if (!el) return;
+  const banner = S.ref?.banner;
+  const show = !!S.user && !S.user.is_admin && !!banner &&
+    (banner.color !== "neutral" || !!banner.message);
+  el.hidden = !show;
+  if (!show) { el.className = ""; el.textContent = ""; return; }
+  el.className = BANNER_COLORS.includes(banner.color) ? banner.color : "neutral";
+  el.innerHTML = `<span class="label">${esc(banner.color)}</span>` +
+    (banner.message ? ` ${esc(banner.message)}` : "");
+}
+
 function timeAgo(timestamp) {
   const minutes = Math.round((Date.now() - timestamp) / 60000);
   if (minutes < 1) return "just now";
@@ -452,6 +477,9 @@ function render(background = false) {
   const hash = location.hash || "#/items";
   document.getElementById("topbar").hidden = false;
   document.getElementById("tabs").hidden = S.needsLogin && !S.user;
+  // Before every early return below: the banner lives in the shell, not the
+  // view, and must not depend on whether this particular render went ahead.
+  renderStatusBanner();
 
   // Only force the login screen when there is no cached identity to work
   // with. A session expiring mid-shift must NOT lock an engineer out of an
@@ -1457,9 +1485,9 @@ function nextRevision(current) {
   return `${current}1`;
 }
 
-/* The office is five workspaces rather than one long page: items, projects,
-   routes, stages, users. Each is a subpage under #/office/<section>, so an
-   editor is somewhere you navigate to and finish, not something you scroll
+/* The office is six workspaces rather than one long page: items, projects,
+   routes, stages, users, status. Each is a subpage under #/office/<section>, so
+   an editor is somewhere you navigate to and finish, not something you scroll
    past on the way to something else. */
 const OFFICE_SECTIONS = [
   { key: "items", label: "Items" },
@@ -1467,6 +1495,7 @@ const OFFICE_SECTIONS = [
   { key: "routes", label: "Routes" },
   { key: "stages", label: "Stages", admin: true },
   { key: "users", label: "Users", admin: true },
+  { key: "status", label: "Status", admin: true },
 ];
 
 function viewOffice(section) {
@@ -1487,6 +1516,7 @@ function viewOffice(section) {
     routes: officeRoutes,
     stages: officeStages,
     users: officeUsers,
+    status: officeStatus,
   }[current.key])(body);
 }
 
@@ -1695,25 +1725,30 @@ async function loadItemEditors() {
         <br><span class="muted">${esc(item.description)} · ${item.total_qty} pcs · rev ${esc(item.drawing_revision)} · ${item.is_released ? "released" : "not released"}</span>
       </summary>
       <div style="padding:8px 0 12px">
+        <!-- Readable by anyone, editable by admins: a code or a batch size is
+             what the rest of the floor reads the work by. -->
         <div class="field-grid">
-          <div><label>Code</label><input data-it-code="${item.id}" value="${esc(item.code)}"></div>
-          <div><label>Total qty</label><input data-it-qty="${item.id}" type="number" inputmode="numeric" min="1" value="${item.total_qty}"></div>
+          <div><label>Code</label><input data-it-code="${item.id}" value="${esc(item.code)}" ${isAdmin ? "" : "disabled"}></div>
+          <div><label>Total qty</label><input data-it-qty="${item.id}" type="number" inputmode="numeric" min="1" value="${item.total_qty}" ${isAdmin ? "" : "disabled"}></div>
         </div>
         <label>Description</label>
-        <input data-it-desc="${item.id}" value="${esc(item.description)}">
+        <input data-it-desc="${item.id}" value="${esc(item.description)}" ${isAdmin ? "" : "disabled"}>
         <div class="field-grid">
           <div><label>Project</label>
-            <select data-it-project="${item.id}">
+            <select data-it-project="${item.id}" ${isAdmin ? "" : "disabled"}>
               ${projects.map((p) => `<option value="${p.id}" ${p.id === item.project_id ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
             </select>
           </div>
           <div><label>Target release</label>
-            <input data-it-date="${item.id}" type="date" value="${item.target_release_date || ""}">
+            <input data-it-date="${item.id}" type="date" value="${item.target_release_date || ""}" ${isAdmin ? "" : "disabled"}>
           </div>
         </div>
+        ${isAdmin ? `
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
           <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
-        </div>
+        </div>`
+        : `<p class="muted" style="margin-top:10px">Changing these is an admin job. Logging
+        entries, releasing and bumping the revision are not.</p>`}
 
         <label style="margin-top:12px">Item icon</label>
         <div style="display:flex;gap:10px;align-items:center">
@@ -2141,6 +2176,169 @@ function officeUsers(body) {
       </details>
     </div>`;
   loadUsers();
+}
+
+/* --------------------------------------------------------- office: status -- */
+
+/* The banner an admin has composed but not yet published. Null means "whatever
+   is live", so opening the page shows the truth rather than a stale pick from
+   an hour ago; both clear once a publish lands.
+
+   The message is held here rather than left in the DOM for the same reason the
+   log screen holds its note: a background sync re-renders this view every 30
+   seconds, and an empty field is indistinguishable from an untouched one to the
+   snapshot logic — so an admin who deleted the message would watch it come
+   back. */
+let bannerPick = null;
+let bannerMsg = null;
+
+/* Both halves of the admin status page.
+
+   The banner is a broadcast: an admin sets it here, every non-admin sees it at
+   the top of the app until it is set back to neutral with no message. Admins
+   do not get the bar themselves — this card is where they see and change it,
+   which is the one place the bar would be redundant.
+
+   The accounts list is the other direction: last sign-in, last logged entry
+   and lifetime entry count per account, so a phone that has quietly stopped
+   reaching the server shows up as a row that has gone still. Every account is
+   listed, admins badged, because an admin who logs work from the floor is as
+   worth seeing as anyone else. */
+function officeStatus(body) {
+  const live = S.ref?.banner || { color: "neutral", message: "" };
+  const picked = bannerPick || live.color;
+
+  body.innerHTML = `
+    <div class="card">
+      <h2>Floor banner</h2>
+      <p class="muted" style="margin-bottom:10px">Shown at the top of the app to everyone
+      who is not an admin, offline included — the phones keep showing the last banner they
+      received. Neutral with no message shows nothing at all.</p>
+      <div id="st-live" class="muted"></div>
+      <label>Colour</label>
+      <div class="seg" id="st-colors">
+        ${BANNER_COLORS.map((c) => `
+          <button data-id="${c}" class="${c === picked ? "on" : ""}" aria-pressed="${c === picked}">
+            ${c === "neutral" ? "Neutral" : c[0].toUpperCase() + c.slice(1)}
+          </button>`).join("")}
+      </div>
+      <label for="st-msg">Message (optional, 200 characters)</label>
+      <input id="st-msg" maxlength="200" placeholder="e.g. Paint booth 2 down until Thursday"
+             value="${esc(bannerMsg ?? live.message ?? "")}">
+      <div style="height:10px"></div>
+      <button class="primary" id="st-go" ${S.online ? "" : "disabled"}>
+        ${S.online ? "Publish banner" : "Publishing needs a connection"}</button>
+      <p class="warn-text" id="st-err" hidden></p>
+    </div>
+
+    <div class="card">
+      <h2>Accounts</h2>
+      <p class="muted" style="margin-bottom:10px">Entries are counted against the person
+      they were logged for, and timed by when the work happened on the floor.</p>
+      <div id="st-users" class="muted">Loading…</div>
+    </div>`;
+
+  renderLiveBanner(live);
+
+  // Repainted in place rather than re-rendered: nothing else on the page
+  // depends on the pick, and a re-render here would reach into the message
+  // field the admin is halfway through typing.
+  wireSeg("st-colors", (color) => {
+    bannerPick = color;
+    document.querySelectorAll("#st-colors button").forEach((b) => {
+      const on = b.dataset.id === color;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", String(on));
+    });
+  });
+
+  document.getElementById("st-msg").oninput = (e) => { bannerMsg = e.target.value; };
+
+  document.getElementById("st-go").onclick = async () => {
+    const err = document.getElementById("st-err");
+    err.hidden = true;
+    try {
+      await api("/api/status/banner", {
+        method: "POST",
+        body: JSON.stringify({
+          color: bannerPick || live.color,
+          message: (bannerMsg ?? live.message ?? "").trim(),
+        }),
+      });
+      bannerPick = null;
+      bannerMsg = null;
+      toast("Banner published to the floor");
+      sync(); // the banner reaches other phones through the reference payload
+    } catch (error) {
+      err.textContent = error.body?.detail || "Could not publish the banner.";
+      err.hidden = false;
+    }
+  };
+
+  loadUserStatus();
+}
+
+function renderLiveBanner(live) {
+  const el = document.getElementById("st-live");
+  if (!el) return;
+  const showing = live.color !== "neutral" || !!live.message;
+  el.innerHTML = showing
+    ? `<span class="badge">live</span> <strong>${esc(live.color)}</strong>${live.message ? ` — ${esc(live.message)}` : ""}
+       <br>set by ${esc(live.set_by || "someone")} ${live.set_at ? timeAgo(Date.parse(live.set_at)) : ""}`
+    : `<span class="badge">live</span> Nothing showing on the floor.`;
+}
+
+/* "never" beats a blank cell: an account that has not signed in since this
+   shipped is a fact worth reading as one, not an empty space that looks like a
+   rendering bug. Relative time on top because that is the question being asked;
+   the wall clock underneath because "3d ago" is not something to put in an
+   email about it. */
+function whenCell(iso) {
+  if (!iso) return `<td class="muted">never</td>`;
+  const when = new Date(iso);
+  return `<td>${timeAgo(when.getTime())}<br><span class="muted">${
+    when.toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })
+  }</span></td>`;
+}
+
+async function loadUserStatus() {
+  const target = document.getElementById("st-users");
+  if (!target) return;
+
+  let users;
+  try {
+    ({ users } = await api("/api/status/users"));
+  } catch {
+    target.textContent = "Account status needs a connection — it is counted from the log on the server.";
+    return;
+  }
+  if (!target.isConnected) return;
+
+  target.classList.remove("muted");
+  target.innerHTML = `
+    <div class="table-scroll">
+    <table>
+      <thead><tr>
+        <th scope="col">Person</th>
+        <th scope="col">Last sign-in</th>
+        <th scope="col">Last entry</th>
+        <th scope="col" class="num">Entries</th>
+      </tr></thead>
+      <tbody>
+        ${users.map((u) => `
+          <tr>
+            <td>
+              <strong>${esc(u.display_name)}</strong>
+              ${u.is_admin ? ` <span class="badge">admin</span>` : ""}${u.is_active ? "" : ` <span class="badge">off</span>`}
+              <br><span class="muted">${esc(u.username)}</span>
+            </td>
+            ${whenCell(u.last_login_at)}
+            ${whenCell(u.last_event_at)}
+            <td class="num">${u.actions}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>
+    </div>`;
 }
 
 /* ----------------------------------------------- stage admin (runtime) -- */

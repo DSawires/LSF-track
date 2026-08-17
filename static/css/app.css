@@ -106,6 +106,29 @@ header h1 {
 
 #session-banner a { color: inherit; font-weight: 650; }
 
+/* The admin-set banner. Colour is never the only signal — the label spells the
+   colour out — because a red bar and a green bar are the same bar to a
+   colour-blind engineer, and this one is read across a workshop. */
+#status-banner {
+  flex: none;
+  padding: 8px 14px;
+  font-size: 14px;
+  text-align: center;
+  border-bottom: 1px solid var(--line);
+}
+
+#status-banner .label {
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+#status-banner.green { background: #123320; color: #7ee2a8; }
+#status-banner.yellow { background: #4a3a10; color: #ffd98a; }
+#status-banner.red { background: #48151a; color: #ff9ea1; }
+#status-banner.neutral { background: var(--panel-2); color: var(--muted); }
+
 /* Insertion points between route-builder chips. */
 .insert-slot {
   background: none;

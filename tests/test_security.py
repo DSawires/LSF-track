@@ -54,14 +54,49 @@ def test_ip_budget_is_shared_across_usernames():
     ],
 )
 def test_bad_secret_keys_are_refused(value, match):
-    from app.config import get_settings
+    from app.config import get_settings, require_session_key
 
     original = os.environ.get("LSF_SECRET_KEY")
     try:
         os.environ["LSF_SECRET_KEY"] = value
         get_settings.cache_clear()
         with pytest.raises(RuntimeError, match=match):
-            get_settings()
+            require_session_key()
+    finally:
+        os.environ["LSF_SECRET_KEY"] = original or ""
+        get_settings.cache_clear()
+
+
+def test_database_only_commands_do_not_need_a_session_key():
+    """The nightly backup runs in its own container, never serves a request,
+    and used to die on this check -- losing real data protection to guard a
+    key it does not touch. Settings must load; the web app's own refusal to
+    boot without a key lives in app.main's lifespan and is unaffected."""
+    from app.config import get_settings
+
+    original = os.environ.get("LSF_SECRET_KEY")
+    try:
+        os.environ["LSF_SECRET_KEY"] = ""
+        get_settings.cache_clear()
+        assert get_settings().database_url  # no RuntimeError
+    finally:
+        os.environ["LSF_SECRET_KEY"] = original or ""
+        get_settings.cache_clear()
+
+
+def test_web_app_still_refuses_to_boot_without_a_key():
+    from fastapi.testclient import TestClient
+
+    from app.config import get_settings
+    from app.main import app
+
+    original = os.environ.get("LSF_SECRET_KEY")
+    try:
+        os.environ["LSF_SECRET_KEY"] = ""
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match="not set"):
+            with TestClient(app):
+                pass
     finally:
         os.environ["LSF_SECRET_KEY"] = original or ""
         get_settings.cache_clear()

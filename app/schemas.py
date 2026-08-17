@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -164,3 +165,14 @@ class ReleaseRequest(BaseModel):
 
 class RevisionBumpRequest(BaseModel):
     drawing_revision: str = Field(min_length=1, max_length=32)
+
+
+class BannerUpdate(BaseModel):
+    """The site-wide banner. `neutral` with no message means "show nothing".
+
+    A Literal rather than a lookup table: these four are what the stylesheet
+    paints, not vocabulary the factory owns. See app/services/status.py.
+    """
+
+    color: Literal["green", "yellow", "red", "neutral"]
+    message: str = Field(default="", max_length=200)

@@ -569,6 +569,35 @@ def test_purge_destroys_an_item_and_its_events(world, client):
     ) == 0
 
 
+def test_purge_survives_a_correction_chain(world, client):
+    """A correction points at the event it supersedes, so an item's log is a
+    graph, not a list. Purging must not trip the self-referential foreign key
+    -- this is what a real item with a voided entry looks like."""
+    import sqlalchemy as sa
+
+    from app.models import Event, Item
+
+    factory, _route, item = world
+    logged = factory.log(item, 10, "queued", 10, at=hours_ago(4), station_code="carpentry_1")
+    factory.log(item, 10, "completed", 10, at=hours_ago(3), station_code="carpentry_1",
+                event_type="correction", supersedes=logged.id)
+    factory.db.commit()
+    item_id = item.id
+    before = factory.db.scalar(
+        sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item_id)
+    )
+
+    purged = client.delete(f"/api/items/{item_id}?purge=true")
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["purged_events"] == before >= 3
+
+    factory.db.expire_all()
+    assert factory.db.get(Item, item_id) is None
+    assert factory.db.scalar(
+        sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item_id)
+    ) == 0
+
+
 def test_project_rename_and_reactivate(client, factory):
     factory.db.commit()
     project_id = str(factory.project.id)

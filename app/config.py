@@ -21,8 +21,17 @@ _GENERATE_HINT = 'python -c "import secrets; print(secrets.token_urlsafe(48))"'
 _MIN_KEY_LENGTH = 32
 
 
-def _secret_key() -> str:
-    value = os.environ.get("LSF_SECRET_KEY", "").strip()
+def require_session_key() -> str:
+    """The session-signing key, validated where it is actually used.
+
+    Only the web app signs sessions. `manage.py backup`, `restore`, `migrate`
+    and friends talk to the database and nothing else, and the backup job runs
+    in its own container that never serves a request -- failing the nightly
+    dump over a key it will never touch loses real data protection to guard
+    nothing. The web app still refuses to boot without a good key: app.main's
+    lifespan calls this before the first request.
+    """
+    value = get_settings().secret_key
     if value.lower() in _KNOWN_WEAK_KEYS:
         raise RuntimeError(
             "LSF_SECRET_KEY is set to a known placeholder value. Generate a real "
@@ -93,7 +102,9 @@ def get_settings() -> Settings:
         database_url=os.environ.get(
             "LSF_DATABASE_URL", "postgresql+psycopg://lsf:lsf@localhost:5432/lsf_track"
         ),
-        secret_key=_secret_key(),
+        # Raw here, checked by require_session_key() at the point of use, so a
+        # database-only command is not held hostage to a session concern.
+        secret_key=os.environ.get("LSF_SECRET_KEY", "").strip(),
         session_max_age_days=_int("LSF_SESSION_MAX_AGE_DAYS", 30),
         secure_cookies=_bool("LSF_SECURE_COOKIES", True),
         domain=os.environ.get("LSF_DOMAIN", "").strip(),

@@ -4,7 +4,7 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.db import get_db, utcnow
 from app.deps import clear_session, current_user, issue_session
 from app.models import User
 from app.schemas import LoginRequest
@@ -58,6 +58,11 @@ def login(
         login_throttle.record_failure(username, ip)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "wrong username or password")
     login_throttle.record_success(username)
+    # The status page's one non-derived figure. Written on the way in rather
+    # than on every authenticated request: sessions slide for weeks, so
+    # "last seen" and "last signed in" are genuinely different facts and this
+    # is the one an admin asked for.
+    user.last_login_at = utcnow()
     issue_session(response, user)
     return {"user": _user_payload(user)}
 

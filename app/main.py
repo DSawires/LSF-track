@@ -14,8 +14,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, events, images, items, office, reference, reports, users
-from app.config import get_settings
+from app.api import auth, events, images, items, office, reference, reports, status, users
+from app.config import get_settings, require_session_key
 from app.db import dispose_engine, get_engine
 
 
@@ -59,8 +59,10 @@ log = logging.getLogger(__name__)
 async def _lifespan(app: FastAPI):
     # Fail at boot, not on the first request: a bad LSF_SECRET_KEY or an
     # inconsistent TLS/cookie combination must stop the deploy while someone
-    # is still looking at it.
+    # is still looking at it. This is the web app, so the key is required --
+    # database-only commands validate nothing and need nothing.
     get_settings()
+    require_session_key()
     yield
     dispose_engine()
 
@@ -80,6 +82,7 @@ app.include_router(images.router)
 app.include_router(events.router)
 app.include_router(reports.router)
 app.include_router(users.router)
+app.include_router(status.router)
 
 _STATIC = Path(__file__).resolve().parent.parent / "static"
 

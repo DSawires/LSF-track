@@ -3,6 +3,9 @@
 The phone must be able to *look things up* with no signal, not just queue writes.
 This endpoint is everything needed to render the logging screen from scratch, and
 the client stores it in IndexedDB on every successful sync.
+
+The status banner rides along for exactly that reason: a notice worth putting on
+the floor's screens should not vanish the moment the floor loses signal.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from app.models import (
     Station,
     User,
 )
+from app.services.status import current_banner
 
 router = APIRouter(prefix="/api", tags=["reference"])
 
@@ -45,6 +49,7 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
 
     return {
         "server_time": utcnow().isoformat(),
+        "banner": current_banner(db),
         "stages": [
             {
                 "id": str(s.id),

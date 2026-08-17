@@ -263,6 +263,15 @@ version; items already released keep the version they left against.
   a password reset (admin UI or `manage.py set-password`) kills every session
   issued before it. Signing out clears the device's cached identity and data
   cache. User accounts are managed in the app: Office tab → Users (admin).
+- **Account status is a page, the banner is a broadcast.** Office tab → Status
+  (admin) lists every account's last sign-in, last logged entry and lifetime
+  entry count — how you spot a phone that stopped reaching the server, which
+  the production reports cannot tell you. The same page publishes a
+  green/yellow/red/neutral banner with an optional message to everyone who is
+  not an admin. It travels in the reference payload, so a phone that goes into
+  a dead spot keeps showing the last notice it received; neutral with no
+  message shows nothing. Banners are appended, never edited — who raised the
+  red and when stays in the record.
 - **"Sitting too long" is per stage, not one number.** Each stage carries an
   optional `max_days_in_state`; the aging report and item cards flag against
   it, so paint runs hot at 3 days while outsourced rests for 3 weeks

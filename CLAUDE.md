@@ -104,6 +104,10 @@ No `percent_complete` field. No `status` free-text. No "on track / at risk" flag
 Users record what happened: item, stage, station, state, quantity, time. Any
 health assessment is computed from the log, never typed in.
 
+The admin floor banner is not a hole in this. It is one person's announcement to
+the floor — attached to no item, read by no report, feeding no aggregate. The
+moment anything starts deriving from its colour, that is the rule being broken.
+
 ## Data model
 
 Names are indicative; Alembic migrations are authoritative.
@@ -120,7 +124,14 @@ Names are indicative; Alembic migrations are authoritative.
 - `item_steps` — the snapshot of the route for this item
 - `events` — the log. See below.
 - `event_types`, `reason_codes` — table-driven vocabularies
-- `users`
+- `users` — carries `last_login_at`, stamped at sign-in. The only piece of
+  account status not derived from the log, because signing in is not an event
+  about an item.
+- `status_banners` — the notice an admin puts on the floor's screens. Insert
+  only, latest row wins, cleared by appending a neutral one. `color` is a fixed
+  UI palette (green/yellow/red/neutral), deliberately not a lookup table: it is
+  what the stylesheet can paint, not vocabulary the factory owns, and nothing
+  branches on it server-side.
 
 ### `events` columns
 
@@ -178,6 +189,10 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   legacy over-advance rows — flags derived from the log, not a third dashboard
 - Office tab: projects, items, versioned routes, release (with mid-production
   quantity distribution), and admin management of stages/stations
+- Office → Status (admin only): per-account last sign-in, last logged entry and
+  lifetime entry count, plus the green/yellow/red/neutral banner an admin
+  publishes to every non-admin. The banner ships in the reference payload, so
+  it survives the phone losing signal
 - Item photos (snag photos + item icons). Online-only by design: the offline
   guarantee protects the logging path, and multi-megabyte blobs do not belong
   in its sync queue
@@ -218,7 +233,11 @@ fixed rather than patched around.
 
 - `LSF_SECRET_KEY` is mandatory (no ephemeral fallback): sessions must survive
   restarts or offline phones cannot drain their queues after a redeploy. The
-  Docker entrypoint generates and persists one if unset.
+  Docker entrypoint generates and persists one if unset. It is required by the
+  **web app only**, and validated at the point of use (`require_session_key`),
+  not when settings load — the backup container runs its own entrypoint, never
+  serves a request, and must not lose a night's dump over a key it never signs
+  anything with.
 - The login throttle is in-memory and per-process: correct at one uvicorn
   worker (the shipped configuration). Adding `--workers N` needs a shared
   store for it first.

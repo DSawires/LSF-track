@@ -23,6 +23,10 @@ class User(Base):
     is_admin: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # Stamped by the login endpoint. Not derivable from the log -- a sign-in
+    # is not an event about an item -- so it is a column, and the only piece
+    # of account state the status page cannot compute.
+    last_login_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
 class Project(Base):
@@ -303,3 +307,24 @@ class Event(Base):
         sa.Index("ix_events_station_occurred", "station_id", "occurred_at"),
         sa.Index("ix_events_step_occurred", "item_step_id", "occurred_at"),
     )
+
+
+class StatusBanner(Base):
+    """The site-wide notice an admin raises for the floor. Latest row wins.
+
+    Insert-only, like the event log and for the same reason: "who put the
+    factory on red, and when" is worth keeping, and an UPDATE would erase it.
+    Clearing the banner is a new row with colour `neutral` and no message.
+
+    `colour` is presentation, not factory vocabulary: it is the four things the
+    stylesheet can paint, fixed by the UI rather than owned by the factory, so
+    it is deliberately NOT a lookup table. Nothing branches on it server-side.
+    """
+
+    __tablename__ = "status_banners"
+
+    id: Mapped[uuid.UUID] = _pk()
+    color: Mapped[str] = mapped_column(sa.String(16))
+    message: Mapped[str] = mapped_column(sa.String(200), default="")
+    set_by_user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"))
+    set_at: Mapped[datetime] = mapped_column(default=utcnow, index=True)

@@ -193,10 +193,13 @@ def update_item(
     item_id: uuid.UUID,
     payload: ItemUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(current_user),
+    admin: User = Depends(require_admin),
 ) -> dict:
     """Correct an item's office-side facts: code, description, project, batch
-    size, target date.
+    size, target date. Admin-only: a code or batch size is what everyone else
+    reads the floor by, and a quiet edit to one re-labels work already logged.
+    Logging events, releasing and bumping a revision stay open to any engineer
+    -- those append to the log rather than rewriting what it refers to.
 
     The drawing revision is deliberately not editable here -- a revision is a
     dated fact about what production was told to build, so it moves by a bump
@@ -301,11 +304,28 @@ def remove_item(
         > 0
     )
     if has_events and purge:
+        item_events = sa.select(Event.id).where(Event.item_id == item_id)
         purged = db.scalar(
             sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item_id)
         )
-        for event in db.scalars(sa.select(Event).where(Event.item_id == item_id)):
-            db.delete(event)
+        # A correction points at the event it supersedes, so the log is a graph
+        # and not a list: deleting a superseded row while its correction still
+        # references it trips events_supersedes_event_id_fkey. Cut the links
+        # first -- including any reaching in from another item's corrections --
+        # and the rows then go in one statement, in whatever order the database
+        # likes. `synchronize_session=False` because nothing reads these
+        # objects again; the commit at the end of the request expires them.
+        db.execute(
+            sa.update(Event)
+            .where(Event.supersedes_event_id.in_(item_events))
+            .values(supersedes_event_id=None)
+            .execution_options(synchronize_session=False)
+        )
+        db.execute(
+            sa.delete(Event)
+            .where(Event.item_id == item_id)
+            .execution_options(synchronize_session=False)
+        )
         db.flush()
         _destroy_item(db, item)
         return {"archived": False, "deleted": True, "purged_events": purged}
