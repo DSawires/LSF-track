@@ -89,6 +89,17 @@ def update_stage(
     return _stage_payload(stage)
 
 
+def _station_payload(station: Station) -> dict:
+    return {
+        "id": str(station.id),
+        "stage_id": str(station.stage_id),
+        "code": station.code,
+        "name": station.name,
+        "sort_order": station.sort_order,
+        "is_active": station.is_active,
+    }
+
+
 @router.post("/stations", status_code=status.HTTP_201_CREATED)
 def create_station(
     payload: StationCreate,
@@ -107,14 +118,7 @@ def create_station(
     )
     db.add(station)
     db.flush()
-    return {
-        "id": str(station.id),
-        "stage_id": str(station.stage_id),
-        "code": station.code,
-        "name": station.name,
-        "sort_order": station.sort_order,
-        "is_active": station.is_active,
-    }
+    return _station_payload(station)
 
 
 @router.patch("/stations/{station_id}")
@@ -124,13 +128,25 @@ def update_station(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ) -> dict:
+    """Rename, reorder or retire a physical station.
+
+    Neither `code` nor `stage_id` is patchable: events reference the station by
+    id and reports read the name off the row, so a rename is safe and needs no
+    history rewrite -- but a station that changed stage or code would silently
+    re-label work that happened somewhere else. Retire it and add the new one.
+    """
     station = db.get(Station, station_id)
     if station is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown station")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    fields = payload.model_dump(exclude_unset=True)
+    if "name" in fields:
+        fields["name"] = fields["name"].strip()
+        if not fields["name"]:
+            raise HTTPException(422, "station name is required")
+    for field, value in fields.items():
         setattr(station, field, value)
     db.flush()
-    return {"ok": True}
+    return _station_payload(station)
 
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)

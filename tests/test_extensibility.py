@@ -8,6 +8,8 @@ assumption and is the thing to fix.
 
 from __future__ import annotations
 
+import uuid
+
 from app.services import reports
 from app.services.derivation import derive
 from tests.conftest import days_ago, hours_ago
@@ -148,6 +150,49 @@ def test_stage_and_station_added_through_the_admin_api(world, client):
     assert row["total_qty"] == 4
 
 
+def test_admin_can_rename_reorder_and_retire_a_station(world, client):
+    """Stations are physical kit: they get renamed, reordered and taken out of
+    service. Events reference the station by id, so an edit re-labels work
+    already logged there without rewriting a single row of history."""
+    factory, _route, item = world
+    factory.log(item, 10, "completed", 50, at=hours_ago(5), station_code="carpentry_1")
+    factory.log(item, 20, "queued", 50, at=hours_ago(4), station_code="paint_1")
+    factory.db.commit()
+
+    def paint_stations() -> list[dict]:
+        wip = client.get("/api/reports/wip").json()
+        row = next(r for r in wip["stages"] if r["stage"]["code"] == "paint")
+        return [s["station"] for s in row["stations"] if s["station"]]
+
+    station = next(
+        s for s in client.get("/api/reference").json()["stations"] if s["code"] == "paint_1"
+    )
+    renamed = client.patch(
+        f"/api/stations/{station['id']}", json={"name": "Spray booth 1", "sort_order": 5}
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "Spray booth 1"
+    assert renamed.json()["sort_order"] == 5
+    assert renamed.json()["code"] == "paint_1"  # the id the log points at never moves
+    assert [s["name"] for s in paint_stations()] == ["Spray booth 1"]
+
+    retired = client.patch(f"/api/stations/{station['id']}", json={"is_active": False})
+    assert retired.status_code == 200
+    assert retired.json()["is_active"] is False
+
+    cached = next(
+        s for s in client.get("/api/reference").json()["stations"] if s["code"] == "paint_1"
+    )
+    assert cached["is_active"] is False
+    assert cached["name"] == "Spray booth 1"
+    # Retiring a station hides it from the logging picker, not from the report:
+    # the 50 already queued there stay attributed to it.
+    assert [s["name"] for s in paint_stations()] == ["Spray booth 1"]
+
+    assert client.patch(f"/api/stations/{station['id']}", json={"name": "   "}).status_code == 422
+    assert client.patch(f"/api/stations/{uuid.uuid4()}", json={"name": "Ghost"}).status_code == 404
+
+
 def _project_id(client) -> str:
     return client.get("/api/reference").json()["projects"][0]["id"]
 
@@ -184,6 +229,10 @@ def test_stage_admin_endpoints_require_admin(factory, client):
         assert floor.post("/api/stations", json={
             "stage_id": str(some_stage.id), "code": "sneaky_1", "name": "Sneaky 1",
         }).status_code == 403
+        some_station = factory.station("paint_1")
+        assert floor.patch(
+            f"/api/stations/{some_station.id}", json={"is_active": False}
+        ).status_code == 403
 
 
 def test_terminal_stage_must_be_last_in_a_route(world, client):

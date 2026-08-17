@@ -175,7 +175,12 @@ Done in the app by an admin: **Office tab → Stages & stations**.
    `requires_external_po`, `allows_partial_qty`, `is_terminal`, sort order,
    and `max_days_in_state` — the per-stage aging threshold; empty means the
    stage is never flagged, which is what outsourced work wants).
-2. Add stations if the stage has physical instances.
+2. Add stations if the stage has physical instances. Existing stations are
+   renamed, reordered and retired in the same place: a rename re-labels the
+   work already logged there (events point at the station id, so history is
+   not rewritten), and a retired station drops off the logging picker while
+   staying named in the reports. Station codes are fixed — retire a station
+   and add the replacement rather than repurposing one.
 3. In "New route", create the next version of any affected route — the
    builder has ＋ insertion points to slot the stage between existing steps.
 4. Done. Items already in production keep the route they were released

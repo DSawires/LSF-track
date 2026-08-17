@@ -645,8 +645,7 @@ function itemRow(item) {
     <div>
       <a class="item-head" href="#/items/${item.id}">
         <div style="display:flex;gap:10px;align-items:flex-start">
-          ${item.icon_url ? `<img src="${item.icon_url}" alt="" loading="lazy"
-            style="width:44px;height:44px;object-fit:cover;border-radius:8px;border:1px solid var(--line);flex:none">` : ""}
+          ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
           <div style="flex:1;min-width:0">
             <div class="spread">
               <strong>${esc(item.code)}</strong>
@@ -758,8 +757,7 @@ function viewLogScreen(itemId, fromKey) {
   $view.innerHTML = `
     <div class="card">
       <div style="display:flex;gap:12px;align-items:center">
-        ${item.icon_url ? `<img src="${item.icon_url}" alt=""
-          style="width:52px;height:52px;object-fit:cover;border-radius:10px;border:1px solid var(--line);flex:none">` : ""}
+        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : ""}
         <div style="flex:1;min-width:0">
           <div class="spread">
             <h2>${esc(item.code)}</h2>
@@ -1680,6 +1678,17 @@ function renderStageAdmin() {
             <button class="ghost" data-stage-save="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
             <button class="ghost" data-stage-toggle="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${s.is_active ? "Deactivate" : "Reactivate"}</button>
           </div>
+          ${stations.map((st) => `
+          <div style="border:1px solid var(--line);border-radius:var(--radius);padding:8px 10px;margin-top:10px">
+            <div class="field-grid">
+              <div><label>Station${st.is_active ? "" : ` <span class="badge">inactive</span>`}</label><input data-st-name="${st.id}" value="${esc(st.name)}"></div>
+              <div><label>Sort order</label><input data-st-sort="${st.id}" type="number" inputmode="numeric" value="${st.sort_order}"></div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+              <button class="ghost" data-st-save="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
+              <button class="ghost" data-st-toggle="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${st.is_active ? "Deactivate" : "Reactivate"}</button>
+            </div>
+          </div>`).join("")}
           <label style="margin-top:10px">Add station</label>
           <div class="qty-row">
             <input data-station-name="${s.id}" placeholder="e.g. ${esc(s.name)} ${stations.length + 1}" style="flex:1;text-align:left;padding:10px">
@@ -1716,6 +1725,41 @@ function renderStageAdmin() {
       const stage = S.ref.stages.find((s) => s.id === button.dataset.stageToggle);
       patchStage(stage.id, { is_active: !stage.is_active },
         stage.is_active ? "Stage deactivated" : "Stage reactivated");
+    };
+  });
+  const patchStation = async (stationId, body, doneMessage) => {
+    try {
+      await api(`/api/stations/${stationId}`, { method: "PATCH", body: JSON.stringify(body) });
+      toast(doneMessage);
+      await sync();
+    } catch (error) {
+      alert(error.body?.detail || "Could not update the station.");
+    }
+  };
+
+  target.querySelectorAll("[data-st-save]").forEach((button) => {
+    button.onclick = () => {
+      const id = button.dataset.stSave;
+      const name = document.querySelector(`[data-st-name="${id}"]`).value.trim();
+      if (!name) return;
+      patchStation(id, {
+        name,
+        sort_order: Number(document.querySelector(`[data-st-sort="${id}"]`).value) || 0,
+      }, "Station updated");
+    };
+  });
+  target.querySelectorAll("[data-st-toggle]").forEach((button) => {
+    button.onclick = () => {
+      const station = S.ref.stations.find((st) => st.id === button.dataset.stToggle);
+      const stage = S.ref.stages.find((s) => s.id === station.stage_id);
+      // Deactivating the last one doesn't block logging — the station picker
+      // just disappears and entries land without one. Say so rather than
+      // forbid it: a stage can legitimately lose its last machine.
+      const lastActive = station.is_active && stage?.requires_station && !S.ref.stations.some(
+        (st) => st.stage_id === station.stage_id && st.id !== station.id && st.is_active);
+      if (lastActive && !confirm(`${station.name} is the last active station at ${stage.name}. Entries logged there will carry no station until one is added back. Deactivate anyway?`)) return;
+      patchStation(station.id, { is_active: !station.is_active },
+        station.is_active ? "Station deactivated" : "Station reactivated");
     };
   });
   target.querySelectorAll("[data-station-add]").forEach((button) => {
