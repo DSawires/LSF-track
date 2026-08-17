@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
-from app.deps import current_user
+from app.deps import current_user, require_admin
 from app.models import Item, ItemImage, User
 from app.schemas import ImageNoteUpdate
 from app.storage import get_storage
@@ -154,6 +154,36 @@ def update_image_note(
     image.note = payload.note.strip()[:255] or None
     db.flush()
     return _image_payload(image)
+
+
+@router.delete("/images/{image_id}")
+def delete_image(
+    image_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Remove a photo: the bytes off storage, then the row.
+
+    Admin-only, like archiving and purging an item. A photo is often the only
+    record of what a snag actually looked like, there is no undo, and the
+    reasons to delete one -- wrong item, wrong batch, a face in the frame --
+    are all judgement calls someone should own.
+
+    Deleting a photo loses no history: `item_images` is not the log. An item's
+    icon is simply the newest icon row, so removing one falls back to the
+    previous icon, or to none.
+
+    Storage first, database second, matching the item purge: a failure there
+    leaves a listed photo whose bytes are gone (which `serve_image` already
+    reports honestly) rather than bytes no row will ever name again.
+    """
+    image = db.get(ItemImage, image_id)
+    if image is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown image")
+    get_storage().delete(_image_key(image.id))
+    db.delete(image)
+    db.flush()
+    return {"deleted": True, "item_id": str(image.item_id)}
 
 
 @router.get("/images/{image_id}")

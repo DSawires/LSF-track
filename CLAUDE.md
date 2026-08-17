@@ -195,7 +195,8 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   it survives the phone losing signal
 - Item photos (snag photos + item icons). Online-only by design: the offline
   guarantee protects the logging path, and multi-megabyte blobs do not belong
-  in its sync queue
+  in its sync queue. Adding one offers camera or gallery on a phone; deleting
+  one is admin-only and lives in the item editor, not on the logging screen
 
 ### Explicitly out of scope
 

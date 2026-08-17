@@ -155,8 +155,19 @@ async function drainFromWorker() {
   clients.forEach((client) => client.postMessage("queue-drained"));
 }
 
-/* The app posts "purge-data" on logout so the next user of a shared floor
-   phone doesn't see the previous user's cached lists and reports. */
+/* Two messages from the page:
+
+   - "purge-data" on logout, so the next user of a shared floor phone doesn't
+     see the previous user's cached lists and reports.
+   - {type: "drop-image"} after an admin deletes a photo. Image URLs name
+     immutable bytes and are cached hard on purpose; that is exactly wrong for
+     the one case where the bytes are meant to stop existing, so the device
+     that did the deleting evicts its copy immediately. Other devices keep
+     theirs until the cache trims — the honest limit of caching by id. */
 self.addEventListener("message", (event) => {
-  if (event.data === "purge-data") event.waitUntil(caches.delete(DATA));
+  if (event.data === "purge-data") {
+    event.waitUntil(caches.delete(DATA));
+  } else if (event.data?.type === "drop-image" && event.data.url) {
+    event.waitUntil(caches.open(IMAGES).then((cache) => cache.delete(event.data.url)));
+  }
 });

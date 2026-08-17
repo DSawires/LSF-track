@@ -972,10 +972,7 @@ function viewLogScreen(itemId, fromKey) {
       </div>
       <input id="photo-note" maxlength="255" placeholder="Describe the snag (optional)"
              style="margin-bottom:8px" ${S.online ? "" : "disabled"}>
-      <label class="ghost" style="display:block;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
-        ${S.online ? "Add snag photo" : "Photos need a connection"}
-        <input type="file" id="photo-file" accept="image/*" capture="environment" hidden ${S.online ? "" : "disabled"}>
-      </label>
+      ${photoPicker("snag", { camera: "Take snag photo", gallery: "From gallery", single: "Add snag photo" })}
     </div>
 
     <div class="card">
@@ -1058,39 +1055,37 @@ function viewLogScreen(itemId, fromKey) {
     rerender();
   };
 
-  const wireUpload = (inputId, kind, doneMessage, refreshList, noteInputId) => {
-    const input = document.getElementById(inputId);
-    if (!input) return;
-    input.onchange = async () => {
-      const file = input.files[0];
-      if (!file) return;
-      if (photoStatus.busy) { toast("A photo is already uploading."); return; }
-      const noteInput = noteInputId ? document.getElementById(noteInputId) : null;
-      photoStatus.start();
-      try {
-        await uploadImage(item.id, file, {
-          kind,
-          note: noteInput?.value.trim() || "",
-          onProgress: photoStatus.set,
-        });
-        photoStatus.done();
-        toast(doneMessage);
-        if (noteInput) noteInput.value = ""; // kept on failure, so a retry has it
-        logScreenCache.fetchedAt = 0; // the photo list just changed
-        if (refreshList) {
-          await sync(); // pulls the new icon_url into S.items, re-renders
-        } else {
+  // Both halves of the picker land here; whichever one the user opened, the
+  // upload is the same.
+  const wireUpload = (key, kind, doneMessage, noteInputId) => {
+    document.querySelectorAll(`[data-photo="${key}"]`).forEach((input) => {
+      input.onchange = async () => {
+        const file = input.files[0];
+        if (!file) return;
+        if (photoStatus.busy) { toast("A photo is already uploading."); return; }
+        const noteInput = noteInputId ? document.getElementById(noteInputId) : null;
+        photoStatus.start();
+        try {
+          await uploadImage(item.id, file, {
+            kind,
+            note: noteInput?.value.trim() || "",
+            onProgress: photoStatus.set,
+          });
+          photoStatus.done();
+          toast(doneMessage);
+          if (noteInput) noteInput.value = ""; // kept on failure, so a retry has it
+          logScreenCache.fetchedAt = 0; // the photo list just changed
           loadPhotos(item);
+        } catch (error) {
+          photoStatus.fail(error.detail);
+        } finally {
+          clearPicker(key);
         }
-      } catch (error) {
-        photoStatus.fail(error.detail);
-      } finally {
-        input.value = "";
-      }
-    };
+      };
+    });
   };
   // Snags only. The item's icon is set in its editor: Office → Items.
-  wireUpload("photo-file", "snag", "Snag photo added", false, "photo-note");
+  wireUpload("snag", "snag", "Snag photo added", "photo-note");
 
   loadRecent(item);
   loadPhotos(item);
@@ -1172,6 +1167,47 @@ function cacheSet(item, key, value) {
   }
   logScreenCache[key] = value;
   logScreenCache.fetchedAt = Date.now();
+}
+
+/* ---------------------------------------------------------------- photos -- */
+
+/* Camera or gallery, asked before the sheet opens.
+
+   `capture="environment"` does not *suggest* the camera, it replaces the
+   picker with it — no gallery, no way back. That is wrong about half the time:
+   a snag is usually shot on the spot, but an icon is usually a render or a
+   photo already in the roll, and an engineer who took the shot before opening
+   the app had no route to it at all.
+
+   Two inputs rather than a dialog: a dialog is a second tap and a second thing
+   to read, and this app is used one-handed in gloves. On a desktop there is
+   only ever one button — `capture` is ignored by a mouse-and-keyboard browser,
+   so "Take photo" there would open the same file dialog and mean nothing. */
+const hasCamera = () => window.matchMedia?.("(pointer: coarse)").matches ?? false;
+
+function photoPicker(key, { camera = "Take photo", gallery = "From gallery", single = "Add photo", offline = "Photos need a connection" } = {}) {
+  const box = (label, capture) => `
+    <label class="photo-pick${S.online ? "" : " off"}">
+      ${esc(label)}
+      <input type="file" data-photo="${key}" accept="image/*" ${capture ? `capture="environment"` : ""}
+             hidden ${S.online ? "" : "disabled"}>
+    </label>`;
+  if (!S.online) return `<div class="photo-picks">${box(offline, false)}</div>`;
+  return `<div class="photo-picks">${
+    hasCamera() ? box(camera, true) + box(gallery, false) : box(single, false)
+  }</div>`;
+}
+
+/* The file from whichever half of a picker the user actually used. */
+function pickedFile(key) {
+  for (const input of document.querySelectorAll(`[data-photo="${key}"]`)) {
+    if (input.files[0]) return input.files[0];
+  }
+  return null;
+}
+
+function clearPicker(key) {
+  document.querySelectorAll(`[data-photo="${key}"]`).forEach((input) => { input.value = ""; });
 }
 
 /* Photo upload is the one request in the app big enough to watch go by: a
@@ -1565,10 +1601,9 @@ function officeItems(body) {
         <div><label>Total qty</label><input id="ni-qty" type="number" inputmode="numeric" min="1"></div>
         <div><label>Drawing rev</label><input id="ni-rev" value="A"></div>
       </div>
-      <div class="field-grid">
-        <div><label>Target release date</label><input id="ni-date" type="date"></div>
-        <div><label>Item icon (photo)</label><input id="ni-icon" type="file" accept="image/*" style="padding:10px"></div>
-      </div>
+      <label>Target release date</label><input id="ni-date" type="date">
+      <label>Item icon (optional)</label>
+      ${photoPicker("ni-icon", { camera: "Photograph it", gallery: "From gallery", single: "Choose a picture" })}
       <div style="height:12px"></div>
       <button class="primary" id="ni-go" ${S.online ? "" : "disabled"}>Create item</button>
       ${S.online ? "" : `<p class="warn-text">Office tasks need a connection.</p>`}
@@ -1619,7 +1654,7 @@ function officeItems(body) {
           target_release_date: document.getElementById("ni-date").value || null,
         }),
       });
-      const iconFile = document.getElementById("ni-icon").files[0];
+      const iconFile = pickedFile("ni-icon");
       if (iconFile) {
         // The item exists either way; a failed icon shouldn't look like a
         // failed creation — but it should say what went wrong with the icon.
@@ -1698,6 +1733,74 @@ function officeItems(body) {
 /* The item editor. Fetched with archived items included, because a mistyped
    batch that was archived last week is exactly the thing someone comes here
    to delete for good. */
+/* Photo indexes for the item editor, keyed by item id. Fetched when a panel is
+   opened and kept until something changes them, so the 30-second background
+   re-render redraws an open panel from memory instead of refetching. */
+const editorPhotos = new Map();
+
+/* The one screen photos can be deleted from, and admin-only like the rest of
+   the destructive actions here. Deleting is deliberately not on the log screen:
+   that screen is for recording what happened at speed, in gloves, and nothing
+   irreversible belongs under a thumb that is moving quickly. */
+async function loadEditorPhotos(itemId, canDelete) {
+  const target = document.querySelector(`[data-it-photos="${itemId}"]`);
+  if (!target) return;
+
+  let images = editorPhotos.get(itemId);
+  if (!images) {
+    try {
+      ({ images } = await api(`/api/items/${itemId}/images`));
+      editorPhotos.set(itemId, images);
+    } catch {
+      if (target.isConnected) target.textContent = "Photos need a connection.";
+      return;
+    }
+  }
+  if (!target.isConnected) return; // the panel closed, or a re-render replaced it
+
+  target.classList.toggle("muted", images.length === 0);
+  target.innerHTML = images.length
+    ? `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+        ${images.map((img) => `
+          <div class="photo-tile">
+            <a href="${img.url}" target="_blank" rel="noopener">
+              <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy">
+            </a>
+            ${img.kind === "icon" ? `<span class="badge" style="position:absolute;bottom:4px;left:4px;background:rgba(0,0,0,.55)">icon</span>` : ""}
+            ${canDelete ? `<button class="drop" data-drop="${img.id}" aria-label="Delete this photo"
+                    title="Delete this photo" ${S.online ? "" : "disabled"}>✕</button>` : ""}
+          </div>`).join("")}
+       </div>
+       ${canDelete ? "" : `<p class="muted" style="margin-top:6px">Deleting a photo is an admin job.</p>`}`
+    : "No photos on this item.";
+
+  target.querySelectorAll("[data-drop]").forEach((button) => {
+    const image = images.find((img) => img.id === button.dataset.drop);
+    button.onclick = async () => {
+      const what = image.kind === "icon" ? "this icon"
+        : image.note ? `the photo "${image.note}"`
+        : "this photo";
+      if (!confirm(`Delete ${what}? The picture goes for good. The item and its logged history are untouched.`)) return;
+      try {
+        await api(`/api/images/${image.id}`, { method: "DELETE" });
+        // The device that just deleted it must not keep serving it back out of
+        // its own image cache. Other devices hold a copy until theirs trims --
+        // image URLs name immutable bytes and are cached hard, which is the
+        // price of photos that load instantly in a dead spot.
+        navigator.serviceWorker?.controller?.postMessage({ type: "drop-image", url: image.url });
+        editorPhotos.delete(itemId);
+        logScreenCache.fetchedAt = 0; // the log screen's copy is stale too
+        toast("Photo deleted");
+        // Only an icon changes anything the item list is drawn from.
+        if (image.kind === "icon") await sync();
+        await loadEditorPhotos(itemId, canDelete);
+      } catch (error) {
+        alert(error.body?.detail || "Could not delete the photo.");
+      }
+    };
+  });
+}
+
 async function loadItemEditors() {
   const target = document.getElementById("of-items");
   if (!target) return;
@@ -1753,12 +1856,21 @@ async function loadItemEditors() {
         <label style="margin-top:12px">Item icon</label>
         <div style="display:flex;gap:10px;align-items:center">
           ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : `<span class="muted">None yet.</span>`}
-          <label class="ghost" style="flex:1;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
-            ${S.online ? `${item.icon_url ? "Replace" : "Set"} icon` : "Needs a connection"}
-            <input type="file" data-it-icon="${item.id}" accept="image/*" hidden ${S.online ? "" : "disabled"}>
-          </label>
+          <div style="flex:1">
+            ${photoPicker(`icon:${item.id}`, {
+              camera: "Photograph it",
+              gallery: "From gallery",
+              single: `${item.icon_url ? "Replace" : "Set"} icon`,
+              offline: "Needs a connection",
+            })}
+          </div>
         </div>
         <p data-it-upload="${item.id}" class="muted" style="margin-top:6px" hidden></p>
+
+        <label style="margin-top:12px">Photos</label>
+        <div data-it-photos="${item.id}" class="muted">${
+          editorPhotos.has(item.id) ? "" : "Open to load."
+        }</div>
 
         ${item.is_released ? `
         <label style="margin-top:12px">Drawing revision — currently ${esc(item.drawing_revision)}</label>
@@ -1809,9 +1921,9 @@ async function loadItemEditors() {
     };
   });
 
-  target.querySelectorAll("[data-it-icon]").forEach((input) => {
+  target.querySelectorAll(`[data-photo^="icon:"]`).forEach((input) => {
     input.onchange = async () => {
-      const id = input.dataset.itIcon;
+      const id = input.dataset.photo.slice("icon:".length);
       const file = input.files[0];
       if (!file) return;
       const status = inlineUpload(field("data-it-upload", id));
@@ -1820,13 +1932,24 @@ async function loadItemEditors() {
         await uploadImage(id, file, { kind: "icon", onProgress: status.set });
         status.done();
         toast("Item icon updated");
+        editorPhotos.delete(id); // the item just gained a photo
         await sync();
       } catch (error) {
         status.fail(error.detail);
       } finally {
-        input.value = "";
+        clearPicker(`icon:${id}`);
       }
     };
+  });
+
+  // Photos load per item, when its panel is opened: this editor lists every
+  // item in the factory, and fetching a photo index for each one on every
+  // render would be dozens of requests for panels nobody looked at.
+  target.querySelectorAll(`details[data-panel^="item:"]`).forEach((panel) => {
+    const id = panel.dataset.panel.slice("item:".length);
+    const load = () => { if (panel.open) loadEditorPhotos(id, isAdmin); };
+    panel.ontoggle = load;
+    load(); // a background re-render lands with the panel already open
   });
 
   target.querySelectorAll("[data-it-bump]").forEach((button) => {

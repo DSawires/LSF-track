@@ -258,7 +258,11 @@ version; items already released keep the version they left against.
 - **Item photos** are online-only by design: the offline guarantee protects
   the logging path, and multi-megabyte blobs don't belong in its sync queue.
   Files are stored by row id, format-sniffed on upload, and served only
-  through an authenticated endpoint.
+  through an authenticated endpoint. On a phone, adding one asks camera or
+  gallery — `capture` alone replaces the picker with the camera, which is
+  wrong for the shot already sitting in the camera roll. Deleting a photo is
+  admin-only and lives in the item editor (Office → Items), away from the
+  logging screen; it takes the file off storage with the row.
 - **Sessions are revocable.** Tokens carry a digest of the password hash;
   a password reset (admin UI or `manage.py set-password`) kills every session
   issued before it. Signing out clears the device's cached identity and data

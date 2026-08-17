@@ -415,6 +415,58 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 
 .warn-text { color: var(--warn); font-size: 13px; margin-top: 6px; }
 
+/* Camera / gallery. Two equal halves on a phone, one full-width button on a
+   desktop — same box either way, so the row doesn't jump between devices. */
+.photo-picks { display: flex; gap: 8px; }
+
+.photo-pick {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 48px;
+  margin: 0;
+  padding: 12px 8px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.photo-pick:active { background: var(--panel-2); }
+.photo-pick.off { opacity: 0.5; cursor: default; }
+
+/* One photo in the item editor: thumbnail, and the button that destroys it. */
+.photo-tile { position: relative; }
+
+.photo-tile img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  display: block;
+}
+
+/* Small, cornered and outside the tap path to the photo itself — deleting is
+   not what someone is reaching for when they tap a picture. */
+.photo-tile .drop {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.62);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-size: 16px;
+  line-height: 1;
+}
+
 /* The one thing allowed to scroll sideways is a wide table, inside its own
    box — never the page. */
 .table-scroll { overflow-x: auto; }

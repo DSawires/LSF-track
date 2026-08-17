@@ -368,6 +368,102 @@ def test_image_upload_roundtrip_and_format_sniff(world, client, tmp_path, monkey
     get_settings.cache_clear()
 
 
+def test_deleting_an_image_removes_the_row_and_the_bytes(world, client, tmp_path, monkeypatch):
+    """A photo is not the log: it can go, and it takes its file with it."""
+    monkeypatch.setenv("LSF_UPLOAD_DIR", str(tmp_path / "uploads"))
+    from app.config import get_settings
+    get_settings.cache_clear()
+
+    factory, _route, item = world
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    snag = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("chip.png", png, "image/png")},
+        data={"kind": "snag"},
+    ).json()
+    on_disk = tmp_path / "uploads" / "images" / snag["id"]
+    assert on_disk.is_file()
+
+    gone = client.delete(f"/api/images/{snag['id']}")
+    assert gone.status_code == 200
+    assert gone.json()["deleted"] is True
+    assert not on_disk.exists()
+    assert client.get(f"/api/items/{item.id}/images").json()["images"] == []
+    assert client.get(snag["url"]).status_code == 404
+    # Deleting it twice is a 404, not a 500: the second tap of a slow button.
+    assert client.delete(f"/api/images/{snag['id']}").status_code == 404
+
+    # The item and its history are untouched.
+    assert client.get(f"/api/items/{item.id}").status_code == 200
+    get_settings.cache_clear()
+
+
+def test_deleting_an_icon_falls_back_to_the_previous_one(world, client, tmp_path, monkeypatch):
+    monkeypatch.setenv("LSF_UPLOAD_DIR", str(tmp_path / "uploads"))
+    from app.config import get_settings
+    get_settings.cache_clear()
+
+    factory, _route, item = world
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    first = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("old.png", png, "image/png")},
+        data={"kind": "icon"},
+    ).json()
+    second = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("new.png", png, "image/png")},
+        data={"kind": "icon"},
+    ).json()
+
+    def listed():
+        return next(i for i in client.get("/api/items").json()["items"] if i["code"] == "API-1")
+
+    assert listed()["icon_url"] == second["url"]
+
+    client.delete(f"/api/images/{second['id']}")
+    assert listed()["icon_url"] == first["url"]  # the older icon comes back
+
+    client.delete(f"/api/images/{first['id']}")
+    assert listed()["icon_url"] is None
+    get_settings.cache_clear()
+
+
+def test_image_deletion_is_admin_only(world, client, factory, tmp_path, monkeypatch):
+    monkeypatch.setenv("LSF_UPLOAD_DIR", str(tmp_path / "uploads"))
+    from app.config import get_settings
+    get_settings.cache_clear()
+
+    _factory, _route, item = world
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    snag = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("chip.png", png, "image/png")},
+    ).json()
+    client.post("/api/users", json={
+        "username": "floorphoto",
+        "display_name": "Floor",
+        "password": "a-long-password",
+    })
+    factory.db.commit()
+
+    with TestClient(app) as floor:
+        floor.post(
+            "/api/auth/login", json={"username": "floorphoto", "password": "a-long-password"}
+        )
+        # A non-admin can still add photos and describe them -- just not destroy them.
+        assert floor.post(
+            f"/api/items/{item.id}/images", files={"file": ("f.png", png, "image/png")}
+        ).status_code == 201
+        assert floor.patch(
+            f"/api/images/{snag['id']}", json={"note": "chipped"}
+        ).status_code == 200
+        assert floor.delete(f"/api/images/{snag['id']}").status_code == 403
+
+    assert client.get(snag["url"]).status_code == 200  # still there
+    get_settings.cache_clear()
+
+
 def test_release_with_initial_stage_distribution(client, factory):
     factory.route("dist-route", ["carpentry", "paint", "packing"])
     factory.db.commit()
