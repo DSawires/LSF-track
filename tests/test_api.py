@@ -512,3 +512,73 @@ def test_archiving_a_project_ignores_items_in_other_projects(client, factory):
     refused = client.delete(f"/api/projects/{factory.project.id}")
     assert refused.status_code == 409
     assert busy.code in refused.json()["detail"]
+
+
+def test_item_fields_are_editable(client, factory):
+    item = factory.item("EDIT-1", 20)
+    factory.db.commit()
+
+    updated = client.patch(f"/api/items/{item.id}", json={
+        "code": "EDIT-1-REV", "description": "Renamed batch", "total_qty": 25,
+    })
+    assert updated.status_code == 200
+    assert updated.json()["code"] == "EDIT-1-REV"
+    assert updated.json()["total_qty"] == 25
+
+    clash = factory.item("TAKEN-1", 5)
+    factory.db.commit()
+    assert client.patch(f"/api/items/{item.id}", json={"code": clash.code}).status_code == 409
+
+
+def test_batch_cannot_shrink_below_what_the_log_moved(world, client):
+    """The log wins over a typed number: units already in production are a
+    fact, so the batch size cannot be cut underneath them."""
+    factory, _route, item = world
+    factory.log(item, 10, "queued", 30, at=hours_ago(2), station_code="carpentry_1")
+    factory.db.commit()
+
+    refused = client.patch(f"/api/items/{item.id}", json={"total_qty": 10})
+    assert refused.status_code == 409
+    assert "30" in refused.json()["detail"]
+    assert client.patch(f"/api/items/{item.id}", json={"total_qty": 30}).status_code == 200
+
+
+def test_purge_destroys_an_item_and_its_events(world, client):
+    """The deliberate exception to the append-only rule, for batches that should
+    never have existed. Archiving stays the default."""
+    import sqlalchemy as sa
+
+    from app.models import Event, Item
+
+    factory, _route, item = world
+    factory.log(item, 10, "queued", 10, at=hours_ago(2), station_code="carpentry_1")
+    factory.db.commit()
+    item_id = item.id
+
+    archived = client.delete(f"/api/items/{item_id}")
+    assert archived.json()["archived"] is True  # default keeps history
+
+    purged = client.delete(f"/api/items/{item_id}?purge=true")
+    assert purged.json()["deleted"] is True
+    assert purged.json()["purged_events"] > 0
+
+    factory.db.expire_all()
+    assert factory.db.get(Item, item_id) is None
+    assert factory.db.scalar(
+        sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item_id)
+    ) == 0
+
+
+def test_project_rename_and_reactivate(client, factory):
+    factory.db.commit()
+    project_id = str(factory.project.id)
+
+    renamed = client.patch(f"/api/projects/{project_id}", json={
+        "name": "Renamed job", "client": "ACME",
+    })
+    assert renamed.json()["name"] == "Renamed job"
+    assert renamed.json()["client"] == "ACME"
+    assert renamed.json()["code"] == factory.project.code  # code is fixed
+
+    assert client.delete(f"/api/projects/{project_id}").json() == {"archived": True}
+    assert client.patch(f"/api/projects/{project_id}", json={"is_active": True}).json()["is_active"] is True

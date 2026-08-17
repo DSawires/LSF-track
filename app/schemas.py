@@ -56,10 +56,27 @@ class ItemCreate(BaseModel):
     target_release_date: date | None = None
 
 
+class ItemUpdate(BaseModel):
+    """Office-side corrections. Not here: `drawing_revision` (a bump is an
+    event, not an edit) and anything the ledger derives from the log."""
+
+    code: str | None = Field(default=None, min_length=1, max_length=64)
+    project_id: uuid.UUID | None = None
+    description: str | None = Field(default=None, max_length=255)
+    total_qty: int | None = Field(default=None, gt=0, le=1_000_000)
+    target_release_date: date | None = None
+
+
 class ProjectCreate(BaseModel):
     code: str = Field(min_length=1, max_length=32)
     name: str = Field(default="", max_length=160)
     client: str | None = Field(default=None, max_length=160)
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    client: str | None = Field(default=None, max_length=160)
+    is_active: bool | None = None
 
 
 class UserCreate(BaseModel):

@@ -167,6 +167,47 @@ main {
   margin: 0 auto;
 }
 
+/* ---- office subnav ---- */
+
+/* Pinned to the top of the scrolling view, bleeding to the edges: the negative
+   margin and matching offset cancel `main`'s padding so it sits flush. */
+.subnav {
+  position: sticky;
+  top: -14px;
+  z-index: 5;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  margin: -14px -14px 12px;
+  padding: 14px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  scrollbar-width: none;
+}
+
+.subnav::-webkit-scrollbar { display: none; }
+
+.subnav a {
+  flex: none;
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 15px;
+}
+
+.subnav a.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #17130a;
+  font-weight: 700;
+}
+
 /* ---- shared bits ---- */
 
 .card {

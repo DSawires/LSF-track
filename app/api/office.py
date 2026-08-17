@@ -25,6 +25,7 @@ from app.deps import current_user, require_admin
 from app.models import Item, Project, RouteTemplate, RouteTemplateStep, Stage, Station, User
 from app.schemas import (
     ProjectCreate,
+    ProjectUpdate,
     RouteTemplateCreate,
     StageCreate,
     StageUpdate,
@@ -162,6 +163,38 @@ def create_project(
         raise HTTPException(status.HTTP_409_CONFLICT, f"project {code} already exists")
     project = Project(code=code, name=payload.name.strip() or code, client=payload.client)
     db.add(project)
+    db.flush()
+    return {
+        "id": str(project.id),
+        "code": project.code,
+        "name": project.name,
+        "client": project.client,
+        "is_active": project.is_active,
+    }
+
+
+@router.patch("/projects/{project_id}")
+def update_project(
+    project_id: uuid.UUID,
+    payload: ProjectUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Rename a project, correct its client, or bring an archived one back.
+
+    The code is not editable: items reference the project by id but people
+    reference it by code, in drawings and emails that outlive the app.
+    """
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown project")
+    fields = payload.model_dump(exclude_unset=True)
+    if "name" in fields:
+        fields["name"] = (fields["name"] or "").strip()
+        if not fields["name"]:
+            raise HTTPException(422, "project name is required")
+    for field, value in fields.items():
+        setattr(project, field, value)
     db.flush()
     return {
         "id": str(project.id),

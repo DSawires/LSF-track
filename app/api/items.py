@@ -19,7 +19,7 @@ from app.models import (
     Stage,
     User,
 )
-from app.schemas import ItemCreate, ReleaseRequest, RevisionBumpRequest
+from app.schemas import ItemCreate, ItemUpdate, ReleaseRequest, RevisionBumpRequest
 from app.services import reports
 from app.services.release import ReleaseError, bump_revision, release_item
 
@@ -188,6 +188,61 @@ def create_item(
     return _item_payload(item)
 
 
+@router.patch("/{item_id}")
+def update_item(
+    item_id: uuid.UUID,
+    payload: ItemUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Correct an item's office-side facts: code, description, project, batch
+    size, target date.
+
+    The drawing revision is deliberately not editable here -- a revision is a
+    dated fact about what production was told to build, so it moves by a bump
+    event, never by a quiet field edit. `total_qty` cannot be cut below what
+    the log has already moved out of 'not started': the log wins over a typed
+    number, and a negative unstarted count is not a thing that can be true.
+    """
+    item = db.get(Item, item_id)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
+
+    fields = payload.model_dump(exclude_unset=True)
+
+    if "code" in fields:
+        code = (fields["code"] or "").strip()
+        if not code:
+            raise HTTPException(422, "item code is required")
+        clash = db.scalars(
+            sa.select(Item).where(Item.code == code, Item.id != item_id)
+        ).first()
+        if clash is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"item {code} already exists")
+        fields["code"] = code
+
+    if "project_id" in fields and db.get(Project, fields["project_id"]) is None:
+        raise HTTPException(422, "unknown project")
+
+    if "description" in fields:
+        fields["description"] = (fields["description"] or "").strip()
+
+    if "total_qty" in fields:
+        state = reports.item_state(db, [item.id]).get(str(item.id))
+        committed = item.total_qty - state["unstarted_qty"] if state else 0
+        if fields["total_qty"] < committed:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{committed} pcs have already been logged into production; "
+                f"the batch cannot be smaller than that",
+            )
+
+    for field, value in fields.items():
+        setattr(item, field, value)
+    db.flush()
+    return _item_payload(item, _icon_urls(db, [item.id]).get(item.id))
+
+
 @router.post("/{item_id}/release")
 def release(
     item_id: uuid.UUID,
@@ -219,6 +274,7 @@ def release(
 @router.delete("/{item_id}")
 def remove_item(
     item_id: uuid.UUID,
+    purge: bool = False,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ) -> dict:
@@ -227,6 +283,12 @@ def remove_item(
     The event log is append-only, so an item that has events is never destroyed
     -- it is deactivated, which removes it from every list and report while its
     history stays intact and derivable.
+
+    `purge=true` is the deliberate exception, for items that should never have
+    existed at all (a mistyped duplicate, a test batch): it destroys the item's
+    events along with it. This is the one operation in the system that erases
+    log rows, it is admin-only, and it is irreversible -- archiving is what you
+    want for anything that was ever really built.
     """
     item = db.get(Item, item_id)
     if item is None:
@@ -238,6 +300,16 @@ def remove_item(
         )
         > 0
     )
+    if has_events and purge:
+        purged = db.scalar(
+            sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item_id)
+        )
+        for event in db.scalars(sa.select(Event).where(Event.item_id == item_id)):
+            db.delete(event)
+        db.flush()
+        _destroy_item(db, item)
+        return {"archived": False, "deleted": True, "purged_events": purged}
+
     if has_events:
         item.is_active = False
         # Archiving removes the item's quantities from WIP; that must be a
@@ -264,17 +336,22 @@ def remove_item(
         db.flush()
         return {"archived": True, "deleted": False}
 
+    _destroy_item(db, item)
+    return {"archived": False, "deleted": True, "purged_events": 0}
+
+
+def _destroy_item(db: Session, item: Item) -> None:
+    """Photos off storage, steps and the row out of the database."""
     from app.storage import get_storage
 
     storage = get_storage()
-    for image in db.scalars(sa.select(ItemImage).where(ItemImage.item_id == item_id)):
+    for image in db.scalars(sa.select(ItemImage).where(ItemImage.item_id == item.id)):
         storage.delete(f"images/{image.id}")
         db.delete(image)
-    for step in db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item_id)):
+    for step in db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item.id)):
         db.delete(step)
     db.delete(item)
     db.flush()
-    return {"archived": False, "deleted": True}
 
 
 @router.post("/{item_id}/revision")

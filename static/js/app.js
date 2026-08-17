@@ -484,7 +484,7 @@ function render(background = false) {
   else if (route === "sync") viewSyncStatus();
   else if (route === "items" && arg) viewLogScreen(arg, arg2);
   else if (route === "reports") viewReports();
-  else if (route === "office") viewOffice();
+  else if (route === "office") viewOffice(arg);
   else viewItems();
 
   restoreView(lastSnapshot);
@@ -1061,6 +1061,7 @@ function viewLogScreen(itemId, fromKey) {
       }
     };
   };
+  // Snags only. The item's icon is set in its editor: Office → Items.
   wireUpload("photo-file", "snag", "Snag photo added", false, "photo-note");
 
   loadRecent(item);
@@ -1456,24 +1457,77 @@ function nextRevision(current) {
   return `${current}1`;
 }
 
-function viewOffice() {
-  const projects = S.ref?.projects || [];
-  const templates = (S.ref?.route_templates || []).filter((t) => t.is_published);
-  const stages = (S.ref?.stages || []).filter((s) => s.is_active);
-  const unreleased = S.items.filter((i) => !i.is_released);
-  const released = S.items.filter((i) => i.is_released);
-  const inFlight = (item) =>
-    (item.state?.positions || [])
-      .filter((p) => !p.is_unstarted)
-      .reduce((sum, p) => sum + p.qty, 0);
+/* The office is five workspaces rather than one long page: items, projects,
+   routes, stages, users. Each is a subpage under #/office/<section>, so an
+   editor is somewhere you navigate to and finish, not something you scroll
+   past on the way to something else. */
+const OFFICE_SECTIONS = [
+  { key: "items", label: "Items" },
+  { key: "projects", label: "Projects" },
+  { key: "routes", label: "Routes" },
+  { key: "stages", label: "Stages", admin: true },
+  { key: "users", label: "Users", admin: true },
+];
+
+function viewOffice(section) {
+  const sections = OFFICE_SECTIONS.filter((s) => !s.admin || S.user?.is_admin);
+  const current = sections.find((s) => s.key === section) || sections[0];
 
   $view.innerHTML = `
+    <nav class="subnav">
+      ${sections.map((s) => `
+        <a href="#/office/${s.key}"${s.key === current.key ? ` class="on" aria-current="page"` : ""}>${esc(s.label)}</a>`).join("")}
+    </nav>
+    <div id="office-body"></div>`;
+
+  const body = document.getElementById("office-body");
+  ({
+    items: officeItems,
+    projects: officeProjects,
+    routes: officeRoutes,
+    stages: officeStages,
+    users: officeUsers,
+  }[current.key])(body);
+}
+
+/* A one-line upload status for the editors, same contract as the snag-photo
+   bar: percentage while it goes up, the server's own words if it refuses. */
+function inlineUpload(el) {
+  return {
+    set: (fraction) => {
+      const percent = Math.round(fraction * 100);
+      el.hidden = false;
+      el.className = "muted";
+      el.textContent = percent < 100 ? `Uploading… ${percent}%` : "Saving on the server…";
+    },
+    done: () => { el.hidden = true; },
+    fail: (reason) => {
+      el.hidden = false;
+      el.className = "warn-text";
+      el.textContent = reason || "Upload failed.";
+    },
+  };
+}
+
+const inFlightQty = (item) =>
+  (item.state?.positions || [])
+    .filter((p) => !p.is_unstarted)
+    .reduce((sum, p) => sum + p.qty, 0);
+
+/* ---------------------------------------------------------- office: items -- */
+
+function officeItems(body) {
+  const projects = (S.ref?.projects || []).filter((p) => p.is_active !== false);
+  const templates = (S.ref?.route_templates || []).filter((t) => t.is_published);
+  const unreleased = S.items.filter((i) => !i.is_released);
+
+  body.innerHTML = `
     <div class="card">
       <h2>New item</h2>
       <div class="field-grid">
         <div><label>Code</label><input id="ni-code" autocapitalize="characters"></div>
         <div><label>Project</label>
-          <select id="ni-project">${projects.filter((p) => p.is_active !== false).map((p) => `<option value="${p.id}">${esc(p.code)}</option>`).join("")}</select>
+          <select id="ni-project">${projects.map((p) => `<option value="${p.id}">${esc(p.code)}</option>`).join("")}</select>
         </div>
       </div>
       <label>Description</label><input id="ni-desc">
@@ -1491,8 +1545,6 @@ function viewOffice() {
       <p class="warn-text" id="ni-err" hidden></p>
     </div>
 
-    <!-- Directly under "New item", because it is the next step in the same
-         job: create the batch, then hand it to production. -->
     <div class="card">
       <h2>Awaiting release (${unreleased.length})</h2>
       ${unreleased.map((item) => `
@@ -1516,110 +1568,11 @@ function viewOffice() {
     </div>
 
     <div class="card">
-      <h2>New project</h2>
-      <div class="field-grid">
-        <div><label>Code</label><input id="np-code" autocapitalize="characters" placeholder="HOTEL-B"></div>
-        <div><label>Client</label><input id="np-client"></div>
-      </div>
-      <label>Name</label><input id="np-name">
-      <div style="height:12px"></div>
-      <button class="primary" id="np-go" ${S.online ? "" : "disabled"}>Create project</button>
-      <p class="warn-text" id="np-err" hidden></p>
-    </div>
-
-    <div class="card">
-      <h2>New route</h2>
-      <div class="field-grid">
-        <div><label>Code</label><input id="nr-code" autocapitalize="none" placeholder="casegoods_standard"></div>
-        <div><label>Name</label><input id="nr-name"></div>
-      </div>
-      <label>Tap stages in production order</label>
-      <div class="seg" id="nr-stages">
-        ${stages.map((s) => `<button data-add-stage="${s.id}">${esc(s.name)}</button>`).join("")}
-      </div>
-      <label>Sequence${routeDraft.length ? " — tap a step to remove it, tap a ＋ to insert there" : ""}</label>
-      <div id="nr-seq"></div>
-      <p class="muted" id="nr-version-hint" style="margin-top:6px"></p>
-      <div style="height:12px"></div>
-      <button class="primary" id="nr-go" ${S.online && routeDraft.length ? "" : "disabled"}>Create route</button>
-      <p class="warn-text" id="nr-err" hidden></p>
-    </div>
-
-    ${released.length ? `
-    <div class="card">
-      <h2>Drawing revisions</h2>
-      <p class="muted" style="margin-bottom:8px">A bump records that a new drawing was issued
-      after release: everything already in production was built to the old revision, and the
-      quantity affected is derived from the log, never typed in.</p>
-      ${released.map((item) => `
-        <div style="padding:10px 0;border-bottom:1px solid var(--line)">
-          <div class="spread">
-            <strong>${esc(item.code)}</strong>
-            <span class="muted">rev ${esc(item.drawing_revision)} · ${inFlight(item)} pcs in flight</span>
-          </div>
-          <div class="qty-row" style="margin-top:6px">
-            <input data-rev-for="${item.id}" placeholder="new rev, e.g. ${esc(nextRevision(item.drawing_revision))}"
-                   autocapitalize="characters" maxlength="32" style="flex:1;text-align:left;padding:10px">
-            <button class="ghost" data-bump="${item.id}" ${S.online ? "" : "disabled"}
-                    style="width:auto;padding:8px 16px">Bump</button>
-          </div>
-        </div>`).join("")}
-    </div>` : ""}
-
-    ${S.user?.is_admin ? `
-    <div class="card">
-      <h2>Manage</h2>
-      <p class="muted" style="margin-bottom:8px">Removal keeps history: an item with logged events is archived (hidden everywhere), never destroyed. Projects archive once their items are gone; routes are unpublished, leaving released items untouched.</p>
-      <label>Items</label>
-      <div id="mg-items" class="muted">Loading…</div>
-      <label>Projects</label>
-      <div id="mg-projects"></div>
-      <label>Route versions</label>
-      <div id="mg-routes"></div>
-    </div>
-
-    <div class="card">
-      <h2>Stages &amp; stations</h2>
-      <p class="muted" style="margin-bottom:8px">Adding a stage needs no deploy and no code
-      change: add it here with its behaviour flags, add stations if it has physical
-      instances, then create a new route version with the stage slotted in. Items already
-      in production keep the route they were released against.</p>
-      <div id="mg-stages" class="muted">Loading…</div>
-      <details data-panel="new-stage" style="margin-top:12px">
-        <summary class="muted" style="cursor:pointer">New stage</summary>
-        <div class="field-grid" style="margin-top:8px">
-          <div><label for="ns-name">Name</label><input id="ns-name" placeholder="Glass shop"></div>
-          <div><label for="ns-sort">Sort order</label><input id="ns-sort" type="number" inputmode="numeric"></div>
-        </div>
-        <label for="ns-days">Flag as aging after (days — empty for never)</label>
-        <input id="ns-days" type="number" inputmode="numeric" min="1" max="365" value="3">
-        <div id="ns-flags"></div>
-        <div style="height:8px"></div>
-        <button class="primary" id="ns-go" ${S.online ? "" : "disabled"}>Add stage</button>
-        <p class="warn-text" id="ns-err" hidden></p>
-      </details>
-    </div>
-
-    <div class="card">
-      <h2>Users</h2>
-      <div id="mg-users" class="muted">Loading…</div>
-      <details data-panel="new-user" style="margin-top:12px">
-        <summary class="muted" style="cursor:pointer">New user</summary>
-        <div class="field-grid" style="margin-top:8px">
-          <div><label for="nu-username">Username</label><input id="nu-username" autocapitalize="none" autocomplete="off"></div>
-          <div><label for="nu-display">Display name</label><input id="nu-display" autocomplete="off"></div>
-        </div>
-        <label for="nu-pass">Password (min 8 characters)</label>
-        <input id="nu-pass" type="password" autocomplete="new-password">
-        <label style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:14px;color:var(--text)">
-          <input type="checkbox" id="nu-admin" style="width:22px;height:22px;flex:none">
-          Admin — can manage stages, users, and removals
-        </label>
-        <div style="height:8px"></div>
-        <button class="primary" id="nu-go" ${S.online ? "" : "disabled"}>Create user</button>
-        <p class="warn-text" id="nu-err" hidden></p>
-      </details>
-    </div>` : ""}`;
+      <h2>Edit items</h2>
+      <p class="muted" style="margin-bottom:8px">Every item, archived ones included. Open one to
+      correct its details, set its icon, bump its drawing revision or remove it.</p>
+      <div id="of-items" class="muted">Loading…</div>
+    </div>`;
 
   document.getElementById("ni-go").onclick = async () => {
     const err = document.getElementById("ni-err");
@@ -1656,6 +1609,297 @@ function viewOffice() {
     }
   };
 
+  // Optional initial distribution: qty inputs per step of the selected route,
+  // for items entering the system already mid-production.
+  const renderDistribution = (itemId) => {
+    const select = $view.querySelector(`[data-route-for="${itemId}"]`);
+    const container = $view.querySelector(`[data-dist-for="${itemId}"]`);
+    if (!select || !container) return;
+    const template = templates.find((t) => t.id === select.value);
+    container.innerHTML = (template?.steps || []).map((step) => `
+      <div class="spread" style="padding:4px 0">
+        <span class="muted">${step.seq} · ${esc(stageById(step.stage_id)?.name || "?")}</span>
+        <input type="number" inputmode="numeric" min="0" placeholder="0"
+               data-dist-seq="${step.seq}" style="width:90px;padding:8px;text-align:center">
+      </div>`).join("");
+  };
+
+  $view.querySelectorAll("[data-route-for]").forEach((select) => {
+    const itemId = select.dataset.routeFor;
+    renderDistribution(itemId);
+    select.addEventListener("change", () => renderDistribution(itemId));
+  });
+
+  $view.querySelectorAll("[data-release]").forEach((button) => {
+    button.onclick = async () => {
+      const itemId = button.dataset.release;
+      const select = $view.querySelector(`[data-route-for="${itemId}"]`);
+      const template = templates.find((t) => t.id === select.value);
+
+      const distribution = {};
+      $view.querySelectorAll(`[data-dist-for="${itemId}"] [data-dist-seq]`).forEach((input) => {
+        const qty = Number(input.value);
+        if (qty > 0) distribution[input.dataset.distSeq] = qty;
+      });
+      const distributed = Object.values(distribution).reduce((a, b) => a + b, 0);
+      const summary = distributed
+        ? ` ${distributed} pcs start mid-route; the rest start unstarted.`
+        : "";
+      if (!confirm(`Release against ${template.name} v${template.version}? The route is frozen from here.${summary}`)) return;
+      try {
+        await api(`/api/items/${itemId}/release`, {
+          method: "POST",
+          body: JSON.stringify({
+            route_template_id: select.value,
+            initial_quantities: distribution,
+          }),
+        });
+        toast("Released to production");
+        await sync();
+      } catch (error) {
+        alert(error.body?.detail || "Release failed.");
+      }
+    };
+  });
+
+  loadItemEditors();
+}
+
+/* The item editor. Fetched with archived items included, because a mistyped
+   batch that was archived last week is exactly the thing someone comes here
+   to delete for good. */
+async function loadItemEditors() {
+  const target = document.getElementById("of-items");
+  if (!target) return;
+
+  let items;
+  try {
+    ({ items } = await api("/api/items?include_archived=true"));
+  } catch {
+    if (target.isConnected) target.textContent = "Editing items needs a connection.";
+    return;
+  }
+  if (!target.isConnected) return;
+
+  const projects = S.ref?.projects || [];
+  const projectCode = new Map(projects.map((p) => [p.id, p.code]));
+  const isAdmin = !!S.user?.is_admin;
+  target.classList.remove("muted");
+
+  target.innerHTML = items.map((item) => `
+    <details data-panel="item:${item.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
+      <summary style="cursor:pointer;padding:6px 0">
+        <strong>${esc(item.code)}</strong>
+        <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
+        ${item.is_active ? "" : `<span class="badge">archived</span>`}
+        <br><span class="muted">${esc(item.description)} · ${item.total_qty} pcs · rev ${esc(item.drawing_revision)} · ${item.is_released ? "released" : "not released"}</span>
+      </summary>
+      <div style="padding:8px 0 12px">
+        <div class="field-grid">
+          <div><label>Code</label><input data-it-code="${item.id}" value="${esc(item.code)}"></div>
+          <div><label>Total qty</label><input data-it-qty="${item.id}" type="number" inputmode="numeric" min="1" value="${item.total_qty}"></div>
+        </div>
+        <label>Description</label>
+        <input data-it-desc="${item.id}" value="${esc(item.description)}">
+        <div class="field-grid">
+          <div><label>Project</label>
+            <select data-it-project="${item.id}">
+              ${projects.map((p) => `<option value="${p.id}" ${p.id === item.project_id ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
+            </select>
+          </div>
+          <div><label>Target release</label>
+            <input data-it-date="${item.id}" type="date" value="${item.target_release_date || ""}">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
+        </div>
+
+        <label style="margin-top:12px">Item icon</label>
+        <div style="display:flex;gap:10px;align-items:center">
+          ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : `<span class="muted">None yet.</span>`}
+          <label class="ghost" style="flex:1;text-align:center;padding:12px;border:1px dashed var(--line);border-radius:var(--radius);cursor:pointer${S.online ? "" : ";opacity:.5"}">
+            ${S.online ? `${item.icon_url ? "Replace" : "Set"} icon` : "Needs a connection"}
+            <input type="file" data-it-icon="${item.id}" accept="image/*" hidden ${S.online ? "" : "disabled"}>
+          </label>
+        </div>
+        <p data-it-upload="${item.id}" class="muted" style="margin-top:6px" hidden></p>
+
+        ${item.is_released ? `
+        <label style="margin-top:12px">Drawing revision — currently ${esc(item.drawing_revision)}</label>
+        <div class="qty-row">
+          <input data-it-rev="${item.id}" placeholder="new rev, e.g. ${esc(nextRevision(item.drawing_revision))}"
+                 autocapitalize="characters" maxlength="32" style="flex:1;text-align:left;padding:10px">
+          <button class="ghost" data-it-bump="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Bump</button>
+        </div>
+        <p class="muted" style="margin-top:4px">${inFlightQty(item)} pcs in flight were built to rev ${esc(item.drawing_revision)}.</p>` : ""}
+
+        ${isAdmin ? `
+        <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+          ${item.is_active ? `<button class="ghost" data-it-archive="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Archive</button>` : ""}
+          <button class="ghost" data-it-purge="${item.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn)" ${S.online ? "" : "disabled"}>Delete for good</button>
+        </div>
+        <p class="muted" style="margin-top:6px">Archiving hides the item everywhere and keeps its history.
+        Deleting for good destroys the item <em>and its logged events</em> — for batches that should
+        never have existed.</p>` : ""}
+      </div>
+    </details>`).join("") || `<span class="muted">No items yet.</span>`;
+
+  restoreView(lastSnapshot); // this list lands after render() restored the view
+
+  const byId = new Map(items.map((i) => [i.id, i]));
+  const field = (attr, id) => target.querySelector(`[${attr}="${id}"]`);
+
+  target.querySelectorAll("[data-it-save]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.itSave;
+      const code = field("data-it-code", id).value.trim();
+      if (!code) return;
+      try {
+        await api(`/api/items/${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            code,
+            description: field("data-it-desc", id).value.trim(),
+            project_id: field("data-it-project", id).value,
+            total_qty: Number(field("data-it-qty", id).value) || byId.get(id).total_qty,
+            target_release_date: field("data-it-date", id).value || null,
+          }),
+        });
+        toast("Item updated");
+        await sync();
+      } catch (error) {
+        alert(error.body?.detail || "Could not update the item.");
+      }
+    };
+  });
+
+  target.querySelectorAll("[data-it-icon]").forEach((input) => {
+    input.onchange = async () => {
+      const id = input.dataset.itIcon;
+      const file = input.files[0];
+      if (!file) return;
+      const status = inlineUpload(field("data-it-upload", id));
+      status.set(0);
+      try {
+        await uploadImage(id, file, { kind: "icon", onProgress: status.set });
+        status.done();
+        toast("Item icon updated");
+        await sync();
+      } catch (error) {
+        status.fail(error.detail);
+      } finally {
+        input.value = "";
+      }
+    };
+  });
+
+  target.querySelectorAll("[data-it-bump]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.itBump;
+      const item = byId.get(id);
+      const revision = field("data-it-rev", id).value.trim();
+      if (!revision) return;
+      const affected = inFlightQty(item);
+      const detail = affected
+        ? `${affected} pcs in flight were built to rev ${item.drawing_revision}.`
+        : "Nothing is in flight yet.";
+      if (!confirm(`Bump ${item.code} from rev ${item.drawing_revision} to ${revision}? ${detail}`)) return;
+      try {
+        await api(`/api/items/${id}/revision`, {
+          method: "POST",
+          body: JSON.stringify({ drawing_revision: revision }),
+        });
+        toast(`${item.code} bumped to rev ${revision}`);
+        await sync();
+      } catch (error) {
+        alert(error.body?.detail || "Could not bump the revision.");
+      }
+    };
+  });
+
+  target.querySelectorAll("[data-it-archive]").forEach((button) => {
+    button.onclick = async () => {
+      const item = byId.get(button.dataset.itArchive);
+      if (!confirm(`Archive ${item.code}? It disappears from lists and reports; its history stays.`)) return;
+      try {
+        const result = await api(`/api/items/${item.id}`, { method: "DELETE" });
+        toast(result.archived ? "Item archived (history kept)" : "Item deleted");
+        await sync();
+        loadItemEditors();
+      } catch (error) {
+        alert(error.body?.detail || "Could not remove the item.");
+      }
+    };
+  });
+
+  target.querySelectorAll("[data-it-purge]").forEach((button) => {
+    button.onclick = async () => {
+      const item = byId.get(button.dataset.itPurge);
+      const events = item.state?.event_count || 0;
+      // Typing the code, because this is the one action in the app that
+      // destroys log rows and there is no undo behind it.
+      const typed = prompt(
+        `Delete ${item.code} for good?\n\nThis destroys the item and its ${events} logged event(s). ` +
+        `It cannot be undone — archiving is what you want for anything really built.\n\n` +
+        `Type ${item.code} to confirm:`
+      );
+      if (typed === null) return;
+      if (typed.trim() !== item.code) { alert("The code did not match; nothing was deleted."); return; }
+      try {
+        const result = await api(`/api/items/${item.id}?purge=true`, { method: "DELETE" });
+        toast(`${item.code} deleted for good (${result.purged_events} event(s) destroyed)`);
+        await sync();
+        loadItemEditors();
+      } catch (error) {
+        alert(error.body?.detail || "Could not delete the item.");
+      }
+    };
+  });
+}
+
+/* ------------------------------------------------------- office: projects -- */
+
+function officeProjects(body) {
+  const projects = S.ref?.projects || [];
+  const isAdmin = !!S.user?.is_admin;
+
+  body.innerHTML = `
+    <div class="card">
+      <h2>New project</h2>
+      <div class="field-grid">
+        <div><label>Code</label><input id="np-code" autocapitalize="characters" placeholder="HOTEL-B"></div>
+        <div><label>Client</label><input id="np-client"></div>
+      </div>
+      <label>Name</label><input id="np-name">
+      <div style="height:12px"></div>
+      <button class="primary" id="np-go" ${S.online ? "" : "disabled"}>Create project</button>
+      <p class="warn-text" id="np-err" hidden></p>
+    </div>
+
+    <div class="card">
+      <h2>Edit projects</h2>
+      ${projects.map((p) => `
+        <details data-panel="project:${p.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
+          <summary style="cursor:pointer;padding:6px 0">
+            <strong>${esc(p.code)}</strong>${p.is_active ? "" : ` <span class="badge">archived</span>`}
+            <br><span class="muted">${esc(p.name)}${p.client ? ` · ${esc(p.client)}` : ""}</span>
+          </summary>
+          <div style="padding:8px 0 12px">
+            <label>Name</label><input data-pr-name="${p.id}" value="${esc(p.name)}">
+            <label>Client</label><input data-pr-client="${p.id}" value="${esc(p.client || "")}">
+            ${isAdmin ? `
+            <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+              <button class="ghost" data-pr-save="${p.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
+              <button class="ghost" data-pr-toggle="${p.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${p.is_active ? "Archive" : "Reactivate"}</button>
+            </div>
+            <p class="muted" style="margin-top:6px">A project archives once its own items are archived or removed.
+            The code is fixed — it appears on drawings and emails that outlive this app.</p>`
+            : `<p class="muted" style="margin-top:10px">Editing projects is an admin job.</p>`}
+          </div>
+        </details>`).join("") || `<span class="muted">No projects yet.</span>`}
+    </div>`;
+
   document.getElementById("np-go").onclick = async () => {
     const err = document.getElementById("np-err");
     err.hidden = true;
@@ -1669,12 +1913,94 @@ function viewOffice() {
         }),
       });
       toast(`Project ${created.code} created`);
-      await sync(); // refreshes the reference cache; re-renders with it in the pickers
+      await sync();
     } catch (error) {
       err.textContent = error.body?.detail || "Could not create the project.";
       err.hidden = false;
     }
   };
+
+  const patchProject = async (id, patch, doneMessage) => {
+    try {
+      await api(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      toast(doneMessage);
+      await sync();
+    } catch (error) {
+      alert(error.body?.detail || "Could not update the project.");
+    }
+  };
+
+  body.querySelectorAll("[data-pr-save]").forEach((button) => {
+    button.onclick = () => {
+      const id = button.dataset.prSave;
+      const name = body.querySelector(`[data-pr-name="${id}"]`).value.trim();
+      if (!name) return;
+      patchProject(id, {
+        name,
+        client: body.querySelector(`[data-pr-client="${id}"]`).value.trim() || null,
+      }, "Project updated");
+    };
+  });
+
+  body.querySelectorAll("[data-pr-toggle]").forEach((button) => {
+    button.onclick = async () => {
+      const project = projects.find((p) => p.id === button.dataset.prToggle);
+      if (!project.is_active) {
+        patchProject(project.id, { is_active: true }, "Project reactivated");
+        return;
+      }
+      if (!confirm(`Archive ${project.code}? Its items must be archived or removed first.`)) return;
+      try {
+        await api(`/api/projects/${project.id}`, { method: "DELETE" });
+        toast("Project archived");
+        await sync();
+      } catch (error) {
+        alert(error.body?.detail || "Could not archive the project.");
+      }
+    };
+  });
+}
+
+/* --------------------------------------------------------- office: routes -- */
+
+function officeRoutes(body) {
+  const templates = (S.ref?.route_templates || []).filter((t) => t.is_published);
+  const stages = (S.ref?.stages || []).filter((s) => s.is_active);
+  const isAdmin = !!S.user?.is_admin;
+
+  body.innerHTML = `
+    <div class="card">
+      <h2>New route</h2>
+      <div class="field-grid">
+        <div><label>Code</label><input id="nr-code" autocapitalize="none" placeholder="casegoods_standard"></div>
+        <div><label>Name</label><input id="nr-name"></div>
+      </div>
+      <label>Tap stages in production order</label>
+      <div class="seg" id="nr-stages">
+        ${stages.map((s) => `<button data-add-stage="${s.id}">${esc(s.name)}</button>`).join("")}
+      </div>
+      <label>Sequence${routeDraft.length ? " — tap a step to remove it, tap a ＋ to insert there" : ""}</label>
+      <div id="nr-seq"></div>
+      <p class="muted" id="nr-version-hint" style="margin-top:6px"></p>
+      <div style="height:12px"></div>
+      <button class="primary" id="nr-go" ${S.online && routeDraft.length ? "" : "disabled"}>Create route</button>
+      <p class="warn-text" id="nr-err" hidden></p>
+    </div>
+
+    <div class="card">
+      <h2>Published versions</h2>
+      <p class="muted" style="margin-bottom:8px">A route is never edited in place: posting the same
+      code creates the next version, and items already released keep the version they left against.
+      Unpublishing only hides a version from the release picker.</p>
+      ${templates.map((t) => `
+        <div class="spread" style="padding:8px 0;border-bottom:1px solid var(--line)">
+          <span style="min-width:0">
+            <strong>${esc(t.name)} v${t.version}</strong>
+            <br><span class="muted">${esc(t.code)} · ${t.steps.map((s) => esc(stageById(s.stage_id)?.name || "?")).join(" → ")}</span>
+          </span>
+          ${isAdmin ? `<button class="ghost" data-rt-unpublish="${t.id}" style="flex:none" ${S.online ? "" : "disabled"}>Unpublish</button>` : ""}
+        </div>`).join("") || `<span class="muted">No published routes.</span>`}
+    </div>`;
 
   // ---- route builder: updates in place so typed inputs survive ----
   const renderSeq = () => {
@@ -1686,14 +2012,14 @@ function viewOffice() {
       ? routeDraft.map((stageId, i) => slot(i) + chip(stageId, i)).join("") + slot(routeDraft.length)
       : `<span class="muted">Empty — a route needs at least one stage.</span>`;
     document.getElementById("nr-go").disabled = !S.online || !routeDraft.length;
-    document.querySelectorAll("[data-remove-step]").forEach((el) => {
+    body.querySelectorAll("[data-remove-step]").forEach((el) => {
       el.onclick = () => {
         routeDraft.splice(Number(el.dataset.removeStep), 1);
         routeInsertAt = null;
         renderSeq();
       };
     });
-    document.querySelectorAll("[data-insert-at]").forEach((el) => {
+    body.querySelectorAll("[data-insert-at]").forEach((el) => {
       el.onclick = () => {
         const at = Number(el.dataset.insertAt);
         routeInsertAt = routeInsertAt === at ? null : at;
@@ -1703,7 +2029,7 @@ function viewOffice() {
   };
   renderSeq();
 
-  document.querySelectorAll("[data-add-stage]").forEach((button) => {
+  body.querySelectorAll("[data-add-stage]").forEach((button) => {
     button.onclick = () => {
       if (routeInsertAt === null || routeInsertAt >= routeDraft.length) {
         routeDraft.push(button.dataset.addStage);
@@ -1748,87 +2074,73 @@ function viewOffice() {
     }
   };
 
-  // Optional initial distribution: qty inputs per step of the selected route,
-  // for items entering the system already mid-production.
-  const renderDistribution = (itemId) => {
-    const select = $view.querySelector(`[data-route-for="${itemId}"]`);
-    const container = $view.querySelector(`[data-dist-for="${itemId}"]`);
-    if (!select || !container) return;
-    const template = templates.find((t) => t.id === select.value);
-    container.innerHTML = (template?.steps || []).map((step) => `
-      <div class="spread" style="padding:4px 0">
-        <span class="muted">${step.seq} · ${esc(stageById(step.stage_id)?.name || "?")}</span>
-        <input type="number" inputmode="numeric" min="0" placeholder="0"
-               data-dist-seq="${step.seq}" style="width:90px;padding:8px;text-align:center">
-      </div>`).join("");
-  };
-
-  $view.querySelectorAll("[data-route-for]").forEach((select) => {
-    const itemId = select.dataset.routeFor;
-    renderDistribution(itemId);
-    select.addEventListener("change", () => renderDistribution(itemId));
-  });
-
-  $view.querySelectorAll("[data-bump]").forEach((button) => {
+  body.querySelectorAll("[data-rt-unpublish]").forEach((button) => {
     button.onclick = async () => {
-      const item = S.items.find((i) => i.id === button.dataset.bump);
-      const revision = $view.querySelector(`[data-rev-for="${item.id}"]`).value.trim();
-      if (!revision) return;
-      const affected = inFlight(item);
-      const detail = affected
-        ? `${affected} pcs in flight were built to rev ${item.drawing_revision}.`
-        : "Nothing is in flight yet.";
-      if (!confirm(`Bump ${item.code} from rev ${item.drawing_revision} to ${revision}? ${detail}`)) return;
+      if (!confirm("Unpublish this route version? Items already released keep their route.")) return;
       try {
-        await api(`/api/items/${item.id}/revision`, {
-          method: "POST",
-          body: JSON.stringify({ drawing_revision: revision }),
-        });
-        toast(`${item.code} bumped to rev ${revision}`);
+        await api(`/api/routes/${button.dataset.rtUnpublish}`, { method: "DELETE" });
+        toast("Route version unpublished");
         await sync();
       } catch (error) {
-        alert(error.body?.detail || "Could not bump the revision.");
+        alert(error.body?.detail || "Could not unpublish it.");
       }
     };
   });
+}
 
-  if (S.user?.is_admin) {
-    loadManage();
-    renderStageAdmin();
-    loadUsers();
-  }
+/* --------------------------------------------------------- office: stages -- */
 
-  $view.querySelectorAll("[data-release]").forEach((button) => {
-    button.onclick = async () => {
-      const itemId = button.dataset.release;
-      const select = $view.querySelector(`[data-route-for="${itemId}"]`);
-      const template = templates.find((t) => t.id === select.value);
+function officeStages(body) {
+  body.innerHTML = `
+    <div class="card">
+      <h2>Stages &amp; stations</h2>
+      <p class="muted" style="margin-bottom:8px">Adding a stage needs no deploy and no code
+      change: add it here with its behaviour flags, add stations if it has physical
+      instances, then create a new route version with the stage slotted in. Items already
+      in production keep the route they were released against.</p>
+      <div id="mg-stages" class="muted">Loading…</div>
+      <details data-panel="new-stage" style="margin-top:12px">
+        <summary class="muted" style="cursor:pointer">New stage</summary>
+        <div class="field-grid" style="margin-top:8px">
+          <div><label for="ns-name">Name</label><input id="ns-name" placeholder="Glass shop"></div>
+          <div><label for="ns-sort">Sort order</label><input id="ns-sort" type="number" inputmode="numeric"></div>
+        </div>
+        <label for="ns-days">Flag as aging after (days — empty for never)</label>
+        <input id="ns-days" type="number" inputmode="numeric" min="1" max="365" value="3">
+        <div id="ns-flags"></div>
+        <div style="height:8px"></div>
+        <button class="primary" id="ns-go" ${S.online ? "" : "disabled"}>Add stage</button>
+        <p class="warn-text" id="ns-err" hidden></p>
+      </details>
+    </div>`;
+  renderStageAdmin();
+}
 
-      const distribution = {};
-      $view.querySelectorAll(`[data-dist-for="${itemId}"] [data-dist-seq]`).forEach((input) => {
-        const qty = Number(input.value);
-        if (qty > 0) distribution[input.dataset.distSeq] = qty;
-      });
-      const distributed = Object.values(distribution).reduce((a, b) => a + b, 0);
-      const summary = distributed
-        ? ` ${distributed} pcs start mid-route; the rest start unstarted.`
-        : "";
-      if (!confirm(`Release against ${template.name} v${template.version}? The route is frozen from here.${summary}`)) return;
-      try {
-        await api(`/api/items/${itemId}/release`, {
-          method: "POST",
-          body: JSON.stringify({
-            route_template_id: select.value,
-            initial_quantities: distribution,
-          }),
-        });
-        toast("Released to production");
-        await sync();
-      } catch (error) {
-        alert(error.body?.detail || "Release failed.");
-      }
-    };
-  });
+/* ---------------------------------------------------------- office: users -- */
+
+function officeUsers(body) {
+  body.innerHTML = `
+    <div class="card">
+      <h2>Users</h2>
+      <div id="mg-users" class="muted">Loading…</div>
+      <details data-panel="new-user" style="margin-top:12px">
+        <summary class="muted" style="cursor:pointer">New user</summary>
+        <div class="field-grid" style="margin-top:8px">
+          <div><label for="nu-username">Username</label><input id="nu-username" autocapitalize="none" autocomplete="off"></div>
+          <div><label for="nu-display">Display name</label><input id="nu-display" autocomplete="off"></div>
+        </div>
+        <label for="nu-pass">Password (min 8 characters)</label>
+        <input id="nu-pass" type="password" autocomplete="new-password">
+        <label style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:14px;color:var(--text)">
+          <input type="checkbox" id="nu-admin" style="width:22px;height:22px;flex:none">
+          Admin — can manage stages, users, and removals
+        </label>
+        <div style="height:8px"></div>
+        <button class="primary" id="nu-go" ${S.online ? "" : "disabled"}>Create user</button>
+        <p class="warn-text" id="nu-err" hidden></p>
+      </details>
+    </div>`;
+  loadUsers();
 }
 
 /* ----------------------------------------------- stage admin (runtime) -- */
@@ -2132,77 +2444,6 @@ async function loadUsers() {
       err.hidden = false;
     }
   };
-}
-
-/* Admin management lists: items (incl. archived), projects, route versions,
-   each with a Remove action. The server decides archive vs delete. */
-async function loadManage() {
-  const $items = document.getElementById("mg-items");
-  if (!$items) return;
-
-  const row = (label, sub, attr, id, action = "Remove") => `
-    <div class="spread" style="padding:6px 0;border-bottom:1px solid var(--line)">
-      <span style="min-width:0">${label}${sub ? `<br><span class="muted">${sub}</span>` : ""}</span>
-      <button class="ghost" ${attr}="${id}" style="flex:none">${action}</button>
-    </div>`;
-
-  // Which project each item belongs to: this list spans every job, and
-  // archiving a project means clearing ITS items — you have to be able to see
-  // which ones those are.
-  const projectCode = new Map((S.ref?.projects || []).map((p) => [p.id, p.code]));
-
-  try {
-    const { items } = await api("/api/items?include_archived=true");
-    if (!$items.isConnected) return;
-    $items.innerHTML = items.map((item) => row(
-      `${esc(item.code)} <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>`,
-      `${esc(item.description)} · ${!item.is_active ? "archived" : item.is_released ? "released" : "not released"}`,
-      "data-rm-item", item.id, item.is_active ? "Remove" : "Archived",
-    )).join("") || `<span class="muted">No items.</span>`;
-  } catch {
-    $items.textContent = "Management needs a connection.";
-    return;
-  }
-
-  const projects = S.ref?.projects || [];
-  document.getElementById("mg-projects").innerHTML = projects.map((p) => row(
-    esc(p.code), p.is_active ? esc(p.name) : `${esc(p.name)} · archived`,
-    "data-rm-project", p.id, p.is_active ? "Remove" : "Archived",
-  )).join("") || `<span class="muted">No projects.</span>`;
-
-  const routes = (S.ref?.route_templates || []).filter((t) => t.is_published);
-  document.getElementById("mg-routes").innerHTML = routes.map((t) => row(
-    `${esc(t.name)} v${t.version}`, `${t.steps.length} steps`,
-    "data-rm-route", t.id, "Unpublish",
-  )).join("") || `<span class="muted">No published routes.</span>`;
-
-  const wire = (attr, confirmText, request, done) => {
-    document.querySelectorAll(`[${attr}]`).forEach((button) => {
-      if (button.textContent === "Archived") { button.disabled = true; return; }
-      button.onclick = async () => {
-        if (!confirm(confirmText)) return;
-        try {
-          const result = await request(button.getAttribute(attr));
-          toast(done(result));
-          await sync();
-        } catch (error) {
-          alert(error.body?.detail || "Could not remove it.");
-        }
-      };
-    });
-  };
-  wire("data-rm-item",
-    "Remove this item? If it has logged events it is archived with its history; otherwise it is deleted.",
-    (id) => api(`/api/items/${id}`, { method: "DELETE" }),
-    (r) => (r.archived ? "Item archived (history kept)" : "Item deleted"));
-  wire("data-rm-project",
-    "Archive this project? Its items must be removed or archived first.",
-    (id) => api(`/api/projects/${id}`, { method: "DELETE" }),
-    () => "Project archived");
-  wire("data-rm-route",
-    "Unpublish this route version? Items already released keep their route.",
-    (id) => api(`/api/routes/${id}`, { method: "DELETE" }),
-    () => "Route version unpublished");
 }
 
 /* ----------------------------------------------------------------- boot -- */
