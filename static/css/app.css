@@ -22,7 +22,24 @@ html, body {
   -webkit-text-size-adjust: 100%;
 }
 
-body { min-height: 100dvh; }
+/* The shell is a fixed-height column: header, banner, scrolling view, tab bar.
+   The page itself never scrolls — `main` does. A fixed-position tab bar is at
+   the mercy of Safari's toolbar and rubber-band handling and drifts up the
+   screen; a flex row at the end of a 100dvh column cannot. */
+html, body { height: 100%; }
+
+body {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+/* Author `display` rules on header/nav below would otherwise beat the UA
+   stylesheet's `[hidden] { display: none }` — author origin wins over UA
+   regardless of specificity — and the bars would show on the login screen. */
+[hidden] { display: none !important; }
 
 button, input, select {
   font: inherit;
@@ -40,8 +57,7 @@ button, input, select {
 /* ---- header / sync status ---- */
 
 header {
-  position: sticky;
-  top: 0;
+  flex: none;
   z-index: 10;
   display: flex;
   align-items: center;
@@ -69,6 +85,7 @@ header h1 { font-size: 17px; font-weight: 650; flex: 1; }
 }
 
 #session-banner {
+  flex: none;
   background: #4a3a10;
   color: #ffd98a;
   padding: 8px 14px;
@@ -106,10 +123,7 @@ header h1 { font-size: 17px; font-weight: 650; flex: 1; }
 /* ---- nav ---- */
 
 nav {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  flex: none;
   z-index: 10;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -130,10 +144,15 @@ nav a {
 
 nav a.active { color: var(--accent); border-top-color: var(--accent); }
 
-/* Bottom padding clears the fixed navbar. */
+/* The only scrolling region. Everything else in the shell is pinned. */
 main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
   padding: 14px;
-  padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  width: 100%;
   max-width: 760px;
   margin: 0 auto;
 }
@@ -320,11 +339,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .login-wrap h1 { text-align: center; margin-bottom: 18px; font-size: 22px; }
 
 /* The one button that matters stays reachable while the form scrolls: sticky
-   just above the fixed navbar. Solid, not translucent — fields scrolling
-   beneath it must disappear cleanly, never show through half-readable. */
+   at the bottom of the scrolling view, just above the tab bar. Solid, not
+   translucent — fields scrolling beneath it must disappear cleanly, never show
+   through half-readable. */
 .action-sticky {
   position: sticky;
-  bottom: calc(64px + env(safe-area-inset-bottom));
+  bottom: 0;
   z-index: 5;
   background: var(--panel);
   border-top: 1px solid var(--line);
