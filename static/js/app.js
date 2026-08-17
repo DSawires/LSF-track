@@ -1491,6 +1491,30 @@ function viewOffice() {
       <p class="warn-text" id="ni-err" hidden></p>
     </div>
 
+    <!-- Directly under "New item", because it is the next step in the same
+         job: create the batch, then hand it to production. -->
+    <div class="card">
+      <h2>Awaiting release (${unreleased.length})</h2>
+      ${unreleased.map((item) => `
+        <div style="padding:10px 0;border-bottom:1px solid var(--line)">
+          <div class="spread">
+            <strong>${esc(item.code)}</strong>
+            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+          </div>
+          <div class="muted" style="margin-bottom:6px">${esc(item.description)}</div>
+          <div class="qty-row">
+            <select data-route-for="${item.id}" style="flex:1">
+              ${templates.map((t) => `<option value="${t.id}">${esc(t.name)} v${t.version} (${t.steps.length} steps)</option>`).join("")}
+            </select>
+            <button class="ghost" data-release="${item.id}" ${S.online ? "" : "disabled"} style="width:auto;padding:8px 16px">Release</button>
+          </div>
+          <details data-panel="dist:${item.id}" style="margin-top:8px">
+            <summary class="muted" style="cursor:pointer">Already mid-production? Distribute the ${item.total_qty} pcs</summary>
+            <div data-dist-for="${item.id}" style="margin-top:6px"></div>
+          </details>
+        </div>`).join("") || `<p class="muted">Nothing waiting.</p>`}
+    </div>
+
     <div class="card">
       <h2>New project</h2>
       <div class="field-grid">
@@ -1519,28 +1543,6 @@ function viewOffice() {
       <div style="height:12px"></div>
       <button class="primary" id="nr-go" ${S.online && routeDraft.length ? "" : "disabled"}>Create route</button>
       <p class="warn-text" id="nr-err" hidden></p>
-    </div>
-
-    <div class="card">
-      <h2>Awaiting release (${unreleased.length})</h2>
-      ${unreleased.map((item) => `
-        <div style="padding:10px 0;border-bottom:1px solid var(--line)">
-          <div class="spread">
-            <strong>${esc(item.code)}</strong>
-            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
-          </div>
-          <div class="muted" style="margin-bottom:6px">${esc(item.description)}</div>
-          <div class="qty-row">
-            <select data-route-for="${item.id}" style="flex:1">
-              ${templates.map((t) => `<option value="${t.id}">${esc(t.name)} v${t.version} (${t.steps.length} steps)</option>`).join("")}
-            </select>
-            <button class="ghost" data-release="${item.id}" ${S.online ? "" : "disabled"} style="width:auto;padding:8px 16px">Release</button>
-          </div>
-          <details data-panel="dist:${item.id}" style="margin-top:8px">
-            <summary class="muted" style="cursor:pointer">Already mid-production? Distribute the ${item.total_qty} pcs</summary>
-            <div data-dist-for="${item.id}" style="margin-top:6px"></div>
-          </details>
-        </div>`).join("") || `<p class="muted">Nothing waiting.</p>`}
     </div>
 
     ${released.length ? `
