@@ -438,6 +438,33 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 .photo-pick:active { background: var(--panel-2); }
 .photo-pick.off { opacity: 0.5; cursor: default; }
 
+/* What the New item icon picker currently holds. */
+.photo-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.photo-preview img {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  flex: none;
+}
+.photo-preview-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* One photo in the item editor: thumbnail, and the button that destroys it. */
 .photo-tile { position: relative; }
 

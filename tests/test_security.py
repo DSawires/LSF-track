@@ -155,7 +155,7 @@ def test_session_cookie_attributes(factory):
 
 
 def test_cross_origin_writes_are_blocked(world, client):
-    factory, _route, item = world
+    factory, _stages, item = world
     response = client.post(
         "/api/projects",
         json={"code": "EVIL", "name": "csrf"},
@@ -185,8 +185,7 @@ def test_events_record_who_submitted_alongside_who_is_credited(factory):
     factory.db.add(other)
     factory.db.flush()
 
-    route = factory.route("r", ["carpentry"])
-    item = factory.item("SEC-1", 5, route)
+    item = factory.item("SEC-1", 5, ["carpentry"])
     event = factory.log(item, 10, "queued", 5, user_id=other.id)
 
     assert event.user_id == other.id  # credited to who logged it on the floor
@@ -201,7 +200,7 @@ def test_security_headers_present(client, factory):
 
 
 def test_batch_size_is_capped(world, client):
-    factory, _route, item = world
+    factory, _stages, item = world
     import uuid as _uuid
     from datetime import datetime, timezone
 

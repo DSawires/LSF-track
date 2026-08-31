@@ -124,6 +124,11 @@ class EventType(Base):
     is_rework: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     # The item-level events the server itself writes. Flagged rather than looked
     # up by code, so the server never depends on a particular spelling.
+    # is_release is historical: nothing writes it any more, because creating an
+    # item IS the handoff to the floor and `items.created_at` records it. The
+    # flag and its seeded row stay so the release events already in the log
+    # still resolve to a type -- they move no quantity and need no step, so the
+    # ledger replays them as the no-ops they always were.
     is_release: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_revision_bump: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_archive: Mapped[bool] = mapped_column(sa.Boolean, default=False)
@@ -142,47 +147,15 @@ class ReasonCode(Base):
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
 
-class RouteTemplate(Base):
-    """A versioned standard route. (code, version) is the identity."""
-
-    __tablename__ = "route_templates"
-    __table_args__ = (sa.UniqueConstraint("code", "version", name="uq_route_code_version"),)
-
-    id: Mapped[uuid.UUID] = _pk()
-    code: Mapped[str] = mapped_column(sa.String(48), index=True)
-    version: Mapped[int] = mapped_column(sa.Integer, default=1)
-    name: Mapped[str] = mapped_column(sa.String(160))
-    is_published: Mapped[bool] = mapped_column(sa.Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(default=utcnow)
-
-    steps: Mapped[list[RouteTemplateStep]] = relationship(
-        back_populates="route_template", order_by="RouteTemplateStep.seq"
-    )
-
-
-class RouteTemplateStep(Base):
-    __tablename__ = "route_template_steps"
-    __table_args__ = (
-        sa.UniqueConstraint("route_template_id", "seq", name="uq_route_step_seq"),
-    )
-
-    id: Mapped[uuid.UUID] = _pk()
-    route_template_id: Mapped[uuid.UUID] = mapped_column(
-        sa.ForeignKey("route_templates.id"), index=True
-    )
-    # Multiples of 10 so a stage can be slotted between two existing steps.
-    seq: Mapped[int] = mapped_column(sa.Integer)
-    stage_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("stages.id"))
-
-    route_template: Mapped[RouteTemplate] = relationship(back_populates="steps")
-    stage: Mapped[Stage] = relationship()
-
-
 class Item(Base):
     """A batch of identical pieces.
 
     Deliberately carries no derived production state: no current_stage, no
     current_status, no is_complete. Those come from the event log.
+
+    There is no released/unreleased state either. Creating an item IS the
+    handoff to the floor: it is given its stages and is loggable from that
+    moment, and `created_at` is when production started counting.
 
     `drawing_revision` is authored by the technical office rather than derived, and
     every change to it is also written to the log as a revision-bump event.
@@ -201,30 +174,26 @@ class Item(Base):
     drawing_revision: Mapped[str] = mapped_column(sa.String(32))
     target_release_date: Mapped[date | None] = mapped_column(sa.Date, nullable=True)
 
-    # Set at release; until then the item has no route and cannot be logged against.
-    route_template_id: Mapped[uuid.UUID | None] = mapped_column(
-        sa.ForeignKey("route_templates.id"), nullable=True
-    )
-    released_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    released_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        sa.ForeignKey("users.id"), nullable=True
-    )
-    released_revision: Mapped[str | None] = mapped_column(sa.String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
     project: Mapped[Project] = relationship(back_populates="items")
-    route_template: Mapped[RouteTemplate | None] = relationship()
     steps: Mapped[list[ItemStep]] = relationship(
         back_populates="item", order_by="ItemStep.seq"
     )
 
-    @property
-    def is_released(self) -> bool:
-        return self.released_at is not None
-
 
 class ItemStep(Base):
-    """The route snapshot taken at release. Never altered by template changes."""
+    """One stage in this item's own production sequence.
+
+    Chosen per item when the item is created -- either by picking stages, or by
+    copying the sequence off a sibling item in the same project. There is no
+    shared template behind it: two items only share a sequence because someone
+    copied one, and editing one item's stages can never touch another's.
+
+    Rewritable until the floor logs against the item, frozen from then on: once
+    events reference a step, the step is what that history means. Seq numbers go
+    in tens so a stage can be slotted between two existing ones.
+    """
 
     __tablename__ = "item_steps"
     __table_args__ = (sa.UniqueConstraint("item_id", "seq", name="uq_item_step_seq"),)

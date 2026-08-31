@@ -41,13 +41,13 @@ and the log disagree, the log wins.
 Corrections are new events (`event_type = 'correction'`) referencing the event they
 supersede via `supersedes_event_id`. History is never rewritten.
 
-### 2. Stages, stations and routes are data, not code
+### 2. Stages and stations are data, not code
 
 The factory will add stages. Assume this will happen repeatedly and that the person
 adding one will not be a developer.
 
 Adding a stage must require **zero code changes and zero deploys**. It is an insert
-into `stages`, plus optionally a new route template version.
+into `stages`. It is pickable on the next item created, with no further setup.
 
 Concretely, this means:
 
@@ -65,14 +65,21 @@ default that preserves current behaviour, and branch on the column.
 
 The same applies to `event_types` and `reason_codes`: table-driven, not enums.
 
-### 3. Routes are versioned and snapshotted at release
+### 3. Each item owns its stage sequence
 
-`route_templates` are versioned. When an item is released to production, its steps
-are **copied** into `item_steps`. Changing a template never alters the route of an
-item already in production.
+There are no shared route templates. An item's stages are chosen on the item, when
+it is created, and written to `item_steps`. The office screen can fill that picker
+by copying another item in the same project, but that copy happens before the item
+exists: nothing links the two afterwards, and editing one item's stages can never
+reach another's.
 
-This is what makes adding a stage safe: new work picks up the new route, in-flight
-work keeps the route it was released against.
+This is what makes adding a stage safe. New items pick it up; work already on the
+floor keeps the sequence its events were logged against, because there is no
+template that could reach in and re-version it.
+
+A sequence is rewritable until the floor logs against the item, and frozen from
+then on — once an event points at a step, that step is what the event *means*, and
+rewriting it would quietly re-label work already done.
 
 Use sequence numbers in increments of 10 so a stage can be inserted between two
 existing ones without renumbering.
@@ -117,11 +124,10 @@ Names are indicative; Alembic migrations are authoritative.
   packing, …). Carries behaviour flags. **Extensible at runtime.**
 - `stations` — physical instances of a stage (paint_1, paint_2, carpentry_1, …).
   Many stations per stage. Recorded on events for load balancing.
-- `route_templates` / `route_template_steps` — versioned standard routes per product
-  family
 - `items` — a batch: code, project, description, total qty, current drawing revision,
-  route template + version, target release date
-- `item_steps` — the snapshot of the route for this item
+  target release date. Creating one **is** the handoff to the floor: there is no
+  released/unreleased state, and `created_at` is when production started counting
+- `item_steps` — this item's own ordered stages, chosen at creation
 - `events` — the log. See below.
 - `event_types`, `reason_codes` — table-driven vocabularies
 - `users` — carries `last_login_at`, stamped at sign-in. The only piece of
@@ -167,7 +173,7 @@ connection.
 - `POST /events` is idempotent on the client-generated UUID: re-posting an existing
   ID returns the stored event, does not error, does not duplicate. Assume responses
   get lost and clients retry.
-- Reference data (items, stages, stations, routes, current drawing revisions) is
+- Reference data (items, stages, stations, current drawing revisions) is
   cached locally and refreshed on each successful sync. Lookups must work offline,
   not just writes.
 - Reports run on `occurred_at`. `received_at` exists to detect late syncs and wrong
@@ -187,8 +193,9 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
 - Aging report: days in current state, sorted descending
 - Exceptions view: clock drift, late syncs, competing/orphaned corrections and
   legacy over-advance rows — flags derived from the log, not a third dashboard
-- Office tab: projects, items, versioned routes, release (with mid-production
-  quantity distribution), and admin management of stages/stations
+- Office tab: projects, items (each created with its own stage sequence, and an
+  optional mid-production quantity distribution for a batch that is already
+  part-built), and admin management of stages/stations
 - Office → Status (admin only): per-account last sign-in, last logged entry and
   lifetime entry count, plus the green/yellow/red/neutral banner an admin
   publishes to every non-admin. The banner ships in the reference payload, so
@@ -222,10 +229,9 @@ Performed by an admin in the app: Office tab → "Stages & stations".
 
 1. Add the stage with the appropriate behaviour flags.
 2. Add stations if the stage has physical instances.
-3. Create a new version of any affected route, using the route builder's
-   insertion points to slot the stage between existing steps.
-4. Nothing else. No deploy, no migration, no code change. Items already in
-   production keep the route they were released against.
+3. Nothing else. No deploy, no migration, no code change. The stage is on the
+   palette for the next item created, and items already on the floor keep the
+   sequence their entries were logged against.
 
 If a stage cannot be added this way, that is a bug in the design and should be
 fixed rather than patched around.
@@ -251,10 +257,8 @@ fixed rather than patched around.
 - **Item** — a batch of identical pieces tracked as one unit, with a quantity.
 - **Stage** — a step type in production (paint, veneer, …).
 - **Station** — a physical instance of a stage; there are two paint stations.
-- **Route** — the ordered sequence of stages a product family passes through.
-- **Release** — the handoff from technical office to production, at a specific
-  drawing revision. Production builds only against a released revision.
-- **Revision bump** — a drawing revision issued after release; flags any quantity
-  currently in flight.
+- **Sequence** — the ordered stages one item passes through. Per item, not shared.
+- **Revision bump** — a drawing revision issued after the item is in production;
+  flags any quantity currently in flight.
 - **Outsourced** — work at an external supplier. Modelled as a stage with
   `requires_external_po`, where time in state is supplier lead time.

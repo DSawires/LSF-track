@@ -176,7 +176,7 @@ class ItemLedger:
         self.positions: list[Position] = []
         self._index_by_key: dict[tuple[uuid.UUID | None, uuid.UUID | None], int] = {}
 
-        start = item.released_at or item.created_at
+        start = item.created_at
         self.positions.append(
             Position(
                 index=UNSTARTED_INDEX,
@@ -269,7 +269,7 @@ class ItemLedger:
             self._flag(
                 event,
                 "unknown_position",
-                "event names a step or state that is not on this item's route",
+                "event names a step or state that is not one of this item's stages",
             )
             return
 
@@ -348,7 +348,7 @@ class ItemLedger:
     # -- reading it back ------------------------------------------------------
 
     def occupied(self, include_unstarted: bool = True, include_finished: bool = False):
-        """Positions currently holding units, in route order."""
+        """Positions currently holding units, in stage order."""
         result: list[Bucket] = []
         for position in self.positions:
             lots = self.buckets[position.index]

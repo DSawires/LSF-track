@@ -15,13 +15,34 @@ from app.models import (
     ItemImage,
     ItemStep,
     Project,
-    RouteTemplate,
-    Stage,
     User,
 )
-from app.schemas import ItemCreate, ItemUpdate, ReleaseRequest, RevisionBumpRequest
+from app.schemas import ItemCreate, ItemStepsUpdate, ItemUpdate, RevisionBumpRequest
 from app.services import reports
-from app.services.release import ReleaseError, bump_revision, release_item
+from app.services.items import (
+    ItemSetupError,
+    assign_steps,
+    bump_revision,
+    place_initial_quantities,
+    steps_are_frozen,
+)
+
+
+def _locked_item_ids(db: Session, item_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Which of these items the floor has already logged against, in one query.
+
+    An item is locked once an event points at one of its steps; item-level
+    events (a revision bump) leave the sequence editable.
+    """
+    if not item_ids:
+        return set()
+    return set(
+        db.scalars(
+            sa.select(Event.item_id)
+            .where(Event.item_id.in_(item_ids), Event.item_step_id.is_not(None))
+            .distinct()
+        )
+    )
 
 router = APIRouter(prefix="/api/items", tags=["items"])
 
@@ -41,7 +62,7 @@ def _icon_urls(db: Session, item_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
     return icons
 
 
-def _item_payload(item: Item, icon_url: str | None = None) -> dict:
+def _item_payload(item: Item, icon_url: str | None = None, steps_locked: bool = False) -> dict:
     return {
         "id": str(item.id),
         "icon_url": icon_url,
@@ -51,13 +72,13 @@ def _item_payload(item: Item, icon_url: str | None = None) -> dict:
         "description": item.description,
         "total_qty": item.total_qty,
         "drawing_revision": item.drawing_revision,
-        "released_revision": item.released_revision,
         "target_release_date": (
             item.target_release_date.isoformat() if item.target_release_date else None
         ),
-        "is_released": item.is_released,
-        "released_at": item.released_at.isoformat() if item.released_at else None,
-        "route_template_id": str(item.route_template_id) if item.route_template_id else None,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        # Whether the floor has logged against these stages yet, which is what
+        # decides if the sequence can still be corrected.
+        "steps_locked": steps_locked,
         "steps": [
             {"id": str(s.id), "seq": s.seq, "stage_id": str(s.stage_id)} for s in item.steps
         ],
@@ -70,7 +91,6 @@ def list_items(
     user: User = Depends(current_user),
     project_id: uuid.UUID | None = None,
     stage_id: uuid.UUID | None = None,
-    released: bool | None = None,
     q: str | None = None,
     include_archived: bool = False,
 ) -> dict:
@@ -88,15 +108,11 @@ def list_items(
             Item.code.ilike(needle, escape="\\")
             | Item.description.ilike(needle, escape="\\")
         )
-    if released is True:
-        query = query.where(Item.released_at.is_not(None))
-    elif released is False:
-        query = query.where(Item.released_at.is_(None))
-
     items = list(db.scalars(query))
-    released_ids = [item.id for item in items if item.is_released]
-    state = reports.item_state(db, released_ids) if released_ids else {}
-    icons = _icon_urls(db, [item.id for item in items])
+    item_ids = [item.id for item in items]
+    state = reports.item_state(db, item_ids) if item_ids else {}
+    icons = _icon_urls(db, item_ids)
+    locked = _locked_item_ids(db, item_ids)
 
     rows = []
     for item in items:
@@ -112,7 +128,10 @@ def list_items(
                 if p["stage_id"]
             ):
                 continue
-        rows.append({**_item_payload(item, icons.get(item.id)), "state": item_state})
+        rows.append({
+            **_item_payload(item, icons.get(item.id), steps_locked=item.id in locked),
+            "state": item_state,
+        })
     return {"items": rows}
 
 
@@ -125,9 +144,12 @@ def get_item(
     item = db.get(Item, item_id, options=[selectinload(Item.steps)])
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
-    state = reports.item_state(db, [item.id]) if item.is_released else {}
+    state = reports.item_state(db, [item.id])
     icon = _icon_urls(db, [item.id]).get(item.id)
-    return {**_item_payload(item, icon), "state": state.get(str(item.id))}
+    return {
+        **_item_payload(item, icon, steps_locked=steps_are_frozen(db, item)),
+        "state": state.get(str(item.id)),
+    }
 
 
 @router.get("/{item_id}/events")
@@ -169,12 +191,22 @@ def create_item(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
+    """Create an item and hand it to the floor in one step.
+
+    There is no separate release: an item exists because someone is building it,
+    so it gets its stages here and is loggable immediately. `initial_quantities`
+    is for a batch that is already part-built when it reaches the system.
+    """
     if db.get(Project, payload.project_id) is None:
         raise HTTPException(422, "unknown project")
     code = payload.code.strip()
     existing = db.scalars(sa.select(Item).where(Item.code == code)).first()
     if existing is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, f"item {code} already exists")
+
+    if not payload.stage_ids:
+        raise HTTPException(422, "pick the stages this item goes through")
+
     item = Item(
         code=code,
         project_id=payload.project_id,
@@ -185,7 +217,45 @@ def create_item(
     )
     db.add(item)
     db.flush()
+
+    moment = utcnow()
+    try:
+        steps = assign_steps(db, item, payload.stage_ids, created_at=moment)
+        if payload.initial_quantities:
+            place_initial_quantities(
+                db, item, steps, payload.initial_quantities, user, moment
+            )
+    except ItemSetupError as exc:
+        raise HTTPException(422, str(exc))
+    db.refresh(item)
     return _item_payload(item)
+
+
+@router.put("/{item_id}/steps")
+def set_item_steps(
+    item_id: uuid.UUID,
+    payload: ItemStepsUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Correct the stage sequence of an item nobody has logged against yet.
+
+    Once an event points at one of the steps, the sequence is frozen: the stored
+    events mean "this happened at that step", and rewriting the steps under them
+    would quietly re-label history. At that point the answer is a correction
+    event, or a new item.
+    """
+    item = db.get(Item, item_id)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
+    if not payload.stage_ids:
+        raise HTTPException(422, "an item needs at least one stage")
+    try:
+        assign_steps(db, item, payload.stage_ids)
+    except ItemSetupError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    db.refresh(item)
+    return _item_payload(item, _icon_urls(db, [item.id]).get(item.id))
 
 
 @router.patch("/{item_id}")
@@ -244,34 +314,6 @@ def update_item(
         setattr(item, field, value)
     db.flush()
     return _item_payload(item, _icon_urls(db, [item.id]).get(item.id))
-
-
-@router.post("/{item_id}/release")
-def release(
-    item_id: uuid.UUID,
-    payload: ReleaseRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-) -> dict:
-    item = db.get(Item, item_id)
-    if item is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
-    template = db.get(RouteTemplate, payload.route_template_id)
-    if template is None or not template.is_published:
-        raise HTTPException(422, "unknown route template")
-    try:
-        release_item(
-            db,
-            item,
-            template,
-            user,
-            drawing_revision=payload.drawing_revision,
-            initial_quantities=payload.initial_quantities,
-        )
-    except ReleaseError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    db.refresh(item)
-    return _item_payload(item)
 
 
 @router.delete("/{item_id}")
@@ -386,6 +428,6 @@ def revision(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
     try:
         bump_revision(db, item, payload.drawing_revision.strip(), user)
-    except ReleaseError as exc:
+    except ItemSetupError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     return _item_payload(item)

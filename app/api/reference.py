@@ -21,8 +21,6 @@ from app.models import (
     EventType,
     Project,
     ReasonCode,
-    RouteTemplate,
-    RouteTemplateStep,
     Stage,
     Station,
     User,
@@ -40,12 +38,6 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
     event_types = list(db.scalars(sa.select(EventType).order_by(EventType.sort_order)))
     reason_codes = list(db.scalars(sa.select(ReasonCode).order_by(ReasonCode.sort_order)))
     projects = list(db.scalars(sa.select(Project).order_by(Project.code)))
-    templates = list(
-        db.scalars(sa.select(RouteTemplate).order_by(RouteTemplate.code, RouteTemplate.version))
-    )
-    template_steps = list(
-        db.scalars(sa.select(RouteTemplateStep).order_by(RouteTemplateStep.seq))
-    )
 
     return {
         "server_time": utcnow().isoformat(),
@@ -118,20 +110,5 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "is_active": p.is_active,
             }
             for p in projects
-        ],
-        "route_templates": [
-            {
-                "id": str(t.id),
-                "code": t.code,
-                "version": t.version,
-                "name": t.name,
-                "is_published": t.is_published,
-                "steps": [
-                    {"seq": s.seq, "stage_id": str(s.stage_id)}
-                    for s in template_steps
-                    if s.route_template_id == t.id
-                ],
-            }
-            for t in templates
         ],
     }

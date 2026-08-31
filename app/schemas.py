@@ -49,12 +49,31 @@ class EventBatch(BaseModel):
 
 
 class ItemCreate(BaseModel):
+    """A new item, live on the floor the moment it is created.
+
+    `stage_ids` is its production sequence, in order. The office screen can fill
+    that list by copying another item in the project, but what arrives here is
+    always just a list of stages: nothing links the two items afterwards.
+    """
+
     code: str = Field(min_length=1, max_length=64)
     project_id: uuid.UUID
     description: str = Field(max_length=255)
     total_qty: int = Field(gt=0, le=1_000_000)
     drawing_revision: str = Field(min_length=1, max_length=32)
     target_release_date: date | None = None
+    # 100 stages is far beyond any real sequence; it bounds the request.
+    stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+    # Where the quantities already are, keyed by step seq -- for entering an
+    # item that is mid-production when it reaches the system. Anything not
+    # distributed starts as unstarted.
+    initial_quantities: dict[int, int] = Field(default_factory=dict)
+
+
+class ItemStepsUpdate(BaseModel):
+    """Correct an item's stage sequence, before anything is logged against it."""
+
+    stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
 
 
 class ItemUpdate(BaseModel):
@@ -144,23 +163,6 @@ class ImageNoteUpdate(BaseModel):
     on the floor the photo is taken first and described second."""
 
     note: str = Field(default="", max_length=255)
-
-
-class RouteTemplateCreate(BaseModel):
-    """Steps in order. Posting an existing code creates the next version."""
-
-    code: str = Field(min_length=1, max_length=48)
-    name: str = Field(default="", max_length=160)
-    stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
-
-
-class ReleaseRequest(BaseModel):
-    route_template_id: uuid.UUID
-    drawing_revision: str | None = None
-    # Where the quantities already are, keyed by step seq — for onboarding an
-    # item that is mid-production when it enters the system. Anything not
-    # distributed starts as unstarted.
-    initial_quantities: dict[int, int] = Field(default_factory=dict)
 
 
 class RevisionBumpRequest(BaseModel):

@@ -19,8 +19,6 @@ from app.models import (  # noqa: E402
     EventType,
     Item,
     Project,
-    RouteTemplate,
-    RouteTemplateStep,
     Stage,
     Station,
     User,
@@ -28,7 +26,7 @@ from app.models import (  # noqa: E402
 from app.schemas import EventCreate  # noqa: E402
 from app.security import hash_password  # noqa: E402
 from app.services.events import record_event  # noqa: E402
-from app.services.release import release_item  # noqa: E402
+from app.services.items import assign_steps  # noqa: E402
 from seeds.seed import run as run_seed  # noqa: E402
 
 
@@ -46,10 +44,10 @@ def client(factory):
 
 @pytest.fixture()
 def world(factory):
-    route = factory.route("api-route", ["carpentry", "paint", "packing"])
-    item = factory.item("API-1", 50, route)
+    stages = ["carpentry", "paint", "packing"]
+    item = factory.item("API-1", 50, stages)
     factory.db.commit()
-    return factory, route, item
+    return factory, stages, item
 
 
 @pytest.fixture(autouse=True)
@@ -143,22 +141,12 @@ class Factory:
         self.db.flush()
         return stage
 
-    def route(self, code: str, stage_codes: list[str], version: int = 1) -> RouteTemplate:
-        template = RouteTemplate(code=code, version=version, name=code)
-        self.db.add(template)
-        self.db.flush()
-        for index, stage_code in enumerate(stage_codes):
-            self.db.add(
-                RouteTemplateStep(
-                    route_template_id=template.id,
-                    seq=(index + 1) * 10,
-                    stage_id=self.stage(stage_code).id,
-                )
-            )
-        self.db.flush()
-        return template
+    def item(self, code: str, qty: int, stage_codes: list[str] | None = None) -> Item:
+        """An item, live on the floor -- creation is the handoff.
 
-    def item(self, code: str, qty: int, route: RouteTemplate | None = None) -> Item:
+        `stage_codes` is its own production sequence; omitting it leaves an item
+        with no stages, which is what the office screen shows as needing them.
+        """
         item = Item(
             code=code,
             project_id=self.project.id,
@@ -168,8 +156,8 @@ class Factory:
         )
         self.db.add(item)
         self.db.flush()
-        if route is not None:
-            release_item(self.db, item, route, self.user)
+        if stage_codes:
+            assign_steps(self.db, item, [self.stage(c).id for c in stage_codes])
         return item
 
     def log(

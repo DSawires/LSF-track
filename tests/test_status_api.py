@@ -58,8 +58,7 @@ def test_activity_counts_events_credited_to_each_user(factory, client, world):
     _, _, item = world
     other = _floor_user(client, factory, "floor-a")
 
-    # Two entries credited to the floor user, one to the admin. The release
-    # event the fixture wrote also counts against its author.
+    # Two entries credited to the floor user, one to the admin.
     factory.log(item, 10, "queued", 5, at=hours_ago(3), user_id=other["id"])
     factory.log(item, 10, "in_progress", 5, at=hours_ago(1), user_id=other["id"])
     factory.log(item, 10, "completed", 5, at=hours_ago(0.5))
@@ -68,8 +67,9 @@ def test_activity_counts_events_credited_to_each_user(factory, client, world):
     rows = {r["username"]: r for r in client.get("/api/status/users").json()["users"]}
     assert rows["floor-a"]["actions"] == 2
     assert rows["floor-a"]["last_event_at"] is not None
-    # Admin: the release plus the entry above.
-    assert rows["test"]["actions"] >= 2
+    # Admin: the one entry above. Creating an item is not an entry -- it
+    # writes no event -- so it does not pad anyone's count.
+    assert rows["test"]["actions"] == 1
     # An account with no entries reads as zero, not as missing.
     idle = _floor_user(client, factory, "floor-idle")
     idle_row = next(

@@ -87,7 +87,7 @@ app.include_router(status.router)
 _STATIC = Path(__file__).resolve().parent.parent / "static"
 
 _CSP = (
-    "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+    "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
     "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 )
 

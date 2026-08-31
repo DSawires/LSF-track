@@ -62,9 +62,7 @@ def derive(
 ) -> Derivation:
     vocab = vocab or load_vocabulary(db)
 
-    item_query = sa.select(Item).where(
-        Item.released_at.is_not(None), Item.is_active.is_(True)
-    )
+    item_query = sa.select(Item).where(Item.is_active.is_(True))
     if item_ids is not None:
         if not item_ids:
             return Derivation({}, {}, vocab, [])

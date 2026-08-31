@@ -18,8 +18,7 @@ from tests.conftest import days_ago, hours_ago
 def test_runtime_stage_flows_through_release_and_reports(factory):
     # The factory adds a "polishing" stage today, with no deploy.
     factory.add_stage("polishing", sort=35, requires_station=False)
-    route = factory.route("r2", ["carpentry", "polishing", "packing"])
-    item = factory.item("POL-1", 25, route)
+    item = factory.item("POL-1", 25, ["carpentry", "polishing", "packing"])
 
     factory.log(item, 10, "completed", 25, at=days_ago(2), station_code="carpentry_1")
     factory.log(item, 20, "in_progress", 25, at=days_ago(1))
@@ -38,15 +37,16 @@ def test_runtime_stage_flows_through_release_and_reports(factory):
     assert 0.9 < row["days_in_state"] < 1.1
 
 
-def test_new_template_version_leaves_inflight_items_alone(factory):
+def test_a_new_stage_reaches_new_items_and_leaves_inflight_ones_alone(factory):
+    """A stage added mid-job goes into the items created after it. The batch
+    already on the floor keeps the sequence its events were logged against --
+    which is what per-item stages buy: no template to re-version, nothing that
+    can reach in and re-label work already done."""
     factory.add_stage("sanding", sort=15)
-    route_v1 = factory.route("beds", ["carpentry", "packing"], version=1)
-    inflight = factory.item("BED-1", 10, route_v1)
+    inflight = factory.item("BED-1", 10, ["carpentry", "packing"])
     factory.log(inflight, 10, "queued", 10, at=hours_ago(3), station_code="carpentry_1")
 
-    # New version inserts sanding between the existing steps using the seq gaps.
-    route_v2 = factory.route("beds", ["carpentry", "sanding", "packing"], version=2)
-    fresh = factory.item("BED-2", 10, route_v2)
+    fresh = factory.item("BED-2", 10, ["carpentry", "sanding", "packing"])
 
     assert [s.seq for s in inflight.steps] == [10, 20]
     assert len(fresh.steps) == 3
@@ -64,8 +64,7 @@ def test_wip_report_iterates_states_from_the_table(factory):
     )
     factory.db.flush()
 
-    route = factory.route("r3", ["paint"])
-    item = factory.item("DRY-1", 8, route)
+    item = factory.item("DRY-1", 8, ["paint"])
     factory.log(item, 10, "in_progress", 8, at=hours_ago(4), station_code="paint_1")
     factory.log(item, 10, "drying", 8, at=hours_ago(2), station_code="paint_1")
 
@@ -77,8 +76,7 @@ def test_wip_report_iterates_states_from_the_table(factory):
 
 def test_queue_depth_comes_from_state_order_not_name(factory):
     """Rename-proof: queue depth keys off the earliest state by sort_order."""
-    route = factory.route("r4", ["carpentry"])
-    item = factory.item("Q-1", 12, route)
+    item = factory.item("Q-1", 12, ["carpentry"])
     factory.log(item, 10, "queued", 12, at=hours_ago(1), station_code="carpentry_1")
 
     wip = reports.wip_report(factory.db)
@@ -89,10 +87,9 @@ def test_queue_depth_comes_from_state_order_not_name(factory):
 
 def test_stage_and_station_added_through_the_admin_api(world, client):
     """The full CLAUDE.md procedure, end to end, through HTTP: add a stage and
-    a station via the admin endpoints, cut a new route version with the stage
-    slotted in, release an item, log against it, and see it in the WIP report.
-    Zero code changes, zero deploys."""
-    factory, _route, _item = world
+    a station via the admin endpoints, create an item that goes through it, log
+    against it, and see it in the WIP report. Zero code changes, zero deploys."""
+    factory, _stages, _item = world
 
     stage = client.post("/api/stages", json={
         "code": "glass_shop",
@@ -110,18 +107,14 @@ def test_stage_and_station_added_through_the_admin_api(world, client):
     carpentry = next(
         s for s in client.get("/api/reference").json()["stages"] if s["code"] == "carpentry"
     )
-    route = client.post("/api/routes", json={
-        "code": "glazed", "name": "Glazed casegoods",
-        "stage_ids": [carpentry["id"], stage["id"]],
-    }).json()
-
+    # The brand-new stage is pickable for a new item the moment it exists.
     item = client.post("/api/items", json={
         "code": "GLZ-1", "project_id": _project_id(client), "description": "Glazed cabinet",
         "total_qty": 4, "drawing_revision": "A",
-    }).json()
-    assert client.post(f"/api/items/{item['id']}/release", json={
-        "route_template_id": route["id"],
-    }).status_code == 200
+        "stage_ids": [carpentry["id"], stage["id"]],
+    })
+    assert item.status_code == 201
+    item = item.json()
 
     steps = client.get(f"/api/items/{item['id']}").json()["steps"]
     glass_step = next(s for s in steps if s["stage_id"] == stage["id"])
@@ -154,7 +147,7 @@ def test_admin_can_rename_reorder_and_retire_a_station(world, client):
     """Stations are physical kit: they get renamed, reordered and taken out of
     service. Events reference the station by id, so an edit re-labels work
     already logged there without rewriting a single row of history."""
-    factory, _route, item = world
+    factory, _stages, item = world
     factory.log(item, 10, "completed", 50, at=hours_ago(5), station_code="carpentry_1")
     factory.log(item, 20, "queued", 50, at=hours_ago(4), station_code="paint_1")
     factory.db.commit()
@@ -235,14 +228,15 @@ def test_stage_admin_endpoints_require_admin(factory, client):
         ).status_code == 403
 
 
-def test_terminal_stage_must_be_last_in_a_route(world, client):
-    factory, _route, _item = world
+def test_terminal_stage_must_be_the_last_stage_of_an_item(world, client):
+    factory, _stages, _item = world
     reference = client.get("/api/reference").json()
     packing = next(s for s in reference["stages"] if s["is_terminal"])
     carpentry = next(s for s in reference["stages"] if s["code"] == "carpentry")
 
-    response = client.post("/api/routes", json={
-        "code": "backwards", "name": "Backwards",
+    response = client.post("/api/items", json={
+        "code": "BACKWARDS-1", "project_id": _project_id(client),
+        "description": "packing before carpentry", "total_qty": 4, "drawing_revision": "A",
         "stage_ids": [packing["id"], carpentry["id"]],
     })
     assert response.status_code == 422
@@ -274,8 +268,7 @@ def test_whole_batch_stage_rejects_partial_moves(factory):
     from app.services.events import EventRejected
 
     factory.add_stage("kiln", sort=25, allows_partial_qty=False)
-    route = factory.route("r-kiln", ["carpentry", "kiln"])
-    item = factory.item("KILN-1", 20, route)
+    item = factory.item("KILN-1", 20, ["carpentry", "kiln"])
 
     factory.log(item, 10, "completed", 20, at=hours_ago(5), station_code="carpentry_1")
     with pytest.raises(EventRejected, match="partial"):

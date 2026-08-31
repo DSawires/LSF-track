@@ -79,8 +79,8 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
     item = db.get(Item, payload.item_id)
     if item is None:
         raise EventRejected("unknown item", "item_id")
-    if not item.is_released:
-        raise EventRejected("item has not been released to production", "item_id")
+    if not item.is_active:
+        raise EventRejected("item is archived", "item_id")
 
     event_type = db.get(EventType, payload.event_type_id)
     if event_type is None or not event_type.is_active:

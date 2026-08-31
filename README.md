@@ -6,9 +6,9 @@ phones; the system answers where everything is, which stage is backed up, and
 what has been sitting too long.
 
 The design rules live in [CLAUDE.md](CLAUDE.md) and are load-bearing: an
-append-only event log as the sole source of truth, stages/stations/routes as
-runtime data rather than code, routes snapshotted onto items at release, and a
-fully offline-capable PWA with an IndexedDB write queue.
+append-only event log as the sole source of truth, stages and stations as runtime
+data rather than code, each item owning its own stage sequence, and a fully
+offline-capable PWA with an IndexedDB write queue.
 
 ## Quickstart (Docker — the intended path)
 
@@ -181,19 +181,22 @@ Done in the app by an admin: **Office tab → Stages & stations**.
    not rewritten), and a retired station drops off the logging picker while
    staying named in the reports. Station codes are fixed — retire a station
    and add the replacement rather than repurposing one.
-3. In "New route", create the next version of any affected route — the
-   builder has ＋ insertion points to slot the stage between existing steps.
-4. Done. Items already in production keep the route they were released
-   against; newly released items pick up the new version.
+3. Done. The stage is on the palette when the next item is created (the
+   builder has ＋ insertion points to slot it between existing stages), and
+   items already on the floor keep the sequence their entries were logged
+   against — there is no shared template that could re-version under them.
 
 `event_types`, `event_states` and `reason_codes` extend the same way — every
 behavioural difference is a flag column, and business logic branches only on
 flags, never on codes. Seeds are insert-if-missing only, so flags tuned in the
 UI survive restarts.
 
-**Projects and route templates** are created in the app: Office tab → "New
-project" / "New route". Posting a route under an existing code creates the next
-version; items already released keep the version they left against.
+**Projects** are created in the app: Office tab → "New project". **Items** are
+created in Office → Items, each with its own stage sequence — tapped out stage by
+stage, or copied off another item in the same project and adjusted. Creating an
+item *is* the handoff to the floor: there is no separate release step, and it can
+be logged against immediately. The sequence stays correctable until the first
+entry is logged against it, and is frozen from then on.
 
 ## How the pieces fit
 
@@ -205,11 +208,11 @@ version; items already released keep the version they left against.
   Pure logic, no I/O.
 - `app/services/` — `derivation.py` loads and replays; `reports.py` builds the
   WIP, aging and exceptions payloads; `events.py` is the idempotent write path
-  and the over-advance guard; `release.py` snapshots a route template onto an
-  item.
+  and the over-advance guard; `items.py` assigns an item its stages, places any
+  starting quantities, and records revision bumps.
 - `app/api/` — FastAPI routers: auth, reference (the offline cache payload),
-  items + release, office (projects, routes, stages, stations), images,
-  events (single + batch), reports.
+  items, office (projects, stages, stations), images, events (single + batch),
+  reports.
 - `static/` — the PWA. `js/db.js` is the IndexedDB queue and cache; `js/app.js`
   renders everything from the reference payload and never names a stage, state
   or event type by its code. It syncs every 30 seconds but only redraws when
@@ -252,9 +255,9 @@ version; items already released keep the version they left against.
 - **Completing a step offers a one-tap "also queue at next stage"** (default
   on). It writes two ordinary events a millisecond apart — done here, queued
   there — so the log stays factual and the derivation needs no special case.
-- **Releasing accepts an initial per-stage distribution** for items entering
-  the system mid-production; the placements are ordinary queued events written
-  deepest-step-first at release time.
+- **Creating an item accepts an initial per-stage distribution** for a batch
+  that is already part-built when it reaches the system; the placements are
+  ordinary queued events written deepest-step-first.
 - **Item photos** are online-only by design: the offline guarantee protects
   the logging path, and multi-megabyte blobs don't belong in its sync queue.
   Files are stored by row id, format-sniffed on upload, and served only

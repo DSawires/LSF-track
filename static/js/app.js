@@ -340,7 +340,7 @@ function pendingCountFor(itemId) {
 
 /* The position one past (stepId, stateId) on this item's chain — where a batch
    resting there naturally advances to. (null, null) means unstarted; returns
-   null past the end of the route. */
+   null past the end of the sequence. */
 function positionAfter(item, stepId, stateId) {
   const states = stateOrder();
   const steps = [...item.steps].sort((a, b) => a.seq - b.seq);
@@ -688,7 +688,9 @@ function viewItems() {
   const filterText = (sessionStorage.getItem("f-q") || "").toLowerCase();
 
   const rows = S.items.filter((item) => {
-    if (!item.is_released) return false;
+    // An item with no stages yet has nothing to log against; the office screen
+    // is where it gets them.
+    if (!item.steps?.length) return false;
     if (filterProject && item.project_id !== filterProject) return false;
     if (filterStage) {
       const at = (item.state?.positions || []).some((p) => p.stage_id === filterStage);
@@ -732,7 +734,7 @@ function viewItems() {
     if (list) {
       const needle = e.target.value.toLowerCase();
       const filtered = S.items.filter((item) => {
-        if (!item.is_released) return false;
+        if (!item.steps?.length) return false;
         if (filterProject && item.project_id !== filterProject) return false;
         if (filterStage && !(item.state?.positions || []).some((p) => p.stage_id === filterStage)) return false;
         return !needle || `${item.code} ${item.description}`.toLowerCase().includes(needle);
@@ -838,9 +840,9 @@ function viewLogScreen(itemId, fromKey) {
     }
   }
 
-  // The track constrains the picker: only steps where units rest, plus the
-  // immediate next step, are offered. Rework may target any step at or before
-  // the furthest units. Free jumps down the route would negate the route.
+  // The item's own stage sequence constrains the picker: only steps where units
+  // rest, plus the immediate next step, are offered. Rework may target any step
+  // at or before the furthest units. Free jumps would negate the sequence.
   const allowed = allowedStepIds(item, steps, states, !!type?.is_rework);
   const shownSteps = steps.filter((s) => allowed.has(s.id));
   if (!shownSteps.some((s) => s.id === logSel.stepId)) {
@@ -1025,8 +1027,9 @@ function viewLogScreen(itemId, fromKey) {
     logSel.qtyDefault = null;
     logSel._fromKey = null;
     if (fromKey) {
-      // The batch has moved on; drop its key from the URL without a reload so
-      // the next render defaults normally.
+      // The batch has moved on; drop its key from the URL without a reload, so
+      // going Back here later lands on the item rather than on a position it
+      // has already left.
       history.replaceState(null, "", `#/items/${item.id}`);
       fromKey = undefined;
     }
@@ -1051,8 +1054,19 @@ function viewLogScreen(itemId, fromKey) {
         user_id: S.user?.id || null,
       });
     }
-    dirtyFields.clear(); // the form resets to fresh defaults after a log
-    rerender();
+    // The entry is in. Close the screen and go back to the list, rather than
+    // sitting on a form that still looks armed: an engineer who is not sure the
+    // tap registered taps again, and a screen that stays put invites exactly
+    // that. The queue is what confirms the entry — the toast, then the pending
+    // count in the header — not the form being visible.
+    //
+    // Deliberately after the auto-queue entry above, so both events are safely
+    // enqueued before anything navigates.
+    dirtyFields.clear(); // nothing here should follow the user to the list
+    // Re-opening this item should show what was just logged, not a 30-second-old
+    // snapshot of the entries before it.
+    logScreenCache.fetchedAt = 0;
+    navigate("#/items");
   };
 
   // Both halves of the picker land here; whichever one the user opened, the
@@ -1500,13 +1514,81 @@ async function viewReports() {
 
 /* --------------------------------------------------------------- office -- */
 
-/* Stage sequence being assembled in the "New route" card. Survives re-renders
-   of the Office view within a session. */
-let routeDraft = [];
-/* Where the next tapped stage lands in the draft: an index, or null to append.
-   This is how a stage gets slotted BETWEEN two existing steps — the versioned
-   template then carries the insertion with seq gaps of 10. */
-let routeInsertAt = null;
+/* Stage sequences being assembled, keyed by which builder owns them: "new" for
+   the New item card, `edit:<itemId>` for an item's stage editor. Held outside
+   the render so the 30-second background refresh cannot wipe a half-built
+   sequence out from under someone's thumb.
+
+   `insertAt` is where the next tapped stage lands — an index, or null to append.
+   That is how a stage gets slotted BETWEEN two existing ones. */
+const stageDrafts = new Map();
+
+function stageDraft(key, initial = []) {
+  if (!stageDrafts.has(key)) {
+    stageDrafts.set(key, { stages: [...initial], insertAt: null });
+  }
+  return stageDrafts.get(key);
+}
+
+/* The stage palette and the slot the built sequence is painted into. Tapping a
+   stage appends it (or inserts it, if a ＋ is armed); tapping a chip removes it. */
+function stageBuilderMarkup(key) {
+  const stages = (S.ref?.stages || []).filter((s) => s.is_active);
+  return `
+    <div class="seg">
+      ${stages.map((s) => `<button data-sb-add="${key}" data-stage="${s.id}">${esc(s.name)}</button>`).join("")}
+    </div>
+    <div data-sb-seq="${key}" style="margin-top:8px"></div>`;
+}
+
+function bindStageBuilder(root, key, onChange) {
+  const draft = stageDraft(key);
+  const seq = root.querySelector(`[data-sb-seq="${key}"]`);
+  if (!seq) return;
+
+  const paint = () => {
+    const chip = (stageId, i) =>
+      `<span class="badge qty" data-sb-remove="${i}" style="margin:0 4px 6px 0;padding:8px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`;
+    const slot = (i) =>
+      `<button data-sb-insert="${i}" class="insert-slot${draft.insertAt === i ? " on" : ""}" title="Insert here">＋</button>`;
+    seq.innerHTML = draft.stages.length
+      ? draft.stages.map((id, i) => slot(i) + chip(id, i)).join("") + slot(draft.stages.length)
+      : `<span class="muted">Empty — an item needs at least one stage.</span>`;
+    seq.querySelectorAll("[data-sb-remove]").forEach((el) => {
+      el.onclick = () => {
+        draft.stages.splice(Number(el.dataset.sbRemove), 1);
+        draft.insertAt = null;
+        paint();
+      };
+    });
+    seq.querySelectorAll("[data-sb-insert]").forEach((el) => {
+      el.onclick = () => {
+        const at = Number(el.dataset.sbInsert);
+        draft.insertAt = draft.insertAt === at ? null : at;
+        paint();
+      };
+    });
+    onChange?.(draft);
+  };
+
+  root.querySelectorAll(`[data-sb-add="${key}"]`).forEach((button) => {
+    button.onclick = () => {
+      if (draft.insertAt === null || draft.insertAt >= draft.stages.length) {
+        draft.stages.push(button.dataset.stage);
+        draft.insertAt = null;
+      } else {
+        draft.stages.splice(draft.insertAt, 0, button.dataset.stage);
+        draft.insertAt += 1; // consecutive taps keep inserting in order
+      }
+      paint();
+    };
+  });
+  paint();
+}
+
+/* An item's stage sequence, for the summary lines that only need to read it. */
+const stageSequenceText = (item) =>
+  (item.steps || []).map((s) => stageById(s.stage_id)?.name || "?").join(" → ");
 
 const slugify = (text) =>
   text.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -1521,14 +1603,16 @@ function nextRevision(current) {
   return `${current}1`;
 }
 
-/* The office is six workspaces rather than one long page: items, projects,
-   routes, stages, users, status. Each is a subpage under #/office/<section>, so
-   an editor is somewhere you navigate to and finish, not something you scroll
-   past on the way to something else. */
+/* The office is five workspaces rather than one long page: items, projects,
+   stages, users, status. Each is a subpage under #/office/<section>, so an
+   editor is somewhere you navigate to and finish, not something you scroll past
+   on the way to something else.
+
+   There is no Routes subpage: an item's stages are its own, picked on the item
+   itself when it is created. */
 const OFFICE_SECTIONS = [
   { key: "items", label: "Items" },
   { key: "projects", label: "Projects" },
-  { key: "routes", label: "Routes" },
   { key: "stages", label: "Stages", admin: true },
   { key: "users", label: "Users", admin: true },
   { key: "status", label: "Status", admin: true },
@@ -1549,7 +1633,6 @@ function viewOffice(section) {
   ({
     items: officeItems,
     projects: officeProjects,
-    routes: officeRoutes,
     stages: officeStages,
     users: officeUsers,
     status: officeStatus,
@@ -1582,10 +1665,18 @@ const inFlightQty = (item) =>
 
 /* ---------------------------------------------------------- office: items -- */
 
+/* The icon chosen on the New item form. Kept outside the DOM because a
+   background sync re-renders the Office view, and a file input does not
+   survive that; the engineer picked it, so it stays picked until they
+   remove it or the item is created. */
+let newItemIcon = null;
+/* Starting quantities typed into the New item card, keyed by step seq. Same
+   reason as the icon: rebuilding the stage list must not wipe them. */
+const newItemDist = {};
+
 function officeItems(body) {
   const projects = (S.ref?.projects || []).filter((p) => p.is_active !== false);
-  const templates = (S.ref?.route_templates || []).filter((t) => t.is_published);
-  const unreleased = S.items.filter((i) => !i.is_released);
+  const draft = stageDraft("new");
 
   body.innerHTML = `
     <div class="card">
@@ -1602,34 +1693,26 @@ function officeItems(body) {
         <div><label>Drawing rev</label><input id="ni-rev" value="A"></div>
       </div>
       <label>Target release date</label><input id="ni-date" type="date">
-      <label>Item icon (optional)</label>
+
+      <label style="margin-top:14px">Stages — the sequence this item goes through</label>
+      <p class="muted" style="margin-bottom:8px">Tap stages in production order, or copy the
+      sequence off another item in this project and adjust it. The floor logs its way along
+      this list. It belongs to this item alone: editing it later never touches the item it
+      was copied from.</p>
+      <select id="ni-copy" style="margin-bottom:8px"></select>
+      ${stageBuilderMarkup("new")}
+      <details data-panel="ni-dist" style="margin-top:10px">
+        <summary class="muted" style="cursor:pointer">Already part-built? Say where the pieces are</summary>
+        <div id="ni-dist" style="margin-top:6px"></div>
+      </details>
+
+      <label style="margin-top:14px">Item icon (optional)</label>
       ${photoPicker("ni-icon", { camera: "Photograph it", gallery: "From gallery", single: "Choose a picture" })}
+      <div id="ni-icon-preview" class="photo-preview" hidden></div>
       <div style="height:12px"></div>
       <button class="primary" id="ni-go" ${S.online ? "" : "disabled"}>Create item</button>
       ${S.online ? "" : `<p class="warn-text">Office tasks need a connection.</p>`}
       <p class="warn-text" id="ni-err" hidden></p>
-    </div>
-
-    <div class="card">
-      <h2>Awaiting release (${unreleased.length})</h2>
-      ${unreleased.map((item) => `
-        <div style="padding:10px 0;border-bottom:1px solid var(--line)">
-          <div class="spread">
-            <strong>${esc(item.code)}</strong>
-            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
-          </div>
-          <div class="muted" style="margin-bottom:6px">${esc(item.description)}</div>
-          <div class="qty-row">
-            <select data-route-for="${item.id}" style="flex:1">
-              ${templates.map((t) => `<option value="${t.id}">${esc(t.name)} v${t.version} (${t.steps.length} steps)</option>`).join("")}
-            </select>
-            <button class="ghost" data-release="${item.id}" ${S.online ? "" : "disabled"} style="width:auto;padding:8px 16px">Release</button>
-          </div>
-          <details data-panel="dist:${item.id}" style="margin-top:8px">
-            <summary class="muted" style="cursor:pointer">Already mid-production? Distribute the ${item.total_qty} pcs</summary>
-            <div data-dist-for="${item.id}" style="margin-top:6px"></div>
-          </details>
-        </div>`).join("") || `<p class="muted">Nothing waiting.</p>`}
     </div>
 
     <div class="card">
@@ -1639,9 +1722,98 @@ function officeItems(body) {
       <div id="of-items" class="muted">Loading…</div>
     </div>`;
 
+  // Show what was picked: a thumbnail, the name, and a way to un-pick it.
+  const renderIconPreview = () => {
+    const box = document.getElementById("ni-icon-preview");
+    if (!box) return;
+    if (!newItemIcon) { box.hidden = true; box.innerHTML = ""; return; }
+    const url = URL.createObjectURL(newItemIcon);
+    box.innerHTML = `
+      <img src="${url}" alt="">
+      <span class="muted photo-preview-name">${esc(newItemIcon.name)} · ${Math.max(1, Math.round(newItemIcon.size / 1024))} KB</span>
+      <button type="button" class="ghost" id="ni-icon-clear">Remove</button>`;
+    box.hidden = false;
+    box.querySelector("img").onload = () => URL.revokeObjectURL(url);
+    document.getElementById("ni-icon-clear").onclick = () => {
+      newItemIcon = null;
+      clearPicker("ni-icon");
+      renderIconPreview();
+    };
+  };
+  document.querySelectorAll('[data-photo="ni-icon"]').forEach((input) => {
+    input.addEventListener("change", () => {
+      if (!input.files[0]) return;
+      newItemIcon = input.files[0];
+      // Only one half of the picker may hold a file, or "which one" is ambiguous.
+      document.querySelectorAll('[data-photo="ni-icon"]').forEach((other) => {
+        if (other !== input) other.value = "";
+      });
+      renderIconPreview();
+    });
+  });
+  renderIconPreview();
+
+  // "Same stages as…" lists the items of the project currently selected: an
+  // engineer building the third wardrobe of a job wants the other two, not a
+  // list of every batch in the factory.
+  const renderCopyOptions = () => {
+    const select = document.getElementById("ni-copy");
+    const projectId = document.getElementById("ni-project").value;
+    const candidates = S.items.filter(
+      (i) => i.project_id === projectId && (i.steps || []).length,
+    );
+    select.innerHTML = `<option value="">Copy the stages from another item…</option>`
+      + candidates.map((i) => `<option value="${i.id}">${esc(i.code)} — ${esc(stageSequenceText(i))}</option>`).join("");
+    select.disabled = !candidates.length;
+  };
+  document.getElementById("ni-copy").onchange = (event) => {
+    const source = S.items.find((i) => i.id === event.target.value);
+    if (!source) return;
+    // A prefill, not a link: from here it is an ordinary draft to adjust.
+    draft.stages = (source.steps || []).map((step) => step.stage_id);
+    draft.insertAt = null;
+    event.target.value = "";
+    bindStageBuilder(body, "new", renderNewDistribution);
+  };
+  document.getElementById("ni-project").addEventListener("change", renderCopyOptions);
+  renderCopyOptions();
+
+  // Optional starting positions, for a batch that is already part-built when it
+  // reaches the system. Typed quantities are kept in newItemDist so rebuilding
+  // the stage list does not wipe them.
+  function renderNewDistribution() {
+    const host = document.getElementById("ni-dist");
+    if (!host) return;
+    if (!draft.stages.length) {
+      host.innerHTML = `<span class="muted">Pick the stages first.</span>`;
+      return;
+    }
+    host.innerHTML = draft.stages.map((stageId, i) => `
+      <div class="spread" style="padding:4px 0">
+        <span class="muted">${(i + 1) * 10} · ${esc(stageById(stageId)?.name || "?")}</span>
+        <input type="number" inputmode="numeric" min="0" placeholder="0"
+               value="${newItemDist[(i + 1) * 10] ?? ""}"
+               data-dist-seq="${(i + 1) * 10}" style="width:90px;padding:8px;text-align:center">
+      </div>`).join("")
+      + `<p class="muted" style="margin-top:6px">Anything left blank starts unstarted.</p>`;
+    host.querySelectorAll("[data-dist-seq]").forEach((input) => {
+      input.oninput = () => {
+        const qty = Number(input.value);
+        if (qty > 0) newItemDist[input.dataset.distSeq] = qty;
+        else delete newItemDist[input.dataset.distSeq];
+      };
+    });
+  }
+  bindStageBuilder(body, "new", renderNewDistribution);
+
   document.getElementById("ni-go").onclick = async () => {
     const err = document.getElementById("ni-err");
     err.hidden = true;
+    if (!draft.stages.length) {
+      err.textContent = "Pick the stages this item goes through.";
+      err.hidden = false;
+      return;
+    }
     try {
       const created = await api("/api/items", {
         method: "POST",
@@ -1652,9 +1824,11 @@ function officeItems(body) {
           total_qty: Number(document.getElementById("ni-qty").value),
           drawing_revision: document.getElementById("ni-rev").value.trim() || "A",
           target_release_date: document.getElementById("ni-date").value || null,
+          stage_ids: draft.stages,
+          initial_quantities: newItemDist,
         }),
       });
-      const iconFile = pickedFile("ni-icon");
+      const iconFile = pickedFile("ni-icon") || newItemIcon;
       if (iconFile) {
         // The item exists either way; a failed icon shouldn't look like a
         // failed creation — but it should say what went wrong with the icon.
@@ -1667,65 +1841,16 @@ function officeItems(body) {
       } else {
         toast("Item created");
       }
+      newItemIcon = null;
+      // The card is finished with: clear it so the next item starts clean.
+      stageDrafts.delete("new");
+      for (const key of Object.keys(newItemDist)) delete newItemDist[key];
       await sync();
     } catch (error) {
       err.textContent = error.body?.detail?.reason || error.body?.detail || "Could not create the item.";
       err.hidden = false;
     }
   };
-
-  // Optional initial distribution: qty inputs per step of the selected route,
-  // for items entering the system already mid-production.
-  const renderDistribution = (itemId) => {
-    const select = $view.querySelector(`[data-route-for="${itemId}"]`);
-    const container = $view.querySelector(`[data-dist-for="${itemId}"]`);
-    if (!select || !container) return;
-    const template = templates.find((t) => t.id === select.value);
-    container.innerHTML = (template?.steps || []).map((step) => `
-      <div class="spread" style="padding:4px 0">
-        <span class="muted">${step.seq} · ${esc(stageById(step.stage_id)?.name || "?")}</span>
-        <input type="number" inputmode="numeric" min="0" placeholder="0"
-               data-dist-seq="${step.seq}" style="width:90px;padding:8px;text-align:center">
-      </div>`).join("");
-  };
-
-  $view.querySelectorAll("[data-route-for]").forEach((select) => {
-    const itemId = select.dataset.routeFor;
-    renderDistribution(itemId);
-    select.addEventListener("change", () => renderDistribution(itemId));
-  });
-
-  $view.querySelectorAll("[data-release]").forEach((button) => {
-    button.onclick = async () => {
-      const itemId = button.dataset.release;
-      const select = $view.querySelector(`[data-route-for="${itemId}"]`);
-      const template = templates.find((t) => t.id === select.value);
-
-      const distribution = {};
-      $view.querySelectorAll(`[data-dist-for="${itemId}"] [data-dist-seq]`).forEach((input) => {
-        const qty = Number(input.value);
-        if (qty > 0) distribution[input.dataset.distSeq] = qty;
-      });
-      const distributed = Object.values(distribution).reduce((a, b) => a + b, 0);
-      const summary = distributed
-        ? ` ${distributed} pcs start mid-route; the rest start unstarted.`
-        : "";
-      if (!confirm(`Release against ${template.name} v${template.version}? The route is frozen from here.${summary}`)) return;
-      try {
-        await api(`/api/items/${itemId}/release`, {
-          method: "POST",
-          body: JSON.stringify({
-            route_template_id: select.value,
-            initial_quantities: distribution,
-          }),
-        });
-        toast("Released to production");
-        await sync();
-      } catch (error) {
-        alert(error.body?.detail || "Release failed.");
-      }
-    };
-  });
 
   loadItemEditors();
 }
@@ -1825,7 +1950,8 @@ async function loadItemEditors() {
         <strong>${esc(item.code)}</strong>
         <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
         ${item.is_active ? "" : `<span class="badge">archived</span>`}
-        <br><span class="muted">${esc(item.description)} · ${item.total_qty} pcs · rev ${esc(item.drawing_revision)} · ${item.is_released ? "released" : "not released"}</span>
+        <br><span class="muted">${esc(item.description)} · ${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+        <br><span class="muted">${esc(stageSequenceText(item)) || "no stages yet"}</span>
       </summary>
       <div style="padding:8px 0 12px">
         <!-- Readable by anyone, editable by admins: a code or a batch size is
@@ -1850,8 +1976,22 @@ async function loadItemEditors() {
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
           <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
         </div>`
-        : `<p class="muted" style="margin-top:10px">Changing these is an admin job. Logging
-        entries, releasing and bumping the revision are not.</p>`}
+        : `<p class="muted" style="margin-top:10px">Changing these is an admin job. Creating
+        items, logging entries and bumping the revision are not.</p>`}
+
+        <label style="margin-top:12px">Stages</label>
+        ${item.steps_locked ? `
+        <p class="muted">${esc(stageSequenceText(item))}</p>
+        <p class="muted" style="margin-top:4px">Fixed: the floor has logged entries against
+        these stages, and those entries mean "this happened at that step". Correcting the
+        sequence now would quietly re-label work already done — void the entries with
+        corrections, or create a new item.</p>`
+        : `
+        <p class="muted" style="margin-bottom:8px">Nothing has been logged against this item
+        yet, so its sequence is still free to correct.</p>
+        ${stageBuilderMarkup(`edit:${item.id}`)}
+        <div style="height:8px"></div>
+        <button class="ghost" data-it-steps="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save stages</button>`}
 
         <label style="margin-top:12px">Item icon</label>
         <div style="display:flex;gap:10px;align-items:center">
@@ -1872,14 +2012,13 @@ async function loadItemEditors() {
           editorPhotos.has(item.id) ? "" : "Open to load."
         }</div>
 
-        ${item.is_released ? `
         <label style="margin-top:12px">Drawing revision — currently ${esc(item.drawing_revision)}</label>
         <div class="qty-row">
           <input data-it-rev="${item.id}" placeholder="new rev, e.g. ${esc(nextRevision(item.drawing_revision))}"
                  autocapitalize="characters" maxlength="32" style="flex:1;text-align:left;padding:10px">
           <button class="ghost" data-it-bump="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Bump</button>
         </div>
-        <p class="muted" style="margin-top:4px">${inFlightQty(item)} pcs in flight were built to rev ${esc(item.drawing_revision)}.</p>` : ""}
+        <p class="muted" style="margin-top:4px">${inFlightQty(item)} pcs in flight were built to rev ${esc(item.drawing_revision)}.</p>
 
         ${isAdmin ? `
         <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
@@ -1950,6 +2089,38 @@ async function loadItemEditors() {
     const load = () => { if (panel.open) loadEditorPhotos(id, isAdmin); };
     panel.ontoggle = load;
     load(); // a background re-render lands with the panel already open
+  });
+
+  // One builder per editable item, seeded from what the item has now. The draft
+  // is keyed by item id, so a background re-render redraws it mid-edit intact.
+  items.filter((item) => !item.steps_locked).forEach((item) => {
+    const key = `edit:${item.id}`;
+    stageDraft(key, (item.steps || []).map((step) => step.stage_id));
+    bindStageBuilder(target, key);
+  });
+
+  target.querySelectorAll("[data-it-steps]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.itSteps;
+      const key = `edit:${id}`;
+      const stages = stageDrafts.get(key)?.stages || [];
+      if (!stages.length) {
+        alert("An item needs at least one stage.");
+        return;
+      }
+      try {
+        await api(`/api/items/${id}/steps`, {
+          method: "PUT",
+          body: JSON.stringify({ stage_ids: stages }),
+        });
+        stageDrafts.delete(key); // reseed from the server's answer
+        toast("Stages updated");
+        await sync();
+        loadItemEditors();
+      } catch (error) {
+        alert(error.body?.detail || "Could not update the stages.");
+      }
+    };
   });
 
   target.querySelectorAll("[data-it-bump]").forEach((button) => {
@@ -2119,133 +2290,6 @@ function officeProjects(body) {
   });
 }
 
-/* --------------------------------------------------------- office: routes -- */
-
-function officeRoutes(body) {
-  const templates = (S.ref?.route_templates || []).filter((t) => t.is_published);
-  const stages = (S.ref?.stages || []).filter((s) => s.is_active);
-  const isAdmin = !!S.user?.is_admin;
-
-  body.innerHTML = `
-    <div class="card">
-      <h2>New route</h2>
-      <div class="field-grid">
-        <div><label>Code</label><input id="nr-code" autocapitalize="none" placeholder="casegoods_standard"></div>
-        <div><label>Name</label><input id="nr-name"></div>
-      </div>
-      <label>Tap stages in production order</label>
-      <div class="seg" id="nr-stages">
-        ${stages.map((s) => `<button data-add-stage="${s.id}">${esc(s.name)}</button>`).join("")}
-      </div>
-      <label>Sequence${routeDraft.length ? " — tap a step to remove it, tap a ＋ to insert there" : ""}</label>
-      <div id="nr-seq"></div>
-      <p class="muted" id="nr-version-hint" style="margin-top:6px"></p>
-      <div style="height:12px"></div>
-      <button class="primary" id="nr-go" ${S.online && routeDraft.length ? "" : "disabled"}>Create route</button>
-      <p class="warn-text" id="nr-err" hidden></p>
-    </div>
-
-    <div class="card">
-      <h2>Published versions</h2>
-      <p class="muted" style="margin-bottom:8px">A route is never edited in place: posting the same
-      code creates the next version, and items already released keep the version they left against.
-      Unpublishing only hides a version from the release picker.</p>
-      ${templates.map((t) => `
-        <div class="spread" style="padding:8px 0;border-bottom:1px solid var(--line)">
-          <span style="min-width:0">
-            <strong>${esc(t.name)} v${t.version}</strong>
-            <br><span class="muted">${esc(t.code)} · ${t.steps.map((s) => esc(stageById(s.stage_id)?.name || "?")).join(" → ")}</span>
-          </span>
-          ${isAdmin ? `<button class="ghost" data-rt-unpublish="${t.id}" style="flex:none" ${S.online ? "" : "disabled"}>Unpublish</button>` : ""}
-        </div>`).join("") || `<span class="muted">No published routes.</span>`}
-    </div>`;
-
-  // ---- route builder: updates in place so typed inputs survive ----
-  const renderSeq = () => {
-    const chip = (stageId, i) =>
-      `<span class="badge qty" data-remove-step="${i}" style="margin:0 4px 6px 0;padding:8px 12px">${i + 1}. ${esc(stageById(stageId)?.name || "?")}</span>`;
-    const slot = (i) =>
-      `<button data-insert-at="${i}" class="insert-slot${routeInsertAt === i ? " on" : ""}" title="Insert here">＋</button>`;
-    document.getElementById("nr-seq").innerHTML = routeDraft.length
-      ? routeDraft.map((stageId, i) => slot(i) + chip(stageId, i)).join("") + slot(routeDraft.length)
-      : `<span class="muted">Empty — a route needs at least one stage.</span>`;
-    document.getElementById("nr-go").disabled = !S.online || !routeDraft.length;
-    body.querySelectorAll("[data-remove-step]").forEach((el) => {
-      el.onclick = () => {
-        routeDraft.splice(Number(el.dataset.removeStep), 1);
-        routeInsertAt = null;
-        renderSeq();
-      };
-    });
-    body.querySelectorAll("[data-insert-at]").forEach((el) => {
-      el.onclick = () => {
-        const at = Number(el.dataset.insertAt);
-        routeInsertAt = routeInsertAt === at ? null : at;
-        renderSeq();
-      };
-    });
-  };
-  renderSeq();
-
-  body.querySelectorAll("[data-add-stage]").forEach((button) => {
-    button.onclick = () => {
-      if (routeInsertAt === null || routeInsertAt >= routeDraft.length) {
-        routeDraft.push(button.dataset.addStage);
-        routeInsertAt = null;
-      } else {
-        routeDraft.splice(routeInsertAt, 0, button.dataset.addStage);
-        routeInsertAt += 1; // consecutive taps keep inserting in order
-      }
-      renderSeq();
-    };
-  });
-
-  const versionHint = () => {
-    const code = document.getElementById("nr-code").value.trim().toLowerCase().replace(/ /g, "_");
-    const versions = templates.filter((t) => t.code === code).map((t) => t.version);
-    document.getElementById("nr-version-hint").textContent = versions.length
-      ? `${code} exists — this will create v${Math.max(...versions) + 1}; items already released keep their old route.`
-      : "";
-  };
-  document.getElementById("nr-code").oninput = versionHint;
-  versionHint();
-
-  document.getElementById("nr-go").onclick = async () => {
-    const err = document.getElementById("nr-err");
-    err.hidden = true;
-    try {
-      const created = await api("/api/routes", {
-        method: "POST",
-        body: JSON.stringify({
-          code: document.getElementById("nr-code").value.trim(),
-          name: document.getElementById("nr-name").value.trim(),
-          stage_ids: routeDraft,
-        }),
-      });
-      routeDraft = [];
-      routeInsertAt = null;
-      toast(`Route ${created.code} v${created.version} created`);
-      await sync();
-    } catch (error) {
-      err.textContent = error.body?.detail || "Could not create the route.";
-      err.hidden = false;
-    }
-  };
-
-  body.querySelectorAll("[data-rt-unpublish]").forEach((button) => {
-    button.onclick = async () => {
-      if (!confirm("Unpublish this route version? Items already released keep their route.")) return;
-      try {
-        await api(`/api/routes/${button.dataset.rtUnpublish}`, { method: "DELETE" });
-        toast("Route version unpublished");
-        await sync();
-      } catch (error) {
-        alert(error.body?.detail || "Could not unpublish it.");
-      }
-    };
-  });
-}
-
 /* --------------------------------------------------------- office: stages -- */
 
 function officeStages(body) {
@@ -2254,8 +2298,8 @@ function officeStages(body) {
       <h2>Stages &amp; stations</h2>
       <p class="muted" style="margin-bottom:8px">Adding a stage needs no deploy and no code
       change: add it here with its behaviour flags, add stations if it has physical
-      instances, then create a new route version with the stage slotted in. Items already
-      in production keep the route they were released against.</p>
+      instances, and it is pickable on the next item created. Items already in production
+      keep the stages their entries were logged against.</p>
       <div id="mg-stages" class="muted">Loading…</div>
       <details data-panel="new-stage" style="margin-top:12px">
         <summary class="muted" style="cursor:pointer">New stage</summary>
@@ -2651,7 +2695,7 @@ function renderStageAdmin() {
           ...readFlags("new"),
         }),
       });
-      toast(`Stage ${name} added — slot it into a route version to use it`);
+      toast(`Stage ${name} added — pick it when creating an item`);
       await sync();
     } catch (error) {
       err.textContent = error.body?.detail || "Could not add the stage.";

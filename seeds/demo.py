@@ -21,15 +21,13 @@ from app.models import (
     EventType,
     Item,
     Project,
-    RouteTemplate,
-    RouteTemplateStep,
     Stage,
     User,
 )
 from app.schemas import EventCreate
 from app.security import hash_password
 from app.services.events import record_event
-from app.services.release import release_item
+from app.services.items import assign_steps
 from seeds.seed import run as run_seed
 
 
@@ -74,34 +72,18 @@ def run(db: Session) -> None:
         projects[code] = project
 
     stage_ids = {s.code: s.id for s in db.scalars(sa.select(Stage))}
-    template = db.scalars(
-        sa.select(RouteTemplate).where(
-            RouteTemplate.code == "casegoods", RouteTemplate.version == 1
-        )
-    ).first()
-    if template is None:
-        template = RouteTemplate(code="casegoods", version=1, name="Casegoods standard")
-        db.add(template)
-        db.flush()
-        for seq, stage_code in [
-            (10, "carpentry"),
-            (20, "veneer"),
-            (30, "paint"),
-            (40, "qc"),
-            (50, "packing"),
-        ]:
-            db.add(
-                RouteTemplateStep(
-                    route_template_id=template.id, seq=seq, stage_id=stage_ids[stage_code]
-                )
-            )
-        db.flush()
+    # The standard casegoods sequence. It is not a template any more -- each
+    # demo item simply gets its own copy of it, which is what the app does.
+    casegoods = [
+        stage_ids[code] for code in ("carpentry", "veneer", "paint", "qc", "packing")
+    ]
 
     now = utcnow()
     items_spec = [
         ("BST-120", "HOTEL-A", "Bedside table, walnut", 120, 9),
         ("WRD-040", "HOTEL-A", "Wardrobe, 3-door", 40, 6),
         ("DSK-015", "VILLA-B", "Writing desk", 15, 4),
+        # 0 days: created just now, so the walk below logs nothing against it.
         ("CHR-060", "VILLA-B", "Dining chair", 60, 0),
     ]
     states = {s.code: s for s in db.scalars(sa.select(EventState))}
@@ -117,22 +99,21 @@ def run(db: Session) -> None:
         item = db.scalars(sa.select(Item).where(Item.code == code)).first()
         if item is not None:
             continue
+        started = now - timedelta(days=days_ago)
         item = Item(
             code=code,
             project_id=projects[project_code].id,
             description=description,
             total_qty=qty,
             drawing_revision="A",
+            created_at=started,
         )
         db.add(item)
         db.flush()
-        if days_ago == 0:
-            continue  # left unreleased on purpose
-        released = now - timedelta(days=days_ago)
-        steps = release_item(db, item, template, user, released_at=released)
+        steps = assign_steps(db, item, casegoods, created_at=started)
 
-        # Walk some quantity down the route, leaving a spread of ages behind.
-        moment = released
+        # Walk some quantity down the stages, leaving a spread of ages behind.
+        moment = started
         moving = qty
         for depth, step in enumerate(steps):
             if moving <= 0:
