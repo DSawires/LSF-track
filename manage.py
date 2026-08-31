@@ -6,9 +6,9 @@
     python manage.py create-user NAME [--admin]
     python manage.py demo                    # a small demo factory with history
 
-Adding a stage needs no command here at all -- it is an INSERT into `stages` (plus
-stations and a new route template version), exactly as CLAUDE.md describes. The
-release screen and reports pick it up on the next reference sync.
+Adding a stage needs no command here at all -- it is an INSERT into `stages`
+(plus its stations), exactly as CLAUDE.md describes. It is on the palette for the
+next item created, and the reports pick it up on the next reference sync.
 """
 
 from __future__ import annotations
