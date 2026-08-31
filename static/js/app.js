@@ -1692,8 +1692,6 @@ function officeItems(body) {
         <div><label>Total qty</label><input id="ni-qty" type="number" inputmode="numeric" min="1"></div>
         <div><label>Drawing rev</label><input id="ni-rev" value="A"></div>
       </div>
-      <label>Target release date</label><input id="ni-date" type="date">
-
       <label style="margin-top:14px">Stages — the sequence this item goes through</label>
       <p class="muted" style="margin-bottom:8px">Tap stages in production order, or copy the
       sequence off another item in this project and adjust it. The floor logs its way along
@@ -1823,7 +1821,6 @@ function officeItems(body) {
           description: document.getElementById("ni-desc").value.trim(),
           total_qty: Number(document.getElementById("ni-qty").value),
           drawing_revision: document.getElementById("ni-rev").value.trim() || "A",
-          target_release_date: document.getElementById("ni-date").value || null,
           stage_ids: draft.stages,
           initial_quantities: newItemDist,
         }),
@@ -1962,16 +1959,10 @@ async function loadItemEditors() {
         </div>
         <label>Description</label>
         <input data-it-desc="${item.id}" value="${esc(item.description)}" ${isAdmin ? "" : "disabled"}>
-        <div class="field-grid">
-          <div><label>Project</label>
-            <select data-it-project="${item.id}" ${isAdmin ? "" : "disabled"}>
-              ${projects.map((p) => `<option value="${p.id}" ${p.id === item.project_id ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
-            </select>
-          </div>
-          <div><label>Target release</label>
-            <input data-it-date="${item.id}" type="date" value="${item.target_release_date || ""}" ${isAdmin ? "" : "disabled"}>
-          </div>
-        </div>
+        <label>Project</label>
+        <select data-it-project="${item.id}" ${isAdmin ? "" : "disabled"}>
+          ${projects.map((p) => `<option value="${p.id}" ${p.id === item.project_id ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
+        </select>
         ${isAdmin ? `
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
           <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
@@ -2049,7 +2040,6 @@ async function loadItemEditors() {
             description: field("data-it-desc", id).value.trim(),
             project_id: field("data-it-project", id).value,
             total_qty: Number(field("data-it-qty", id).value) || byId.get(id).total_qty,
-            target_release_date: field("data-it-date", id).value || null,
           }),
         });
         toast("Item updated");

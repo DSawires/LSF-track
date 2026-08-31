@@ -124,8 +124,8 @@ Names are indicative; Alembic migrations are authoritative.
   packing, …). Carries behaviour flags. **Extensible at runtime.**
 - `stations` — physical instances of a stage (paint_1, paint_2, carpentry_1, …).
   Many stations per stage. Recorded on events for load balancing.
-- `items` — a batch: code, project, description, total qty, current drawing revision,
-  target release date. Creating one **is** the handoff to the floor: there is no
+- `items` — a batch: code, project, description, total qty, current drawing
+  revision. Creating one **is** the handoff to the floor: there is no
   released/unreleased state, and `created_at` is when production started counting
 - `item_steps` — this item's own ordered stages, chosen at creation
 - `events` — the log. See below.

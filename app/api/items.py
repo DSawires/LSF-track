@@ -72,9 +72,6 @@ def _item_payload(item: Item, icon_url: str | None = None, steps_locked: bool = 
         "description": item.description,
         "total_qty": item.total_qty,
         "drawing_revision": item.drawing_revision,
-        "target_release_date": (
-            item.target_release_date.isoformat() if item.target_release_date else None
-        ),
         "created_at": item.created_at.isoformat() if item.created_at else None,
         # Whether the floor has logged against these stages yet, which is what
         # decides if the sequence can still be corrected.
@@ -213,7 +210,6 @@ def create_item(
         description=payload.description.strip(),
         total_qty=payload.total_qty,
         drawing_revision=payload.drawing_revision.strip(),
-        target_release_date=payload.target_release_date,
     )
     db.add(item)
     db.flush()

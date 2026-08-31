@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import datetime
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -172,7 +172,6 @@ class Item(Base):
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True, server_default=sa.true())
     total_qty: Mapped[int] = mapped_column(sa.Integer)
     drawing_revision: Mapped[str] = mapped_column(sa.String(32))
-    target_release_date: Mapped[date | None] = mapped_column(sa.Date, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 

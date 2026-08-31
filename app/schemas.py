@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -61,7 +61,6 @@ class ItemCreate(BaseModel):
     description: str = Field(max_length=255)
     total_qty: int = Field(gt=0, le=1_000_000)
     drawing_revision: str = Field(min_length=1, max_length=32)
-    target_release_date: date | None = None
     # 100 stages is far beyond any real sequence; it bounds the request.
     stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
     # Where the quantities already are, keyed by step seq -- for entering an
@@ -84,7 +83,6 @@ class ItemUpdate(BaseModel):
     project_id: uuid.UUID | None = None
     description: str | None = Field(default=None, max_length=255)
     total_qty: int | None = Field(default=None, gt=0, le=1_000_000)
-    target_release_date: date | None = None
 
 
 class ProjectCreate(BaseModel):
