@@ -1,7 +1,7 @@
 """The CLAUDE.md contract: a stage added at runtime changes output, never code.
 
-Every test here inserts a brand-new stage (and in one case a new state) after the
-application is fully wired, then exercises the reports and the release path. If a
+Every test here inserts a brand-new stage after the application is fully wired,
+then exercises the reports and the logging path. If a
 change to the codebase makes any of these fail, that change hardcoded a stage
 assumption and is the thing to fix.
 """
@@ -20,15 +20,14 @@ def test_runtime_stage_flows_through_release_and_reports(factory):
     factory.add_stage("polishing", sort=35, requires_station=False)
     item = factory.item("POL-1", 25, ["carpentry", "polishing", "packing"])
 
-    factory.log(item, 10, "completed", 25, at=days_ago(2), station_code="carpentry_1")
-    factory.log(item, 20, "in_progress", 25, at=days_ago(1))
+    factory.log(item, 10, 25, at=days_ago(2), station_code="carpentry_1")
+    factory.log(item, 20, 25, at=days_ago(1))
 
     wip = reports.wip_report(factory.db)
     polishing_row = next(
         row for row in wip["stages"] if row["stage"]["code"] == "polishing"
     )
     assert polishing_row["total_qty"] == 25
-    assert polishing_row["by_state"]["in_progress"] == 25
 
     aging = reports.aging_report(factory.db)
     row = next(
@@ -44,7 +43,7 @@ def test_a_new_stage_reaches_new_items_and_leaves_inflight_ones_alone(factory):
     can reach in and re-label work already done."""
     factory.add_stage("sanding", sort=15)
     inflight = factory.item("BED-1", 10, ["carpentry", "packing"])
-    factory.log(inflight, 10, "queued", 10, at=hours_ago(3), station_code="carpentry_1")
+    factory.log(inflight, 10, 10, at=hours_ago(3), station_code="carpentry_1")
 
     fresh = factory.item("BED-2", 10, ["carpentry", "sanding", "packing"])
 
@@ -52,37 +51,22 @@ def test_a_new_stage_reaches_new_items_and_leaves_inflight_ones_alone(factory):
     assert len(fresh.steps) == 3
     # The in-flight item still derives against its snapshot, untouched.
     ledger = derive(factory.db, item_ids=[inflight.id]).ledger_for(inflight.id)
-    assert len([p for p in ledger.positions if not p.is_unstarted]) == 2 * 3
+    assert [p.item_step_id for p in ledger.positions if p.item_step_id] == [
+        s.id for s in inflight.steps
+    ]
 
 
-def test_wip_report_iterates_states_from_the_table(factory):
-    """A fourth state added at runtime appears in every report row."""
-    from app.models import EventState
-
-    factory.db.add(
-        EventState(code="drying", name="Drying", sort_order=25, is_complete=False)
-    )
-    factory.db.flush()
-
-    item = factory.item("DRY-1", 8, ["paint"])
-    factory.log(item, 10, "in_progress", 8, at=hours_ago(4), station_code="paint_1")
-    factory.log(item, 10, "drying", 8, at=hours_ago(2), station_code="paint_1")
+def test_wip_report_has_a_row_for_a_runtime_stage_and_its_sample(factory):
+    """The sample shows up in WIP under whatever stage it is at -- including
+    one added this morning."""
+    factory.add_stage("drying", sort=32)
+    item = factory.item("DRY-1", 8, ["paint", "drying"], sample_qty=1)
+    factory.log(item, 10, 1, at=hours_ago(4), station_code="paint_1")
+    factory.log(item, 20, 1, at=hours_ago(2))
 
     wip = reports.wip_report(factory.db)
-    paint_row = next(row for row in wip["stages"] if row["stage"]["code"] == "paint")
-    assert paint_row["by_state"]["drying"] == 8
-    assert "drying" in [s["code"] for s in wip["states"]]
-
-
-def test_queue_depth_comes_from_state_order_not_name(factory):
-    """Rename-proof: queue depth keys off the earliest state by sort_order."""
-    item = factory.item("Q-1", 12, ["carpentry"])
-    factory.log(item, 10, "queued", 12, at=hours_ago(1), station_code="carpentry_1")
-
-    wip = reports.wip_report(factory.db)
-    row = next(r for r in wip["stages"] if r["stage"]["code"] == "carpentry")
-    assert row["queue_qty"] == 12
-    assert wip["queue_state_code"] == "queued"
+    row = next(r for r in wip["stages"] if r["stage"]["code"] == "drying")
+    assert (row["total_qty"], row["sample_qty"]) == (1, 1)
 
 
 def test_stage_and_station_added_through_the_admin_api(world, client):
@@ -110,7 +94,7 @@ def test_stage_and_station_added_through_the_admin_api(world, client):
     # The brand-new stage is pickable for a new item the moment it exists.
     item = client.post("/api/items", json={
         "code": "GLZ-1", "project_id": _project_id(client), "description": "Glazed cabinet",
-        "total_qty": 4, "drawing_revision": "A",
+        "total_qty": 4, "sample_qty": 0, "drawing_revision": "A",
         "stage_ids": [carpentry["id"], stage["id"]],
     })
     assert item.status_code == 201
@@ -118,11 +102,9 @@ def test_stage_and_station_added_through_the_admin_api(world, client):
 
     steps = client.get(f"/api/items/{item['id']}").json()["steps"]
     glass_step = next(s for s in steps if s["stage_id"] == stage["id"])
-    states = client.get("/api/reference").json()["states"]
-    queued = next(s for s in states if s["sort_order"] == min(x["sort_order"] for x in states))
     move = next(
         t for t in client.get("/api/reference").json()["event_types"]
-        if t["moves_quantity"] and not t["is_rework"] and not t["is_correction"]
+        if t["moves_quantity"] and not (t["is_rework"] or t["is_correction"] or t["is_finish"])
     )
     import uuid as _uuid
     from datetime import datetime, timezone
@@ -132,7 +114,6 @@ def test_stage_and_station_added_through_the_admin_api(world, client):
         "item_step_id": glass_step["id"],
         "station_id": station.json()["id"],
         "event_type_id": move["id"],
-        "state_id": queued["id"],
         "qty": 4,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -148,8 +129,8 @@ def test_admin_can_rename_reorder_and_retire_a_station(world, client):
     service. Events reference the station by id, so an edit re-labels work
     already logged there without rewriting a single row of history."""
     factory, _stages, item = world
-    factory.log(item, 10, "completed", 50, at=hours_ago(5), station_code="carpentry_1")
-    factory.log(item, 20, "queued", 50, at=hours_ago(4), station_code="paint_1")
+    factory.log(item, 10, 50, at=hours_ago(5), station_code="carpentry_1")
+    factory.log(item, 20, 50, at=hours_ago(4), station_code="paint_1")
     factory.db.commit()
 
     def paint_stations() -> list[dict]:
@@ -240,7 +221,7 @@ def test_terminal_stage_must_be_the_last_stage_of_an_item(world, client):
         "stage_ids": [packing["id"], carpentry["id"]],
     })
     assert response.status_code == 422
-    assert "terminal" in response.json()["detail"]
+    assert "must be the last stage" in response.json()["detail"]
 
 
 def test_seed_rerun_does_not_clobber_operator_edits(factory):
@@ -270,11 +251,11 @@ def test_whole_batch_stage_rejects_partial_moves(factory):
     factory.add_stage("kiln", sort=25, allows_partial_qty=False)
     item = factory.item("KILN-1", 20, ["carpentry", "kiln"])
 
-    factory.log(item, 10, "completed", 20, at=hours_ago(5), station_code="carpentry_1")
+    factory.log(item, 10, 20, at=hours_ago(5), station_code="carpentry_1")
     with pytest.raises(EventRejected, match="partial"):
-        factory.log(item, 20, "queued", 8, at=hours_ago(2))
+        factory.log(item, 20, 8, at=hours_ago(2))
     # The whole batch moves fine.
-    factory.log(item, 20, "queued", 20, at=hours_ago(1))
+    factory.log(item, 20, 20, at=hours_ago(1))
 
 
 def test_no_stage_codes_hardcoded_outside_seeds_and_tests():

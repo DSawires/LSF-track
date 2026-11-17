@@ -73,7 +73,11 @@ def _image_payload(image: ItemImage) -> dict:
 
 
 @router.post("/items/{item_id}/images", status_code=status.HTTP_201_CREATED)
-async def upload_image(
+# A plain `def`, so FastAPI runs it on a worker thread. Everything in here
+# blocks -- the database, and with S3 the upload itself -- and as a coroutine it
+# would hold the one event loop for the length of a photo upload, stalling every
+# other phone's sync behind it.
+def upload_image(
     item_id: uuid.UUID,
     file: UploadFile = File(...),
     note: str = Form(default=""),
@@ -87,7 +91,7 @@ async def upload_image(
         raise HTTPException(422, f"kind must be one of {sorted(_KINDS)}")
 
     settings = get_settings()
-    head = await file.read(16)
+    head = file.file.read(16)
     content_type = _sniff(head)
     if content_type is None:
         raise HTTPException(422, "not a recognised image format")
@@ -99,7 +103,7 @@ async def upload_image(
     with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as spool:
         spool.write(head)
         size = len(head)
-        while chunk := await file.read(64 * 1024):
+        while chunk := file.file.read(64 * 1024):
             size += len(chunk)
             if size > settings.max_upload_bytes:
                 raise HTTPException(

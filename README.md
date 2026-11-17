@@ -6,7 +6,7 @@ phones; the system answers where everything is, which stage is backed up, and
 what has been sitting too long.
 
 The design rules live in [CLAUDE.md](CLAUDE.md) and are load-bearing: an
-append-only event log as the sole source of truth, stages and stations as runtime
+event log as the sole source of truth, stages and stations as runtime
 data rather than code, each item owning its own stage sequence, and a fully
 offline-capable PWA with an IndexedDB write queue.
 
@@ -62,7 +62,8 @@ Set `LSF_S3_BUCKET` and one private bucket holds both item photos (`images/`)
 and nightly `pg_dump` archives (`backups/`, newest `LSF_BACKUP_KEEP` kept).
 The `backup` service dumps shortly after boot and then daily at 02:00 UTC —
 anchored to the clock, not container start, so redeploys can't starve the
-schedule. Run one on demand:
+schedule. **Office → Status** shows when the last one landed and warns when
+a night has been missed. Run one on demand:
 
 ```sh
 docker compose exec backup python manage.py backup
@@ -150,8 +151,8 @@ factory's size one worker is plenty.
 .venv/bin/python -m pytest
 ```
 
-The suite includes extensibility tests that insert a brand-new stage *and* a
-brand-new event state at runtime and assert both reports pick them up, a test
+The suite includes extensibility tests that insert a brand-new stage at runtime
+and assert both reports (and the import) pick it up, a test
 that performs the whole add-a-stage procedure through the admin HTTP API, plus
 a grep test that fails the build if any seeded stage code appears as a string
 literal inside `app/`. If adding a stage to a fixture breaks a test, fix the
@@ -172,7 +173,8 @@ Dockerfile). To bump: create a fresh venv, `pip install .`, then
 Done in the app by an admin: **Office tab → Stages & stations**.
 
 1. Add the stage with its behaviour flags (`requires_station`,
-   `requires_external_po`, `allows_partial_qty`, `is_terminal`, sort order,
+   `requires_external_po`, `allows_partial_qty`, `is_terminal` — a closing
+   stage, which must be last in any sequence that uses it — sort order,
    and `max_days_in_state` — the per-stage aging threshold; empty means the
    stage is never flagged, which is what outsourced work wants).
 2. Add stations if the stage has physical instances. Existing stations are
@@ -181,41 +183,69 @@ Done in the app by an admin: **Office tab → Stages & stations**.
    not rewritten), and a retired station drops off the logging picker while
    staying named in the reports. Station codes are fixed — retire a station
    and add the replacement rather than repurposing one.
-3. Done. The stage is on the palette when the next item is created (the
-   builder has ＋ insertion points to slot it between existing stages), and
-   items already on the floor keep the sequence their entries were logged
-   against — there is no shared template that could re-version under them.
+3. Done. The stage can be named in the next import file (the downloadable
+   template lists it), and items already on the floor keep the sequence their
+   entries were logged against — there is no shared template that could
+   re-version under them.
 
-`event_types`, `event_states` and `reason_codes` extend the same way — every
+`event_types` and `reason_codes` extend the same way — every
 behavioural difference is a flag column, and business logic branches only on
 flags, never on codes. Seeds are insert-if-missing only, so flags tuned in the
 UI survive restarts.
 
-**Projects** are created in the app: Office tab → "New project". **Items** are
-created in Office → Items, each with its own stage sequence — tapped out stage by
-stage, or copied off another item in the same project and adjusted. Creating an
-item *is* the handoff to the floor: there is no separate release step, and it can
-be logged against immediately. The sequence stays correctable until the first
-entry is logged against it, and is frozen from then on.
+## Importing a project
+
+**Office → Import.** A project and all its items arrive as one spreadsheet
+(.xlsx or .csv), one row per item, header row first:
+
+| project | project name | client | item | description | qty | sample qty | revision | stages |
+|---|---|---|---|---|---|---|---|---|
+| HOTEL-B | Grand Hotel | Acme | BST-1 | Bedside table | 120 | 1 | A | Carpentry > Veneer > Paint > QC > Packing |
+
+`project`, `item`, `qty` and `stages` are required. Stages are matched by name
+or code against the `stages` table, separated by `>` (or `,` `;` `|`). A new
+project code creates the project; an existing one is added to (never renamed
+by the file). "Download a template" builds one from today's stages.
+
+The file is previewed first — projects, items, and every problem by
+spreadsheet row — and committed only if the whole file is clean.
+
+**Sample first.** Every item starts as its sample (`sample qty`, default 1).
+Only the sample is on the floor until it is logged to Done; that entry releases
+the batch (`qty`), which then follows the same stages. The release is derived
+from the log, so voiding the finishing entry takes the batch back off the floor.
+
+Creating an item *is* the handoff to the floor: there is no separate release
+step. An item's sequence stays correctable in its editor until the first entry
+is logged against it, and is frozen from then on.
+
+## Logging
+
+The floor records where units are, nothing more: **item, stage (or Done),
+station, quantity**. There is no queued / in progress / completed within a
+stage. Logs from before that change carry a state and still replay exactly —
+see `app/ledger.py`.
 
 ## How the pieces fit
 
-- `app/models.py` — schema. `events` is insert-only; `items` carries no derived
-  state.
+- `app/models.py` — schema. `events` rows are never edited (a mistake is
+  superseded by a correction); `items` carries no derived state.
 - `app/ledger.py` — the derivation core. Replays an item's events into FIFO
-  lots at (step, state) positions; produces WIP, aging, completion and every
+  lots at not started → each step → Done, gates the batch behind its sample,
+  and replays legacy state rows; produces WIP, aging, completion and every
   anomaly (competing/orphaned corrections, clock drift, legacy over-advance).
   Pure logic, no I/O.
 - `app/services/` — `derivation.py` loads and replays; `reports.py` builds the
   WIP, aging and exceptions payloads; `events.py` is the idempotent write path
   and the over-advance guard; `items.py` assigns an item its stages, places any
-  starting quantities, and records revision bumps.
+  starting quantities, and records revision bumps; `imports.py` reads, checks
+  and commits a project file.
 - `app/api/` — FastAPI routers: auth, reference (the offline cache payload),
-  items, office (projects, stages, stations), images, events (single + batch),
-  reports.
+  items, imports, office (projects, stages, stations), images, events
+  (single + batch), reports.
 - `static/` — the PWA. `js/db.js` is the IndexedDB queue and cache; `js/app.js`
-  renders everything from the reference payload and never names a stage, state
-  or event type by its code. It syncs every 30 seconds but only redraws when
+  renders everything from the reference payload and never names a stage or
+  event type by its code. It syncs every 30 seconds but only redraws when
   the payload actually changed (ages are compared at the one decimal place the
   UI prints), and a redraw carries the user's typing, ticked boxes, open panels
   and scroll position across — a refresh must never cost someone their work.
@@ -243,21 +273,29 @@ entry is logged against it, and is frozen from then on.
   because floor devices are shared); `submitted_by_user_id` is the
   authenticated session that posted the row, always server-set. The audit
   trail holds even when a colleague's phone drains your queue.
-- **Aging is per item + step + state**, FIFO: 40 units at paint and 50 at QC
+- **Aging is per item + stage**, FIFO: 40 units at paint and 50 at QC
   are two rows with independent ages, and a partial advance doesn't reset the
   clock on what stayed behind.
 - **Rework is forward motion.** A rework event pulls units back from
-  downstream positions, increments their rework count, and completed-count
-  reports exclude re-completions — no double-counting.
-- **States are as extensible as stages.** `state` is a foreign key to
-  `event_states`; the queue state is flagged `is_initial` rather than assumed
-  from sort order.
-- **Completing a step offers a one-tap "also queue at next stage"** (default
-  on). It writes two ordinary events a millisecond apart — done here, queued
-  there — so the log stays factual and the derivation needs no special case.
-- **Creating an item accepts an initial per-stage distribution** for a batch
-  that is already part-built when it reaches the system; the placements are
-  ordinary queued events written deepest-step-first.
+  downstream, increments their rework count, and completed-count reports
+  exclude re-completions — no double-counting. The entry names the stage (or
+  Done) the units came back from, and the phone asks for it ("Taking them
+  from"): without it the ledger can only take the nearest lot downstream,
+  which is the wrong one whenever another lot rests in between.
+- **Deleting is possible, archiving is the default.** Archiving an item — or a
+  whole project with its items — takes it off every list and report, keeps its
+  history, and can be undone from the item editor. "Delete for good" removes
+  the item and its logged events; it is admin-only and written to the server
+  log. Archive finished jobs: every active item is replayed by every report.
+- **Phones only refetch the item list when something changed.** The reference
+  payload carries a token computed from the tables (`app/services/sync.py`);
+  a phone holding the same token skips the replay behind `/api/items`.
+- **Done is not a stage.** Units leave the last stage through an event type
+  flagged `is_finish`, which names no step. The phone offers it as "Done ✓"
+  after the last stage.
+- **`POST /api/items` accepts an initial per-stage distribution** for a batch
+  that is already part-built when it reaches the system (with `sample_qty` 0);
+  the placements are ordinary arrivals written deepest-step-first.
 - **Item photos** are online-only by design: the offline guarantee protects
   the logging path, and multi-megabyte blobs don't belong in its sync queue.
   Files are stored by row id, format-sniffed on upload, and served only

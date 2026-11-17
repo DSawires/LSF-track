@@ -358,6 +358,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 .badge.age-hot { color: var(--warn); border-color: var(--warn); }
 .badge.pending { color: var(--accent); border-color: var(--accent); }
 .badge.rework { color: var(--warn); }
+.badge.sample { color: var(--accent); border-color: var(--accent); font-weight: 600; }
 
 /* segmented pickers beat dropdowns with gloves on */
 .seg {

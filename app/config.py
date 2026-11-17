@@ -85,6 +85,8 @@ class Settings:
     domain: str
     max_device_ahead_seconds: int
     max_sync_lag_days: int
+    clock_flag_days: int
+    api_docs: bool
     upload_dir: str
     max_upload_bytes: int
     s3_bucket: str
@@ -110,6 +112,12 @@ def get_settings() -> Settings:
         domain=os.environ.get("LSF_DOMAIN", "").strip(),
         max_device_ahead_seconds=_int("LSF_MAX_DEVICE_AHEAD_SECONDS", 3600),
         max_sync_lag_days=_int("LSF_MAX_SYNC_LAG_DAYS", 14),
+        # How long a clock-drift or late-sync flag stays in the exceptions
+        # view, counted from when the entry reached the server. 0 = for ever.
+        clock_flag_days=_int("LSF_CLOCK_FLAG_DAYS", 30),
+        # The interactive API docs describe every endpoint to anyone who can
+        # reach the server, signed in or not. Off unless asked for.
+        api_docs=_bool("LSF_API_DOCS", False),
         upload_dir=os.environ.get("LSF_UPLOAD_DIR", "data/uploads"),
         max_upload_bytes=_int("LSF_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
         s3_bucket=os.environ.get("LSF_S3_BUCKET", "").strip(),

@@ -11,6 +11,10 @@ the item is loggable from the moment it exists, and its stages are rewritable
 only until the floor has actually logged against it, because from then on the
 steps are what the stored events refer to.
 
+Every item starts as a sample (`sample_qty`, 1 unless the office says
+otherwise). The production batch is released by the ledger when the sample
+reaches Done -- derived from the log, so nothing here writes it.
+
 Nothing is written to the log to mark that handoff. `items.created_at` is when
 production started counting -- the ledger reads it as the aging origin -- and a
 marker event on every single item would say nothing the item row does not, while
@@ -28,7 +32,6 @@ from sqlalchemy.orm import Session
 from app.db import utcnow
 from app.models import (
     Event,
-    EventState,
     EventType,
     Item,
     ItemStep,
@@ -41,6 +44,12 @@ class ItemSetupError(Exception):
     pass
 
 
+def references_a_step():
+    """An event that names one of its item's steps, as where its units went or
+    as where they came from. That is what freezes a sequence."""
+    return sa.or_(Event.item_step_id.is_not(None), Event.from_item_step_id.is_not(None))
+
+
 def steps_are_frozen(db: Session, item: Item) -> bool:
     """True once any stored event points at one of this item's steps.
 
@@ -51,10 +60,36 @@ def steps_are_frozen(db: Session, item: Item) -> bool:
         db.scalar(
             sa.select(sa.func.count())
             .select_from(Event)
-            .where(Event.item_id == item.id, Event.item_step_id.is_not(None))
+            .where(Event.item_id == item.id, references_a_step())
         )
         > 0
     )
+
+
+def archive_item(db: Session, item: Item, user: User) -> None:
+    """Take an item off every list and report, keeping its history.
+
+    Archiving removes the item's quantities from WIP, so it is written to the
+    log (who, when) rather than being a silent flag flip. Reversible: see the
+    `is_active` branch of PATCH /api/items/{id}.
+    """
+    item.is_active = False
+    archive_type = _event_type(db, "is_archive")
+    if archive_type is not None:
+        db.add(
+            Event(
+                id=uuid.uuid4(),
+                item_id=item.id,
+                event_type_id=archive_type.id,
+                qty=0,
+                occurred_at=utcnow(),
+                received_at=utcnow(),
+                user_id=user.id,
+                submitted_by_user_id=user.id,
+                note="item archived",
+            )
+        )
+    db.flush()
 
 
 def assign_steps(
@@ -78,13 +113,14 @@ def assign_steps(
         if not stages[stage_id].is_active:
             raise ItemSetupError(f"stage '{stages[stage_id].name}' is retired")
 
-    # A terminal stage completes units for good -- the ledger counts them
-    # finished there -- so anywhere but last, every step after it would sit
-    # empty for ever.
+    # `is_terminal` marks a stage that closes a sequence (packing): nothing may
+    # follow it. It no longer finishes units by itself -- that is a finish
+    # entry, into Done -- except on legacy rows, where "completed" at a terminal
+    # stage replays as Done.
     for stage_id in stage_ids[:-1]:
         if stages[stage_id].is_terminal:
             raise ItemSetupError(
-                f"stage '{stages[stage_id].name}' is terminal and must be the last stage"
+                f"stage '{stages[stage_id].name}' closes a sequence and must be the last stage"
             )
 
     if steps_are_frozen(db, item):
@@ -119,12 +155,18 @@ def place_initial_quantities(
 ) -> None:
     """Onboard an item that is already mid-production when it is entered.
 
-    Each placement is an ordinary queued event, so the ledger needs no special
-    case. Deepest step first, each a millisecond apart: the replay pulls from the
+    Each placement is an ordinary arrival at its stage, so the ledger needs no
+    special case. Only for an item without a sample: a part-built batch is past
+    its sample by definition, and with one the batch would not exist yet for
+    the placements to draw from. Deepest step first, each a millisecond apart: the replay pulls from the
     *nearest* upstream position, and only this ordering guarantees every
     placement draws from the unstarted pool rather than from a shallower
     placement that happened to land first.
     """
+    if quantities and item.sample_qty:
+        raise ItemSetupError(
+            "a part-built batch has no sample to run; set the sample quantity to 0"
+        )
     step_by_seq = {step.seq: step for step in steps}
     for seq, qty in quantities.items():
         if seq not in step_by_seq:
@@ -142,15 +184,12 @@ def place_initial_quantities(
             EventType.moves_quantity.is_(True),
             EventType.is_rework.is_(False),
             EventType.is_correction.is_(False),
+            EventType.is_finish.is_(False),
             EventType.is_active.is_(True),
         ).order_by(EventType.sort_order).limit(1)
     ).first()
-    queued_state = db.scalars(
-        sa.select(EventState).where(EventState.is_active.is_(True))
-        .order_by(EventState.is_initial.desc(), EventState.sort_order).limit(1)
-    ).first()
-    if move_type is None or queued_state is None:
-        raise ItemSetupError("no movement event type or entry state is seeded")
+    if move_type is None:
+        raise ItemSetupError("no movement event type is seeded")
 
     at = moment or utcnow()
     for offset, seq in enumerate(sorted(quantities, reverse=True), start=1):
@@ -160,7 +199,6 @@ def place_initial_quantities(
                 item_id=item.id,
                 item_step_id=step_by_seq[seq].id,
                 event_type_id=move_type.id,
-                state_id=queued_state.id,
                 qty=quantities[seq],
                 occurred_at=at + timedelta(milliseconds=offset),
                 received_at=utcnow(),

@@ -33,6 +33,10 @@ const LSF_DB = (() => {
       const result = work(transaction.objectStore(store));
       transaction.oncomplete = () => resolve(result && result.result !== undefined ? result.result : result);
       transaction.onerror = () => reject(transaction.error);
+      // A full disk fails the transaction at commit, which fires `abort` and
+      // no `error`. Without this the promise never settles, and the one tap
+      // that matters gets neither "Logged" nor "NOT saved".
+      transaction.onabort = () => reject(transaction.error || new Error("transaction aborted"));
     }));
   }
 

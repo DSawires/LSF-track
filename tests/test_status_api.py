@@ -59,9 +59,9 @@ def test_activity_counts_events_credited_to_each_user(factory, client, world):
     other = _floor_user(client, factory, "floor-a")
 
     # Two entries credited to the floor user, one to the admin.
-    factory.log(item, 10, "queued", 5, at=hours_ago(3), user_id=other["id"])
-    factory.log(item, 10, "in_progress", 5, at=hours_ago(1), user_id=other["id"])
-    factory.log(item, 10, "completed", 5, at=hours_ago(0.5))
+    factory.log(item, 10, 5, at=hours_ago(3), station_code="carpentry_1", user_id=other["id"])
+    factory.log(item, 20, 5, at=hours_ago(1), station_code="paint_1", user_id=other["id"])
+    factory.log(item, 30, 5, at=hours_ago(0.5))
     factory.db.commit()
 
     rows = {r["username"]: r for r in client.get("/api/status/users").json()["users"]}
@@ -82,7 +82,7 @@ def test_activity_counts_events_credited_to_each_user(factory, client, world):
 def test_activity_survives_a_stage_added_at_runtime(factory, client, world):
     """Adding a stage is a data change, and must not touch this aggregation."""
     _, _, item = world
-    factory.log(item, 10, "queued", 5, at=hours_ago(2))
+    factory.log(item, 10, 5, at=hours_ago(2))
     factory.db.commit()
     before = client.get("/api/status/users").json()["users"]
 

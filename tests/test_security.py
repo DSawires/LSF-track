@@ -186,7 +186,7 @@ def test_events_record_who_submitted_alongside_who_is_credited(factory):
     factory.db.flush()
 
     item = factory.item("SEC-1", 5, ["carpentry"])
-    event = factory.log(item, 10, "queued", 5, user_id=other.id)
+    event = factory.log(item, 10, 5, user_id=other.id)
 
     assert event.user_id == other.id  # credited to who logged it on the floor
     assert event.submitted_by_user_id == factory.user.id  # posted by this session

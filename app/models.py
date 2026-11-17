@@ -83,11 +83,13 @@ class Station(Base):
 
 
 class EventState(Base):
-    """queued / in_progress / completed, as data.
+    """Legacy: queued / in_progress / completed.
 
-    `sort_order` defines progression within a step; `is_complete` marks the state
-    that hands units on to the next step. Nothing else is assumed about them, so a
-    factory can add a fourth state without a deploy.
+    Nothing writes a state any more -- a unit is at a stage or it is not. The
+    table stays because events logged before that change carry a state_id, and
+    the log must keep replaying them: app/ledger.py gives each
+    legacy state its own slot inside the step, ordered by `sort_order`, and
+    reads `is_complete` at the last step as Done.
     """
 
     __tablename__ = "event_states"
@@ -131,6 +133,9 @@ class EventType(Base):
     # ledger replays them as the no-ops they always were.
     is_release: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     is_revision_bump: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # Moves units off the end of the item's sequence into Done. Carries no step:
+    # Done is not a stage, it is where every sequence ends.
+    is_finish: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
     is_archive: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     moves_quantity: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     requires_item_step: Mapped[bool] = mapped_column(sa.Boolean, default=True)
@@ -159,6 +164,12 @@ class Item(Base):
 
     `drawing_revision` is authored by the technical office rather than derived, and
     every change to it is also written to the log as a revision-bump event.
+
+    Every item starts as a sample: only `sample_qty` units exist on the floor
+    until the sample has walked the whole sequence into Done, and at that moment
+    `total_qty` -- the production batch, on top of the sample -- is released
+    into "not started". The release is derived from the log by the ledger, never
+    stored. `sample_qty` 0 means no sample (items that predate the sample flow).
     """
 
     __tablename__ = "items"
@@ -167,10 +178,12 @@ class Item(Base):
     code: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True)
     project_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("projects.id"), index=True)
     description: Mapped[str] = mapped_column(sa.String(255))
-    # Archived items keep their history (the log is append-only) but disappear
-    # from lists and reports. Only an item with no events may be hard-deleted.
+    # Archived items keep their history but disappear from lists and reports,
+    # and can be reactivated. Deleting one for good (an admin purge) takes its
+    # events with it.
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True, server_default=sa.true())
     total_qty: Mapped[int] = mapped_column(sa.Integer)
+    sample_qty: Mapped[int] = mapped_column(sa.Integer, default=1)
     drawing_revision: Mapped[str] = mapped_column(sa.String(32))
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
@@ -226,9 +239,12 @@ class ItemImage(Base):
 
 
 class Event(Base):
-    """The log. Insert only: no UPDATE, no DELETE, anywhere, ever.
+    """The log, and the source of truth: current state is derived from it.
 
-    Mistakes are superseded by a correction event, not edited.
+    Rows are never edited. A mistake in one entry is superseded by a correction
+    event, which keeps the history of what was believed and when. Rows can be
+    deleted, but only whole: an admin purging an item takes its events with it
+    (app/api/items.py), and that is logged with who did it.
     """
 
     __tablename__ = "events"
@@ -243,10 +259,22 @@ class Event(Base):
         sa.ForeignKey("stations.id"), nullable=True, index=True
     )
     event_type_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("event_types.id"))
+    # Legacy only: rows logged before states were removed. New rows leave it NULL.
     state_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("event_states.id"), nullable=True
     )
     qty: Mapped[int] = mapped_column(sa.Integer, default=0)
+    # Where the units came from, when the entry says so: one of the item's own
+    # steps, or Done. Both empty means "the nearest units on the right side of
+    # the target", which is what every row logged before these columns means.
+    # It matters for rework: QC sending 5 back to carpentry while another lot
+    # rests at paint is only unambiguous if the entry names QC.
+    from_item_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("item_steps.id"), nullable=True
+    )
+    from_done: Mapped[bool] = mapped_column(
+        sa.Boolean, default=False, server_default=sa.false()
+    )
     reason_code_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("reason_codes.id"), nullable=True
     )
@@ -280,8 +308,8 @@ class Event(Base):
 class StatusBanner(Base):
     """The site-wide notice an admin raises for the floor. Latest row wins.
 
-    Insert-only, like the event log and for the same reason: "who put the
-    factory on red, and when" is worth keeping, and an UPDATE would erase it.
+    Insert-only: "who put the factory on red, and when" is worth keeping, and
+    an UPDATE would erase it.
     Clearing the banner is a new row with colour `neutral` and no message.
 
     `colour` is presentation, not factory vocabulary: it is the four things the

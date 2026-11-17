@@ -129,7 +129,11 @@ self.addEventListener("sync", (event) => {
 });
 
 async function drainFromWorker() {
-  const queue = (await LSF_DB.queueAll()).filter((q) => q._status === "pending");
+  // Oldest first, as the page's drain does: the queue comes back in UUID order,
+  // and an entry must not go a chunk ahead of the earlier one it depends on.
+  const queue = (await LSF_DB.queueAll())
+    .filter((q) => q._status === "pending")
+    .sort((a, b) => (a.occurred_at < b.occurred_at ? -1 : a.occurred_at > b.occurred_at ? 1 : 0));
   for (let start = 0; start < queue.length; start += 100) {
     const events = queue
       .slice(start, start + 100)

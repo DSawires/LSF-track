@@ -30,6 +30,10 @@ class EventCreate(BaseModel):
     # qty. The ceiling is far beyond any real batch; it exists so a client bug
     # cannot store a number that breaks every report aggregate.
     qty: int = Field(default=0, ge=0, le=1_000_000)
+    # Where the units came from: one of the item's steps, or Done. Optional --
+    # left empty, the nearest units on the right side of the target move.
+    from_item_step_id: uuid.UUID | None = None
+    from_done: bool = False
     reason_code_id: uuid.UUID | None = None
     note: str | None = Field(default=None, max_length=2000)
     supersedes_event_id: uuid.UUID | None = None
@@ -60,6 +64,8 @@ class ItemCreate(BaseModel):
     project_id: uuid.UUID
     description: str = Field(max_length=255)
     total_qty: int = Field(gt=0, le=1_000_000)
+    # Units that walk the sequence before the batch is released. 0 = no sample.
+    sample_qty: int = Field(default=1, ge=0, le=1_000)
     drawing_revision: str = Field(min_length=1, max_length=32)
     # 100 stages is far beyond any real sequence; it bounds the request.
     stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
@@ -83,6 +89,8 @@ class ItemUpdate(BaseModel):
     project_id: uuid.UUID | None = None
     description: str | None = Field(default=None, max_length=255)
     total_qty: int | None = Field(default=None, gt=0, le=1_000_000)
+    # `true` brings an archived item back. Archiving is DELETE, not this.
+    is_active: bool | None = None
 
 
 class ProjectCreate(BaseModel):

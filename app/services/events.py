@@ -76,7 +76,12 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
             )
         return EventWrite(event=existing, created=False, divergent=divergent)
 
-    item = db.get(Item, payload.item_id)
+    # Row-locked until the request commits. The availability check below reads
+    # the item's log and then inserts into it; without the lock two phones
+    # posting for the same item at once would each validate against a log that
+    # does not hold the other's entry, and both would be stored. (SQLite has no
+    # row locks and ignores this; it serialises writers on its own.)
+    item = db.get(Item, payload.item_id, with_for_update=True)
     if item is None:
         raise EventRejected("unknown item", "item_id")
     if not item.is_active:
@@ -87,6 +92,10 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         raise EventRejected("unknown event type", "event_type_id")
 
     item_step = None
+    if event_type.is_finish and payload.item_step_id is not None:
+        raise EventRejected(
+            "a finish entry moves units to Done and names no stage", "item_step_id"
+        )
     if payload.item_step_id is not None:
         item_step = db.get(ItemStep, payload.item_step_id)
         if item_step is None:
@@ -96,13 +105,36 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
     elif event_type.requires_item_step:
         raise EventRejected("this event type needs a step", "item_step_id")
 
-    state = None
-    if payload.state_id is not None:
-        state = db.get(EventState, payload.state_id)
-        if state is None:
-            raise EventRejected("unknown state", "state_id")
-    elif event_type.moves_quantity:
-        raise EventRejected("this event type needs a state", "state_id")
+    # Where the units came from, if the entry says: one of this item's steps,
+    # or Done. Whether that place lies on the right side of the target is a
+    # question about the sequence, answered in _validate_availability.
+    from_step = None
+    if payload.from_item_step_id is not None:
+        if payload.from_done:
+            raise EventRejected(
+                "an entry takes its units from one place: a stage or Done, not both",
+                "from_item_step_id",
+            )
+        from_step = db.get(ItemStep, payload.from_item_step_id)
+        if from_step is None:
+            raise EventRejected("unknown source step", "from_item_step_id")
+        if from_step.item_id != item.id:
+            raise EventRejected("source step belongs to a different item", "from_item_step_id")
+    if from_step is not None or payload.from_done:
+        if not event_type.moves_quantity:
+            raise EventRejected(
+                "only an entry that moves units can say where they came from",
+                "from_item_step_id",
+            )
+    if payload.from_done and not event_type.is_rework:
+        raise EventRejected("only rework takes units back out of Done", "from_done")
+
+    # States are gone from the floor: a unit is at a stage or it is not. A
+    # state_id is still accepted because phones running the previous app
+    # version may be holding queued entries that carry one, and those must
+    # drain rather than strand in a quarantine nobody can resolve.
+    if payload.state_id is not None and db.get(EventState, payload.state_id) is None:
+        raise EventRejected("unknown state", "state_id")
 
     if payload.station_id is not None:
         station = db.get(Station, payload.station_id)
@@ -141,7 +173,7 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
     if occurred_at > utcnow() + _MAX_FUTURE:
         # Small clock drift is stored and flagged (see clock_anomalies); a
         # timestamp days in the future is garbage that would sort after every
-        # honest event forever -- and an append-only log can never remove it.
+        # honest event for as long as it stayed in the log.
         raise EventRejected(
             "occurred_at is more than a week in the future; fix the device clock",
             "occurred_at",
@@ -157,6 +189,8 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         event_type_id=event_type.id,
         state_id=payload.state_id,
         qty=payload.qty,
+        from_item_step_id=payload.from_item_step_id,
+        from_done=payload.from_done,
         reason_code_id=payload.reason_code_id,
         occurred_at=occurred_at,
         # Never from the client: this is how a wrong device clock is detected.
@@ -203,8 +237,6 @@ def _validate_availability(db, item: Item, item_step, payload, event_type: Event
     """
     if not event_type.moves_quantity or payload.qty <= 0:
         return
-    if item_step is None or payload.state_id is None:
-        return
 
     # Replays this item's log as it stands, including events inserted earlier
     # in the same batch (they are in the session already). Cheap at this
@@ -222,9 +254,20 @@ def _validate_availability(db, item: Item, item_step, payload, event_type: Event
         return [a for a in ledger.anomalies if a.code == "over_advance"]
 
     probe = ItemLedger(item, steps, vocab)
-    if not probe.has_position(item_step.id, payload.state_id):
+    target = probe.target_index(
+        item_step.id if item_step else None, payload.state_id, is_finish=event_type.is_finish
+    )
+    if target is None:
         raise EventRejected(
-            "step and state do not name a position on this item's route", "state_id"
+            "this entry does not name a stage on this item's sequence", "item_step_id"
+        )
+    if (payload.from_item_step_id is not None or payload.from_done) and not probe.source_order(
+        target, event_type.is_rework, payload.from_item_step_id, payload.from_done
+    ):
+        side = "after" if event_type.is_rework else "before"
+        raise EventRejected(
+            f"the place these units come from must be {side} the stage they go to",
+            "from_item_step_id",
         )
 
     # A detached stand-in, never added to the session: the replay only reads
@@ -232,11 +275,13 @@ def _validate_availability(db, item: Item, item_step, payload, event_type: Event
     candidate = Event(
         id=payload.id,
         item_id=item.id,
-        item_step_id=item_step.id,
+        item_step_id=item_step.id if item_step else None,
         station_id=payload.station_id,
         event_type_id=event_type.id,
         state_id=payload.state_id,
         qty=payload.qty,
+        from_item_step_id=payload.from_item_step_id,
+        from_done=payload.from_done,
         occurred_at=payload.occurred_at,
         received_at=utcnow(),
         supersedes_event_id=payload.supersedes_event_id,
@@ -250,12 +295,12 @@ def _validate_availability(db, item: Item, item_step, payload, event_type: Event
     # allows_partial_qty=False: this stage moves whole batches, never splits.
     # Enforced as "nothing may be left behind upstream": after the replay with
     # this event included, every position before the target must be empty.
-    stage = vocab.stages.get(item_step.stage_id)
+    stage = vocab.stages.get(item_step.stage_id) if item_step else None
     if stage is not None and not stage.allows_partial_qty and not event_type.is_rework:
         kept, _anomalies = effective_events(events + [candidate])
         ledger = ItemLedger(item, steps, vocab)
         ledger.apply_all(kept)
-        left_behind = ledger.available_upstream(item_step.id, payload.state_id)
+        left_behind = ledger.available_upstream(target)
         if left_behind:
             raise EventRejected(
                 (
@@ -299,6 +344,7 @@ def _differs(existing: Event, payload) -> bool:
         "event_type_id",
         "state_id",
         "qty",
+        "from_item_step_id",
         "reason_code_id",
         "supersedes_event_id",
         "note",
@@ -306,6 +352,8 @@ def _differs(existing: Event, payload) -> bool:
     for field in fields:
         if getattr(existing, field) != getattr(payload, field, None):
             return True
+    if bool(existing.from_done) != bool(getattr(payload, "from_done", False)):
+        return True
     payload_occurred = getattr(payload, "occurred_at", None)
     if payload_occurred is not None and payload_occurred.tzinfo is not None:
         if existing.occurred_at != payload_occurred:

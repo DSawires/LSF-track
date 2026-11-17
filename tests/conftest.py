@@ -123,8 +123,25 @@ class Factory:
     def stage(self, code: str) -> Stage:
         return self.db.scalars(sa.select(Stage).where(Stage.code == code)).one()
 
-    def state(self, code: str) -> EventState:
-        return self.db.scalars(sa.select(EventState).where(EventState.code == code)).one()
+    def legacy_states(self) -> dict[str, EventState]:
+        """The queued / in_progress / completed rows a pre-change database
+        holds. Not seeded any more; tests of legacy replay create them."""
+        rows = {}
+        for code, sort, is_complete, is_initial in [
+            ("queued", 10, False, True),
+            ("in_progress", 20, False, False),
+            ("completed", 30, True, False),
+        ]:
+            row = self.db.scalars(sa.select(EventState).where(EventState.code == code)).first()
+            if row is None:
+                row = EventState(
+                    code=code, name=code.replace("_", " ").title(), sort_order=sort,
+                    is_complete=is_complete, is_initial=is_initial,
+                )
+                self.db.add(row)
+                self.db.flush()
+            rows[code] = row
+        return rows
 
     def event_type(self, code: str) -> EventType:
         return self.db.scalars(sa.select(EventType).where(EventType.code == code)).one()
@@ -141,17 +158,26 @@ class Factory:
         self.db.flush()
         return stage
 
-    def item(self, code: str, qty: int, stage_codes: list[str] | None = None) -> Item:
+    def item(
+        self,
+        code: str,
+        qty: int,
+        stage_codes: list[str] | None = None,
+        sample_qty: int = 0,
+    ) -> Item:
         """An item, live on the floor -- creation is the handoff.
 
         `stage_codes` is its own production sequence; omitting it leaves an item
         with no stages, which is what the office screen shows as needing them.
+        `sample_qty` defaults to 0 here so tests about batch movement start with
+        the batch on the floor; the sample flow has tests of its own.
         """
         item = Item(
             code=code,
             project_id=self.project.id,
             description=f"{code} test batch",
             total_qty=qty,
+            sample_qty=sample_qty,
             drawing_revision="A",
         )
         self.db.add(item)
@@ -163,25 +189,38 @@ class Factory:
     def log(
         self,
         item: Item,
-        step_seq: int,
-        state_code: str,
+        step_seq: int | None,
         qty: int,
         at: datetime | None = None,
-        event_type: str = "move",
+        event_type: str | None = None,
         station_code: str | None = None,
         reason_code_id=None,
         event_id: uuid.UUID | None = None,
         supersedes: uuid.UUID | None = None,
         user_id: uuid.UUID | None = None,
+        legacy_state: str | None = None,
+        from_seq: int | None = None,
+        from_done: bool = False,
     ) -> Event:
-        step = next(s for s in item.steps if s.seq == step_seq)
+        """`qty` units arrived at step `step_seq`; `step_seq=None` is Done.
+        `legacy_state` writes a row the way the app did before states went.
+        `from_seq` / `from_done` name where the units came from."""
+        step = next(s for s in item.steps if s.seq == step_seq) if step_seq is not None else None
+        if event_type is None:
+            event_type = "move" if step is not None else "finish"
         payload = EventCreate(
             id=event_id or uuid.uuid4(),
             item_id=item.id,
-            item_step_id=step.id,
+            item_step_id=step.id if step else None,
             event_type_id=self.event_type(event_type).id,
-            state_id=self.state(state_code).id,
+            state_id=self.legacy_states()[legacy_state].id if legacy_state else None,
             qty=qty,
+            from_item_step_id=(
+                next(s for s in item.steps if s.seq == from_seq).id
+                if from_seq is not None
+                else None
+            ),
+            from_done=from_done,
             station_id=self.station(station_code).id if station_code else None,
             reason_code_id=reason_code_id,
             occurred_at=at or utcnow(),

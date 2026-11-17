@@ -10,12 +10,19 @@ carries no state of its own to fall out of date.
 
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+import re
+from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.models import Event, StatusBanner, User
+from app.storage import get_storage
+
+log = logging.getLogger(__name__)
+
+_BACKUP_STAMP = re.compile(r"lsf-(\d{8}-\d{6})Z")
 
 # The four the stylesheet can paint. Fixed by the UI, unlike stages and reason
 # codes -- a fifth colour is a frontend change, so there is nothing to gain
@@ -72,6 +79,33 @@ def user_activity(db: Session) -> dict:
     # account that has gone quiet, and that is the row at the bottom.
     rows.sort(key=lambda r: (r["last_event_at"] or "", r["last_login_at"] or ""), reverse=True)
     return {"users": rows}
+
+
+def backup_status() -> dict:
+    """The newest database dump in storage, read off the listing itself.
+
+    The backup job runs in its own container and a failure there only ever
+    reaches that container's log, where nobody is looking. This puts "when did
+    the last one land" on the page an admin already opens. Nothing is stored:
+    the timestamp is in the dump's name (`backups/lsf-YYYYmmdd-HHMMSSZ.sql.gz`,
+    see manage.py), and names sort chronologically.
+    """
+    try:
+        keys = get_storage().list("backups/")
+    except Exception:  # storage unreachable must not take the status page down
+        log.exception("could not list backups")
+        return {"available": False, "count": 0, "last_key": None, "last_at": None}
+    last_at = None
+    last_key = keys[-1] if keys else None
+    if last_key:
+        match = _BACKUP_STAMP.search(last_key)
+        if match:
+            last_at = (
+                datetime.strptime(match.group(1), "%Y%m%d-%H%M%S")
+                .replace(tzinfo=timezone.utc)
+                .isoformat()
+            )
+    return {"available": True, "count": len(keys), "last_key": last_key, "last_at": last_at}
 
 
 def current_banner(db: Session) -> dict:

@@ -1,7 +1,11 @@
 """Idempotent seed data.
 
-This file and the tests are the only places stage, station, state and event-type
-codes may appear as string literals. Running it twice changes nothing.
+This file and the tests are the only places stage, station and event-type codes
+may appear as string literals. Running it twice changes nothing.
+
+No event states are seeded: a unit is at a stage or it is not. Databases that
+already hold the legacy queued/in_progress/completed rows keep them, because
+old events reference them (see app/models.EventState).
 
 Insert-if-missing ONLY, never update: stages and their behaviour flags are
 runtime data that the factory tunes through the admin UI, and the entrypoint
@@ -15,7 +19,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from app.models import EventState, EventType, ReasonCode, Stage, Station
+from app.models import EventType, ReasonCode, Stage, Station
 
 STAGES = [
     # code, name, sort, requires_station, requires_external_po, is_terminal,
@@ -40,16 +44,15 @@ STATIONS = [
     ("upholstery_1", "upholstery", "Upholstery 1", 10),
 ]
 
-STATES = [
-    # code, name, sort, is_complete, is_initial
-    ("queued", "Queued", 10, False, True),
-    ("in_progress", "In progress", 20, False, False),
-    ("completed", "Completed", 30, True, False),
-]
-
 EVENT_TYPES = [
     # code, name, sort, flags dict
     ("move", "Stage movement", 10, {}),
+    (
+        "finish",
+        "Finished",
+        15,
+        {"is_finish": True, "requires_item_step": False},
+    ),
     (
         "rework_return",
         "Rework return",
@@ -121,19 +124,6 @@ def run(db: Session) -> None:
             Station,
             code,
             {"stage_id": stage_ids[stage_code], "name": name, "sort_order": sort},
-        )
-
-    for code, name, sort, is_complete, is_initial in STATES:
-        _insert_if_missing(
-            db,
-            EventState,
-            code,
-            {
-                "name": name,
-                "sort_order": sort,
-                "is_complete": is_complete,
-                "is_initial": is_initial,
-            },
         )
 
     for code, name, sort, flags in EVENT_TYPES:

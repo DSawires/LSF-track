@@ -14,14 +14,13 @@ from app.models import Event
 from tests.conftest import hours_ago
 
 
-def _event_body(factory, item, seq, state_code, qty, station_code=None, **extra):
+def _event_body(factory, item, seq, qty, station_code=None, **extra):
     step = next(s for s in item.steps if s.seq == seq)
     return {
         "id": str(extra.pop("event_id", uuid.uuid4())),
         "item_id": str(item.id),
         "item_step_id": str(step.id),
         "event_type_id": str(factory.event_type("move").id),
-        "state_id": str(factory.state(state_code).id),
         "station_id": str(factory.station(station_code).id) if station_code else None,
         "qty": qty,
         "occurred_at": hours_ago(1).isoformat(),
@@ -41,7 +40,7 @@ def test_login_bad_password_rejected(factory):
 
 def test_event_post_is_idempotent(world, client):
     factory, _stages, item = world
-    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    body = _event_body(factory, item, 10, 50, "carpentry_1")
 
     first = client.post("/api/events", json=body)
     assert first.status_code == 201
@@ -63,7 +62,7 @@ def test_event_post_is_idempotent(world, client):
 
 def test_divergent_replay_returns_stored_row(world, client):
     factory, _stages, item = world
-    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    body = _event_body(factory, item, 10, 50, "carpentry_1")
     assert client.post("/api/events", json=body).status_code == 201
 
     tampered = {**body, "qty": 49}
@@ -77,7 +76,7 @@ def test_divergence_covers_every_client_field_not_just_the_movement(world, clien
     """A reused UUID with only a different timestamp (or note) is still the
     client bug the divergent flag exists to catch."""
     factory, _stages, item = world
-    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    body = _event_body(factory, item, 10, 50, "carpentry_1")
     assert client.post("/api/events", json=body).status_code == 201
 
     shifted = {**body, "occurred_at": hours_ago(6).isoformat()}
@@ -93,7 +92,7 @@ def test_divergence_covers_every_client_field_not_just_the_movement(world, clien
 def test_archiving_an_item_writes_an_audit_event(world, client):
     factory, _stages, item = world
     assert client.post(
-        "/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1")
+        "/api/events", json=_event_body(factory, item, 10, 50, "carpentry_1")
     ).status_code == 201
 
     result = client.delete(f"/api/items/{item.id}")
@@ -116,8 +115,8 @@ def test_archiving_an_item_writes_an_audit_event(world, client):
 
 def test_batch_sync_reports_per_event_outcomes(world, client):
     factory, _stages, item = world
-    good = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
-    bad = {**_event_body(factory, item, 10, "queued", 10, "carpentry_1"),
+    good = _event_body(factory, item, 10, 50, "carpentry_1")
+    bad = {**_event_body(factory, item, 10, 10, "carpentry_1"),
            "item_id": str(uuid.uuid4())}
 
     response = client.post("/api/events/batch", json={"events": [good, bad]})
@@ -134,8 +133,8 @@ def test_batch_sync_reports_per_event_outcomes(world, client):
 def test_batch_with_internal_duplicate_stores_once_and_acks_both(world, client):
     """The same entry twice in one drain (a client bug) must not lose neighbours."""
     factory, _stages, item = world
-    entry = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
-    other = _event_body(factory, item, 10, "in_progress", 50, "carpentry_1")
+    entry = _event_body(factory, item, 10, 20, "carpentry_1")
+    other = _event_body(factory, item, 10, 20, "carpentry_1")
 
     response = client.post("/api/events/batch", json={"events": [entry, entry, other]})
     statuses = [r["status"] for r in response.json()["results"]]
@@ -154,7 +153,7 @@ def test_received_at_is_server_set_and_cannot_be_smuggled(world, client):
     from datetime import datetime, timezone
 
     factory, _stages, item = world
-    body = _event_body(factory, item, 10, "queued", 50, "carpentry_1")
+    body = _event_body(factory, item, 10, 50, "carpentry_1")
     body["received_at"] = "1999-01-01T00:00:00+00:00"  # ignored: not a schema field
 
     response = client.post("/api/events", json=body)
@@ -169,12 +168,10 @@ def test_batch_applies_in_occurred_at_order(world, client):
     occurred_at, so the downstream move validates against the upstream one that
     occurred first, whatever the array order."""
     factory, _stages, item = world
-    later = _event_body(
-        factory, item, 20, "queued", 50, "paint_1",
+    later = _event_body(factory, item, 20, 50, "paint_1",
         occurred_at=hours_ago(1).isoformat(),
     )
-    earlier = _event_body(
-        factory, item, 10, "completed", 50, "carpentry_1",
+    earlier = _event_body(factory, item, 10, 50, "carpentry_1",
         occurred_at=hours_ago(2).isoformat(),
     )
 
@@ -187,7 +184,7 @@ def test_batch_applies_in_occurred_at_order(world, client):
 
 def test_over_advance_rejected_over_http_with_reason(world, client):
     factory, _stages, item = world
-    body = _event_body(factory, item, 10, "queued", item.total_qty + 1, "carpentry_1")
+    body = _event_body(factory, item, 10, item.total_qty + 1, "carpentry_1")
     response = client.post("/api/events", json=body)
     assert response.status_code == 422
     assert response.json()["detail"]["field"] == "qty"
@@ -196,7 +193,7 @@ def test_over_advance_rejected_over_http_with_reason(world, client):
 
 def test_item_recent_events_endpoint(world, client):
     factory, _stages, item = world
-    client.post("/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1"))
+    client.post("/api/events", json=_event_body(factory, item, 10, 50, "carpentry_1"))
     response = client.get(f"/api/items/{item.id}/events")
     assert response.status_code == 200
     events = response.json()["events"]
@@ -219,7 +216,6 @@ def test_archived_item_rejects_events(client, factory):
         "item_id": str(item.id),
         "item_step_id": None,
         "event_type_id": str(factory.event_type("move").id),
-        "state_id": str(factory.state("queued").id),
         "qty": 5,
         "occurred_at": utcnow().isoformat(),
     }
@@ -231,7 +227,7 @@ def test_item_list_filters_by_derived_stage(world, client):
     factory, _stages, item = world
     client.post(
         "/api/events",
-        json=_event_body(factory, item, 10, "queued", 50, "carpentry_1"),
+        json=_event_body(factory, item, 10, 50, "carpentry_1"),
     )
     carpentry_id = str(factory.stage("carpentry").id)
     paint_id = str(factory.stage("paint").id)
@@ -263,7 +259,24 @@ def test_creating_an_item_gives_it_stages_and_hands_it_to_the_floor(client, fact
     # Sequence numbers in tens, so a stage can be slotted between two later.
     assert [s["seq"] for s in body["steps"]] == [10, 20]
 
-    # No separate release: the floor can log against it immediately.
+    # Every item starts as its sample: one unit, unless the office says more.
+    assert body["sample_qty"] == 1
+
+    # No separate release: the floor can log the sample immediately -- and
+    # only the sample, because the batch is not on the floor until it is done.
+    too_many = client.post(
+        "/api/events",
+        json={
+            "id": str(uuid.uuid4()),
+            "item_id": body["id"],
+            "item_step_id": body["steps"][0]["id"],
+            "event_type_id": str(factory.event_type("move").id),
+            "station_id": str(factory.station("carpentry_1").id),
+            "qty": 5,
+            "occurred_at": utcnow().isoformat(),
+        },
+    )
+    assert too_many.status_code == 422
     posted = client.post(
         "/api/events",
         json={
@@ -271,9 +284,8 @@ def test_creating_an_item_gives_it_stages_and_hands_it_to_the_floor(client, fact
             "item_id": body["id"],
             "item_step_id": body["steps"][0]["id"],
             "event_type_id": str(factory.event_type("move").id),
-            "state_id": str(factory.state("queued").id),
             "station_id": str(factory.station("carpentry_1").id),
-            "qty": 5,
+            "qty": 1,
             "occurred_at": utcnow().isoformat(),
         },
     )
@@ -309,7 +321,7 @@ def test_stages_freeze_once_the_floor_has_logged_against_them(client, factory):
     assert fixed.status_code == 200
     assert len(fixed.json()["steps"]) == 3
 
-    factory.log(item, 10, "queued", 4, station_code="carpentry_1")
+    factory.log(item, 10, 4, station_code="carpentry_1")
     factory.db.commit()
 
     frozen = client.put(
@@ -512,13 +524,14 @@ def test_image_deletion_is_admin_only(world, client, factory, tmp_path, monkeypa
 
 def test_initial_stage_distribution_at_creation(client, factory):
     """A batch that is already part-built when it reaches the system: the
-    quantities are placed as ordinary queued events, and the rest is unstarted."""
+    quantities are placed as ordinary arrivals, and the rest is unstarted. It
+    has no sample to run, and asking for both is refused."""
     factory.db.commit()
     stage_ids = {s["code"]: s["id"] for s in client.get("/api/reference").json()["stages"]}
     base = {
         "project_id": str(factory.project.id),
         "description": "already mid-production", "total_qty": 100,
-        "drawing_revision": "A",
+        "sample_qty": 0, "drawing_revision": "A",
         "stage_ids": [stage_ids["carpentry"], stage_ids["paint"], stage_ids["packing"]],
     }
 
@@ -535,15 +548,22 @@ def test_initial_stage_distribution_at_creation(client, factory):
     assert created.status_code == 201
 
     state = client.get(f"/api/items/{created.json()['id']}").json()["state"]
-    by_pos = {(p["seq"], p["state_code"]): p["qty"] for p in state["positions"]}
-    assert by_pos[(10, "queued")] == 50
-    assert by_pos[(20, "queued")] == 30
+    by_pos = {p["seq"]: p["qty"] for p in state["positions"]}
+    assert by_pos[10] == 50
+    assert by_pos[20] == 30
     assert state["unstarted_qty"] == 20
+
+    with_sample = client.post(
+        "/api/items",
+        json={**base, "code": "DIST-2", "sample_qty": 1, "initial_quantities": {"10": 5}},
+    )
+    assert with_sample.status_code == 422
+    assert "sample" in with_sample.json()["detail"]
 
 
 def test_item_search_and_aging_filters(world, client):
     factory, _stages, item = world
-    client.post("/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1"))
+    client.post("/api/events", json=_event_body(factory, item, 10, 50, "carpentry_1"))
 
     found = client.get("/api/items?q=api-1").json()["items"]
     assert [i["code"] for i in found] == ["API-1"]
@@ -595,7 +615,7 @@ def test_icon_kind_surfaces_on_item_list(world, client, tmp_path, monkeypatch):
 
 def test_remove_item_archives_with_history_deletes_without(world, client):
     factory, _stages, item = world
-    client.post("/api/events", json=_event_body(factory, item, 10, "queued", 50, "carpentry_1"))
+    client.post("/api/events", json=_event_body(factory, item, 10, 50, "carpentry_1"))
 
     # API-1 has events: archived, not deleted; disappears from lists and reports.
     result = client.delete(f"/api/items/{item.id}")
@@ -625,7 +645,7 @@ def test_remove_project_refused_until_items_gone(world, client):
 
     client.delete(f"/api/items/{item.id}")  # archives it
     archived = client.delete(f"/api/projects/{factory.project.id}")
-    assert archived.json() == {"archived": True}
+    assert archived.json() == {"archived": True, "archived_items": 0}
 
 
 def test_archiving_a_project_ignores_items_in_other_projects(client, factory):
@@ -639,7 +659,7 @@ def test_archiving_a_project_ignores_items_in_other_projects(client, factory):
     busy = factory.item("BUSY-1", 10)  # active, and in a different project
     factory.db.commit()
 
-    assert client.delete(f"/api/projects/{empty.id}").json() == {"archived": True}
+    assert client.delete(f"/api/projects/{empty.id}").json() == {"archived": True, "archived_items": 0}
 
     refused = client.delete(f"/api/projects/{factory.project.id}")
     assert refused.status_code == 409
@@ -666,7 +686,7 @@ def test_batch_cannot_shrink_below_what_the_log_moved(world, client):
     """The log wins over a typed number: units already in production are a
     fact, so the batch size cannot be cut underneath them."""
     factory, _stages, item = world
-    factory.log(item, 10, "queued", 30, at=hours_ago(2), station_code="carpentry_1")
+    factory.log(item, 10, 30, at=hours_ago(2), station_code="carpentry_1")
     factory.db.commit()
 
     refused = client.patch(f"/api/items/{item.id}", json={"total_qty": 10})
@@ -676,14 +696,14 @@ def test_batch_cannot_shrink_below_what_the_log_moved(world, client):
 
 
 def test_purge_destroys_an_item_and_its_events(world, client):
-    """The deliberate exception to the append-only rule, for batches that should
-    never have existed. Archiving stays the default."""
+    """Deleting for good takes the item's events with it. Archiving stays the
+    default, and the purge is written to the server log with who did it."""
     import sqlalchemy as sa
 
     from app.models import Event, Item
 
     factory, _stages, item = world
-    factory.log(item, 10, "queued", 10, at=hours_ago(2), station_code="carpentry_1")
+    factory.log(item, 10, 10, at=hours_ago(2), station_code="carpentry_1")
     factory.db.commit()
     item_id = item.id
 
@@ -710,8 +730,8 @@ def test_purge_survives_a_correction_chain(world, client):
     from app.models import Event, Item
 
     factory, _stages, item = world
-    logged = factory.log(item, 10, "queued", 10, at=hours_ago(4), station_code="carpentry_1")
-    factory.log(item, 10, "completed", 10, at=hours_ago(3), station_code="carpentry_1",
+    logged = factory.log(item, 10, 10, at=hours_ago(4), station_code="carpentry_1")
+    factory.log(item, 10, 10, at=hours_ago(3), station_code="carpentry_1",
                 event_type="correction", supersedes=logged.id)
     factory.db.commit()
     item_id = item.id
@@ -741,7 +761,7 @@ def test_project_rename_and_reactivate(client, factory):
     assert renamed.json()["client"] == "ACME"
     assert renamed.json()["code"] == factory.project.code  # code is fixed
 
-    assert client.delete(f"/api/projects/{project_id}").json() == {"archived": True}
+    assert client.delete(f"/api/projects/{project_id}").json() == {"archived": True, "archived_items": 0}
     assert client.patch(f"/api/projects/{project_id}", json={"is_active": True}).json()["is_active"] is True
 
 

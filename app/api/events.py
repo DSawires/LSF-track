@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import current_user
-from app.models import Event, User
+from app.models import Event, Item, User
 from app.schemas import EventBatch, EventCreate
 from app.services.events import EventRejected, record_event
 
@@ -24,7 +26,14 @@ def _event_payload(event: Event) -> dict:
         "station_id": str(event.station_id) if event.station_id else None,
         "event_type_id": str(event.event_type_id),
         "state_id": str(event.state_id) if event.state_id else None,
+        # Legacy rows only: the reference payload no longer carries states, so
+        # the name travels with the event for the history list to show.
+        "state_name": event.state.name if event.state_id and event.state else None,
         "qty": event.qty,
+        "from_item_step_id": (
+            str(event.from_item_step_id) if event.from_item_step_id else None
+        ),
+        "from_done": bool(event.from_done),
         "reason_code_id": str(event.reason_code_id) if event.reason_code_id else None,
         "occurred_at": event.occurred_at.isoformat(),
         "received_at": event.received_at.isoformat(),
@@ -62,6 +71,15 @@ def post_event(
     }
 
 
+def _occurred_sort_key(entry: EventCreate) -> datetime:
+    # An entry whose timestamp has no timezone is refused on its own a few lines
+    # down, with a reason. It must not get there by making the sort raise --
+    # naive and aware datetimes do not compare -- and taking the whole batch
+    # down with a 500.
+    moment = entry.occurred_at
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
 @router.post("/batch")
 def post_batch(
     payload: EventBatch,
@@ -79,8 +97,18 @@ def post_batch(
     against itself no matter how the queue was assembled. Clients match results
     by id, so the reordering is invisible to them.
     """
+    # Lock every item this batch touches, once and in id order, before the
+    # first entry: record_event locks each item as it goes, and two phones
+    # draining queues that name the same items in different orders would
+    # otherwise be able to deadlock each other.
+    item_ids = sorted({entry.item_id for entry in payload.events}, key=str)
+    if item_ids:
+        db.execute(
+            sa.select(Item.id).where(Item.id.in_(item_ids)).order_by(Item.id).with_for_update()
+        ).all()
+
     results = []
-    for entry in sorted(payload.events, key=lambda e: e.occurred_at):
+    for entry in sorted(payload.events, key=_occurred_sort_key):
         try:
             # A SAVEPOINT per entry: an unexpected failure on one event must
             # neither 500 the whole drain (rolling back events the client is

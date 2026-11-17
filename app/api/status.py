@@ -32,6 +32,12 @@ def user_status(
     return status_service.user_activity(db)
 
 
+@router.get("/backup")
+def backup(admin: User = Depends(require_admin)) -> dict:
+    """When the last database dump landed in storage, and how many are kept."""
+    return status_service.backup_status()
+
+
 @router.get("/banner")
 def read_banner(
     db: Session = Depends(get_db),

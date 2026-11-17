@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 from app.db import get_db, utcnow
 from app.deps import current_user
 from app.models import (
-    EventState,
     EventType,
     Project,
     ReasonCode,
@@ -26,6 +25,7 @@ from app.models import (
     User,
 )
 from app.services.status import current_banner
+from app.services.sync import items_token
 
 router = APIRouter(prefix="/api", tags=["reference"])
 
@@ -34,13 +34,15 @@ router = APIRouter(prefix="/api", tags=["reference"])
 def reference(db: Session = Depends(get_db), user: User = Depends(current_user)) -> dict:
     stages = list(db.scalars(sa.select(Stage).order_by(Stage.sort_order, Stage.code)))
     stations = list(db.scalars(sa.select(Station).order_by(Station.sort_order, Station.code)))
-    states = list(db.scalars(sa.select(EventState).order_by(EventState.sort_order)))
     event_types = list(db.scalars(sa.select(EventType).order_by(EventType.sort_order)))
     reason_codes = list(db.scalars(sa.select(ReasonCode).order_by(ReasonCode.sort_order)))
     projects = list(db.scalars(sa.select(Project).order_by(Project.code)))
 
     return {
         "server_time": utcnow().isoformat(),
+        # Changes whenever anything the item list is drawn from does. A phone
+        # holding the same token skips the /api/items replay on this sync.
+        "items_token": items_token(db),
         "banner": current_banner(db),
         "stages": [
             {
@@ -68,18 +70,6 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
             }
             for s in stations
         ],
-        "states": [
-            {
-                "id": str(s.id),
-                "code": s.code,
-                "name": s.name,
-                "sort_order": s.sort_order,
-                "is_complete": s.is_complete,
-                "is_initial": s.is_initial,
-                "is_active": s.is_active,
-            }
-            for s in states
-        ],
         "event_types": [
             {
                 "id": str(t.id),
@@ -91,6 +81,7 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
                 "is_rework": t.is_rework,
                 "is_release": t.is_release,
                 "is_revision_bump": t.is_revision_bump,
+                "is_finish": t.is_finish,
                 "moves_quantity": t.moves_quantity,
                 "requires_item_step": t.requires_item_step,
                 "requires_reason_code": t.requires_reason_code,

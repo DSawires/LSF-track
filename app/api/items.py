@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 
 import sqlalchemy as sa
@@ -10,7 +11,6 @@ from app.db import get_db, utcnow
 from app.deps import current_user, require_admin
 from app.models import (
     Event,
-    EventType,
     Item,
     ItemImage,
     ItemStep,
@@ -21,11 +21,16 @@ from app.schemas import ItemCreate, ItemStepsUpdate, ItemUpdate, RevisionBumpReq
 from app.services import reports
 from app.services.items import (
     ItemSetupError,
+    archive_item,
     assign_steps,
     bump_revision,
     place_initial_quantities,
+    references_a_step,
     steps_are_frozen,
 )
+from app.services.sync import items_token
+
+log = logging.getLogger(__name__)
 
 
 def _locked_item_ids(db: Session, item_ids: list[uuid.UUID]) -> set[uuid.UUID]:
@@ -39,7 +44,7 @@ def _locked_item_ids(db: Session, item_ids: list[uuid.UUID]) -> set[uuid.UUID]:
     return set(
         db.scalars(
             sa.select(Event.item_id)
-            .where(Event.item_id.in_(item_ids), Event.item_step_id.is_not(None))
+            .where(Event.item_id.in_(item_ids), references_a_step())
             .distinct()
         )
     )
@@ -71,6 +76,7 @@ def _item_payload(item: Item, icon_url: str | None = None, steps_locked: bool = 
         "project_id": str(item.project_id),
         "description": item.description,
         "total_qty": item.total_qty,
+        "sample_qty": item.sample_qty,
         "drawing_revision": item.drawing_revision,
         "created_at": item.created_at.isoformat() if item.created_at else None,
         # Whether the floor has logged against these stages yet, which is what
@@ -91,6 +97,11 @@ def list_items(
     q: str | None = None,
     include_archived: bool = False,
 ) -> dict:
+    # Taken before the rows are read, never after: a write landing in between
+    # then leaves the phone holding newer data under an older token, and its
+    # next sync simply fetches again. The other order would let it keep stale
+    # data under a token that says it is current.
+    token = items_token(db)
     query = sa.select(Item).options(selectinload(Item.steps)).order_by(Item.code)
     if not include_archived:
         query = query.where(Item.is_active.is_(True))
@@ -129,7 +140,7 @@ def list_items(
             **_item_payload(item, icons.get(item.id), steps_locked=item.id in locked),
             "state": item_state,
         })
-    return {"items": rows}
+    return {"items": rows, "token": token}
 
 
 @router.get("/{item_id}")
@@ -179,7 +190,20 @@ def item_events(
         .offset(max(offset, 0))
         .limit(min(max(limit, 1), 100))
     )
-    return {"events": [_event_payload(e) for e in rows], "total": total}
+    # Which of these a correction has already superseded. Without it the phone
+    # cannot tell a voided entry from a live one: it would list both the same
+    # way and offer to void the voided one again.
+    superseded = set(
+        db.scalars(
+            sa.select(Event.supersedes_event_id).where(
+                Event.item_id == item_id, Event.supersedes_event_id.is_not(None)
+            )
+        )
+    )
+    return {
+        "events": [{**_event_payload(e), "superseded": e.id in superseded} for e in rows],
+        "total": total,
+    }
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -191,8 +215,12 @@ def create_item(
     """Create an item and hand it to the floor in one step.
 
     There is no separate release: an item exists because someone is building it,
-    so it gets its stages here and is loggable immediately. `initial_quantities`
-    is for a batch that is already part-built when it reaches the system.
+    so it gets its stages here and is loggable immediately -- the sample first,
+    the batch once the sample is done. `initial_quantities` is for a batch that
+    is already part-built when it reaches the system, and needs `sample_qty` 0.
+
+    Projects normally arrive whole through the file import (app/api/imports.py);
+    this is the one-item path underneath it.
     """
     if db.get(Project, payload.project_id) is None:
         raise HTTPException(422, "unknown project")
@@ -209,6 +237,7 @@ def create_item(
         project_id=payload.project_id,
         description=payload.description.strip(),
         total_qty=payload.total_qty,
+        sample_qty=payload.sample_qty,
         drawing_revision=payload.drawing_revision.strip(),
     )
     db.add(item)
@@ -272,6 +301,10 @@ def update_item(
     event, never by a quiet field edit. `total_qty` cannot be cut below what
     the log has already moved out of 'not started': the log wins over a typed
     number, and a negative unstarted count is not a thing that can be true.
+
+    `is_active: true` brings an archived item back onto the lists and reports,
+    with its history as it was -- archiving is a tap, and a mis-tap must not
+    leave "delete for good" as the only button left.
     """
     item = db.get(Item, item_id)
     if item is None:
@@ -296,9 +329,26 @@ def update_item(
     if "description" in fields:
         fields["description"] = (fields["description"] or "").strip()
 
+    if "is_active" in fields:
+        # Only the way back is a field edit. Archiving goes through DELETE,
+        # which writes the archive event; a PATCH to false would skip it.
+        if fields["is_active"] is not True:
+            raise HTTPException(422, "archive an item with DELETE; this only reactivates one")
+        if item.is_active:
+            del fields["is_active"]
+        else:
+            project = db.get(Project, fields.get("project_id") or item.project_id)
+            if project is not None and not project.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"project {project.code} is archived; reactivate it first",
+                )
+            log.info("item %s reactivated by %s", item.code, admin.username)
+
     if "total_qty" in fields:
         state = reports.item_state(db, [item.id]).get(str(item.id))
-        committed = item.total_qty - state["unstarted_qty"] if state else 0
+        # Batch units only: the sample is not part of total_qty.
+        committed = item.total_qty - state["production_unstarted_qty"] if state else 0
         if fields["total_qty"] < committed:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -321,15 +371,14 @@ def remove_item(
 ) -> dict:
     """Archive an item with history; hard-delete one that never saw the floor.
 
-    The event log is append-only, so an item that has events is never destroyed
-    -- it is deactivated, which removes it from every list and report while its
-    history stays intact and derivable.
+    The default is the gentle one: an item that has events is deactivated,
+    which removes it from every list and report while its history stays intact
+    and derivable, and it can be reactivated (PATCH `is_active`).
 
-    `purge=true` is the deliberate exception, for items that should never have
-    existed at all (a mistyped duplicate, a test batch): it destroys the item's
-    events along with it. This is the one operation in the system that erases
-    log rows, it is admin-only, and it is irreversible -- archiving is what you
-    want for anything that was ever really built.
+    `purge=true` deletes for good: the item, its stages, its photos and every
+    event logged against it. Admin-only and irreversible, so it is written to
+    the server log with who did it and how much went -- the events table cannot
+    record its own deletion.
     """
     item = db.get(Item, item_id)
     if item is None:
@@ -365,36 +414,21 @@ def remove_item(
             .execution_options(synchronize_session=False)
         )
         db.flush()
+        code = item.code
         _destroy_item(db, item)
+        log.warning(
+            "item %s (%s) purged by %s: %d event(s) deleted with it",
+            code, item_id, admin.username, purged,
+        )
         return {"archived": False, "deleted": True, "purged_events": purged}
 
     if has_events:
-        item.is_active = False
-        # Archiving removes the item's quantities from WIP; that must be a
-        # fact in the log (who, when), not a silent flag flip.
-        archive_type = db.scalars(
-            sa.select(EventType)
-            .where(EventType.is_archive.is_(True), EventType.is_active.is_(True))
-            .limit(1)
-        ).first()
-        if archive_type is not None:
-            db.add(
-                Event(
-                    id=uuid.uuid4(),
-                    item_id=item.id,
-                    event_type_id=archive_type.id,
-                    qty=0,
-                    occurred_at=utcnow(),
-                    received_at=utcnow(),
-                    user_id=admin.id,
-                    submitted_by_user_id=admin.id,
-                    note="item archived",
-                )
-            )
-        db.flush()
+        archive_item(db, item, admin)
         return {"archived": True, "deleted": False}
 
+    code = item.code
     _destroy_item(db, item)
+    log.info("item %s (%s) deleted by %s; it had no events", code, item_id, admin.username)
     return {"archived": False, "deleted": True, "purged_events": 0}
 
 

@@ -33,10 +33,14 @@ depends_on = None
 def upgrade() -> None:
     # PostgreSQL drops a column's foreign key with the column, so the two
     # unnamed constraints from the initial schema need no separate handling.
-    op.drop_column('items', 'route_template_id')
-    op.drop_column('items', 'released_by_user_id')
-    op.drop_column('items', 'released_at')
-    op.drop_column('items', 'released_revision')
+    # batch_alter_table is a no-op wrapper there -- the same four ALTERs -- and
+    # the copy-and-move SQLite needs: it cannot drop a column that carries a
+    # foreign key, which is what broke `manage.py migrate` from empty on SQLite.
+    with op.batch_alter_table('items') as batch:
+        batch.drop_column('route_template_id')
+        batch.drop_column('released_by_user_id')
+        batch.drop_column('released_at')
+        batch.drop_column('released_revision')
 
     op.drop_index('ix_route_template_steps_route_template_id', table_name='route_template_steps')
     op.drop_table('route_template_steps')
@@ -73,17 +77,18 @@ def downgrade() -> None:
         'route_template_steps', ['route_template_id'], unique=False,
     )
 
-    op.add_column('items', sa.Column('route_template_id', sa.Uuid(), nullable=True))
-    op.create_foreign_key(
-        'items_route_template_id_fkey', 'items', 'route_templates',
-        ['route_template_id'], ['id'],
-    )
-    op.add_column('items', sa.Column('released_at', sa.DateTime(timezone=True), nullable=True))
-    op.add_column('items', sa.Column('released_by_user_id', sa.Uuid(), nullable=True))
-    op.create_foreign_key(
-        'items_released_by_user_id_fkey', 'items', 'users', ['released_by_user_id'], ['id'],
-    )
-    op.add_column('items', sa.Column('released_revision', sa.String(length=32), nullable=True))
+    with op.batch_alter_table('items') as batch:
+        batch.add_column(sa.Column('route_template_id', sa.Uuid(), nullable=True))
+        batch.create_foreign_key(
+            'items_route_template_id_fkey', 'route_templates',
+            ['route_template_id'], ['id'],
+        )
+        batch.add_column(sa.Column('released_at', sa.DateTime(timezone=True), nullable=True))
+        batch.add_column(sa.Column('released_by_user_id', sa.Uuid(), nullable=True))
+        batch.create_foreign_key(
+            'items_released_by_user_id_fkey', 'users', ['released_by_user_id'], ['id'],
+        )
+        batch.add_column(sa.Column('released_revision', sa.String(length=32), nullable=True))
 
     # An item with steps was, under the old model, a released item.
     op.execute(

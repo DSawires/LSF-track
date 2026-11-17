@@ -16,8 +16,6 @@ from sqlalchemy.orm import Session
 
 from app.db import utcnow
 from app.models import (
-    Event,
-    EventState,
     EventType,
     Item,
     Project,
@@ -80,14 +78,16 @@ def run(db: Session) -> None:
 
     now = utcnow()
     items_spec = [
-        ("BST-120", "HOTEL-A", "Bedside table, walnut", 120, 9),
-        ("WRD-040", "HOTEL-A", "Wardrobe, 3-door", 40, 6),
-        ("DSK-015", "VILLA-B", "Writing desk", 15, 4),
-        # 0 days: created just now, so the walk below logs nothing against it.
-        ("CHR-060", "VILLA-B", "Dining chair", 60, 0),
+        # code, project, description, batch qty, days ago, sample qty
+        ("BST-120", "HOTEL-A", "Bedside table, walnut", 120, 9, 1),
+        ("WRD-040", "HOTEL-A", "Wardrobe, 3-door", 40, 6, 1),
+        ("DSK-015", "VILLA-B", "Writing desk", 15, 4, 0),
+        # 0 days: created just now, so the walk below logs nothing against it --
+        # its sample is waiting to start.
+        ("CHR-060", "VILLA-B", "Dining chair", 60, 0, 1),
     ]
-    states = {s.code: s for s in db.scalars(sa.select(EventState))}
     move_type = db.scalars(sa.select(EventType).where(EventType.code == "move")).first()
+    finish_type = db.scalars(sa.select(EventType).where(EventType.code == "finish")).first()
     # First station of each stage, for stages that record one.
     stations_by_stage: dict = {}
     from app.models import Station
@@ -95,7 +95,7 @@ def run(db: Session) -> None:
     for station in db.scalars(sa.select(Station).order_by(Station.sort_order)):
         stations_by_stage.setdefault(station.stage_id, station.id)
 
-    for code, project_code, description, qty, days_ago in items_spec:
+    for code, project_code, description, qty, days_ago, sample_qty in items_spec:
         item = db.scalars(sa.select(Item).where(Item.code == code)).first()
         if item is not None:
             continue
@@ -105,60 +105,48 @@ def run(db: Session) -> None:
             project_id=projects[project_code].id,
             description=description,
             total_qty=qty,
+            sample_qty=sample_qty,
             drawing_revision="A",
             created_at=started,
         )
         db.add(item)
         db.flush()
         steps = assign_steps(db, item, casegoods, created_at=started)
-
-        # Walk some quantity down the stages, leaving a spread of ages behind.
         moment = started
-        moving = qty
-        for depth, step in enumerate(steps):
-            if moving <= 0:
-                break
-            for state_code in ("queued", "in_progress", "completed"):
-                moment += timedelta(hours=6 + depth * 3)
+
+        # The sample walks the whole sequence first; the batch exists after.
+        if sample_qty:
+            for step in steps:
+                moment += timedelta(hours=4)
                 if moment >= now:
                     break
-                _log(
-                    db,
-                    user,
-                    item,
-                    step.id,
-                    move_type.id,
-                    states[state_code].id,
-                    moving,
-                    moment,
-                    stations_by_stage.get(step.stage_id),
-                )
-                if state_code == "completed":
-                    # Leave roughly a third behind at each stage boundary.
-                    moving -= max(moving // 3, 0) if depth < len(steps) - 1 else 0
+                _log(db, user, item, step, move_type, sample_qty, moment, stations_by_stage)
+            moment += timedelta(hours=4)
             if moment >= now:
+                continue
+            _log(db, user, item, None, finish_type, sample_qty, moment, stations_by_stage)
+
+        # Walk the batch down the stages, leaving a spread of ages behind.
+        moving = qty
+        for depth, step in enumerate(steps):
+            moment += timedelta(hours=18 + depth * 9)
+            if moving <= 0 or moment >= now:
                 break
+            _log(db, user, item, step, move_type, moving, moment, stations_by_stage)
+            # Leave roughly a third behind at each stage.
+            moving -= moving // 3
 
 
-def _log(db, user, item, step_id, type_id, state_id, qty, moment, station_id=None) -> None:
-    if db.scalars(
-        sa.select(Event).where(
-            Event.item_id == item.id,
-            Event.item_step_id == step_id,
-            Event.state_id == state_id,
-        )
-    ).first():
-        return
+def _log(db, user, item, step, event_type, qty, moment, stations_by_stage) -> None:
     record_event(
         db,
         EventCreate(
             id=uuid.uuid4(),
             item_id=item.id,
-            item_step_id=step_id,
-            event_type_id=type_id,
-            state_id=state_id,
+            item_step_id=step.id if step else None,
+            event_type_id=event_type.id,
             qty=qty,
-            station_id=station_id,
+            station_id=stations_by_stage.get(step.stage_id) if step else None,
             occurred_at=moment,
         ),
         user,

@@ -22,6 +22,7 @@ import uuid
 from app.db import get_db
 from app.deps import current_user, require_admin
 from app.models import Item, Project, Stage, Station, User
+from app.services.items import archive_item
 from app.schemas import (
     ProjectCreate,
     ProjectUpdate,
@@ -206,29 +207,43 @@ def update_project(
 @router.delete("/projects/{project_id}")
 def archive_project(
     project_id: uuid.UUID,
+    with_items: bool = False,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ) -> dict:
+    """Archive a project.
+
+    `with_items=true` archives its active items along with it, each with its
+    own archive event, exactly as archiving them one at a time would. That is
+    how a finished job leaves the floor: a delivered hotel is a couple of
+    hundred items, and every one left active is replayed on every report and
+    every phone's refresh for as long as it stays.
+
+    Without the flag, active items block the archive and nothing is touched.
+    """
     project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown project")
-    # Only THIS project's items can block it. The message names them, because
+    # Only THIS project's items are in play. A refusal names them, because
     # "2 active items" against a flat item list is how an admin ends up blaming
     # another job's work for a project that will not archive.
-    blocking = list(
+    active = list(
         db.scalars(
-            sa.select(Item.code)
+            sa.select(Item)
             .where(Item.project_id == project_id, Item.is_active.is_(True))
             .order_by(Item.code)
         )
     )
-    if blocking:
-        named = ", ".join(blocking[:5]) + (" …" if len(blocking) > 5 else "")
+    if active and not with_items:
+        codes = [item.code for item in active]
+        named = ", ".join(codes[:5]) + (" …" if len(codes) > 5 else "")
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"project has {len(blocking)} active item(s) in it ({named}); "
+            f"project has {len(codes)} active item(s) in it ({named}); "
             "remove or archive those first",
         )
+    for item in active:
+        archive_item(db, item, admin)
     project.is_active = False
     db.flush()
-    return {"archived": True}
+    return {"archived": True, "archived_items": len(active)}

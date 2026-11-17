@@ -1,7 +1,7 @@
 """The two v1 reports, plus the exceptions list.
 
-Both reports iterate over whatever is in `stages` and `event_states`. Neither knows
-the name of a single stage. Inserting a stage at runtime changes their output and
+Both reports iterate over whatever is in `stages`. Neither knows the name of a
+single stage. Inserting a stage at runtime changes their output and
 nothing else -- there is a test that does exactly that.
 """
 
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.db import utcnow
-from app.ledger import Bucket, Vocabulary
+from app.ledger import Bucket
 from app.models import Item
 from app.services.derivation import Derivation, derive, reference_maps
 
@@ -33,17 +33,6 @@ def _stage_payload(stage) -> dict:
         "allows_partial_qty": stage.allows_partial_qty,
         "is_terminal": stage.is_terminal,
         "max_days_in_state": stage.max_days_in_state,
-    }
-
-
-def _state_payload(state) -> dict:
-    return {
-        "id": str(state.id),
-        "code": state.code,
-        "name": state.name,
-        "sort_order": state.sort_order,
-        "is_complete": state.is_complete,
-        "is_initial": state.is_initial,
     }
 
 
@@ -81,17 +70,14 @@ def wip_report(
 ) -> dict:
     """Work in progress by stage and station.
 
-    Queue depth is the quantity sitting in the earliest state of a stage -- earliest
-    by `sort_order`, not by name -- so a factory that renames or adds a state gets a
-    correct report without a code change.
+    A unit is at a stage or it is not, so a stage's depth is simply what rests
+    there. Units with no station yet are the ones waiting for a free booth.
+    Sample units are counted in, and also shown separately, because a sample
+    holding up a whole batch is worth seeing on its own.
     """
     now = now or utcnow()
     derivation = _derive_scope(db, project_id)
-    vocab: Vocabulary = derivation.vocab
     refs = reference_maps(db)
-    states = vocab.ordered_states
-    queue_state = next((s for s in states if s.is_initial), states[0] if states else None)
-    queue_state_id = queue_state.id if queue_state else None
 
     stage_rows: dict[uuid.UUID, dict] = {}
     unstarted_qty = 0
@@ -111,25 +97,20 @@ def wip_report(
             stage.id,
             {
                 "stage": _stage_payload(stage),
-                "by_state": {state.code: 0 for state in states},
                 "total_qty": 0,
-                "queue_qty": 0,
+                "sample_qty": 0,
                 "reworked_qty": 0,
                 "item_ids": set(),
                 "oldest_arrived_at": bucket.oldest_arrived_at,
                 "stations": {},
             },
         )
-        state = refs["states"].get(position.state_id)
-        if state is not None:
-            row["by_state"][state.code] = row["by_state"].get(state.code, 0) + bucket.qty
         row["total_qty"] += bucket.qty
+        row["sample_qty"] += bucket.sample_qty
         row["reworked_qty"] += bucket.reworked_qty
         row["item_ids"].add(item.id)
         if bucket.oldest_arrived_at < row["oldest_arrived_at"]:
             row["oldest_arrived_at"] = bucket.oldest_arrived_at
-        if position.state_id == queue_state_id:
-            row["queue_qty"] += bucket.qty
 
         for station_id, qty in bucket.by_station.items():
             station = refs["stations"].get(station_id) if station_id else None
@@ -143,12 +124,9 @@ def wip_report(
                         else None
                     ),
                     "sort_order": station.sort_order if station else 9999,
-                    "by_state": {s.code: 0 for s in states},
                     "total_qty": 0,
                 },
             )
-            if state is not None:
-                entry["by_state"][state.code] = entry["by_state"].get(state.code, 0) + qty
             entry["total_qty"] += qty
 
     stages_out = []
@@ -159,9 +137,8 @@ def wip_report(
         stages_out.append(
             {
                 "stage": row["stage"],
-                "by_state": row["by_state"],
                 "total_qty": row["total_qty"],
-                "queue_qty": row["queue_qty"],
+                "sample_qty": row["sample_qty"],
                 "reworked_qty": row["reworked_qty"],
                 "item_count": len(row["item_ids"]),
                 "oldest_days": _days_since(row["oldest_arrived_at"], now),
@@ -174,8 +151,6 @@ def wip_report(
 
     return {
         "generated_at": now.isoformat(),
-        "states": [_state_payload(state) for state in states],
-        "queue_state_code": queue_state.code if queue_state else None,
         "stages": stages_out,
         "unstarted": {"qty": unstarted_qty, "item_count": unstarted_items},
         "totals": {
@@ -193,9 +168,9 @@ def aging_report(
     stage_id: uuid.UUID | None = None,
     min_days: float | None = None,
 ) -> dict:
-    """Days in current state, longest first.
+    """Days at the current stage, longest first.
 
-    One row per item *and position*, because a batch splits: 40 of the 120 can be in
+    One row per item *and stage*, because a batch splits: 40 of the 120 can be in
     paint while 50 wait at QC, and those two facts have different ages. Age is taken
     from the oldest unit still resting there, FIFO, so a partial advance does not
     reset the clock on the units left behind.
@@ -210,7 +185,6 @@ def aging_report(
         if stage_id is not None and position.stage_id != stage_id:
             continue
         stage = refs["stages"].get(position.stage_id) if position.stage_id else None
-        state = refs["states"].get(position.state_id) if position.state_id else None
         stations = [
             refs["stations"].get(station_id)
             for station_id in bucket.by_station
@@ -226,11 +200,9 @@ def aging_report(
                     "project_id": str(item.project_id),
                 },
                 "stage": _stage_payload(stage) if stage else None,
-                "state": _state_payload(state) if state else None,
-                "label": (
-                    f"{stage.name} / {state.name}" if stage and state else UNSTARTED_LABEL
-                ),
+                "label": stage.name if stage else UNSTARTED_LABEL,
                 "qty": bucket.qty,
+                "sample_qty": bucket.sample_qty,
                 "reworked_qty": bucket.reworked_qty,
                 "stations": [
                     {"id": str(s.id), "code": s.code, "name": s.name} for s in stations if s
@@ -265,18 +237,17 @@ def item_state(db: Session, item_ids: list[uuid.UUID], now: datetime | None = No
         for bucket in buckets:
             position = bucket.position
             stage = refs["stages"].get(position.stage_id) if position.stage_id else None
-            state = refs["states"].get(position.state_id) if position.state_id else None
             positions.append(
                 {
                     "item_step_id": str(position.item_step_id) if position.item_step_id else None,
                     "stage_id": str(stage.id) if stage else None,
                     "stage_code": stage.code if stage else None,
                     "stage_name": stage.name if stage else UNSTARTED_LABEL,
-                    "state_id": str(state.id) if state else None,
-                    "state_code": state.code if state else None,
                     "seq": position.seq,
                     "qty": bucket.qty,
+                    "sample_qty": bucket.sample_qty,
                     "reworked_qty": bucket.reworked_qty,
+                    "station_ids": [str(sid) for sid in bucket.by_station if sid is not None],
                     "since": bucket.oldest_arrived_at.isoformat(),
                     "days_in_state": _days_since(bucket.oldest_arrived_at, now),
                     "overdue": _overdue(stage, bucket.oldest_arrived_at, now),
@@ -285,8 +256,18 @@ def item_state(db: Session, item_ids: list[uuid.UUID], now: datetime | None = No
             )
         out[str(item_id)] = {
             "positions": positions,
+            # "sample" until the sample reaches Done; the batch exists from then.
+            "phase": ledger.phase,
+            "sample_qty": ledger.sample_qty,
+            "sample_done_at": (
+                ledger.released_at.isoformat()
+                if ledger.released_at and ledger.sample_qty
+                else None
+            ),
             "completed_qty": ledger.completed_qty,
+            "done_qty": ledger.done_qty,
             "unstarted_qty": ledger.unstarted_qty,
+            "production_unstarted_qty": ledger.production_unstarted_qty,
             "event_count": ledger.applied_count,
             "last_event_at": (
                 ledger.last_event_at.isoformat() if ledger.last_event_at else None
@@ -300,8 +281,8 @@ def exceptions_report(db: Session) -> dict:
 
     Over-advancing writes are rejected at the API since the write-time guard,
     so this mostly surfaces clock drift, late syncs, competing corrections,
-    and rows that predate the guard. Fixes are correction events; history is
-    never rewritten.
+    and rows that predate the guard. Fixes are correction events; an entry is
+    never edited to make the numbers add up.
     """
     derivation = derive(db)
     rows = []

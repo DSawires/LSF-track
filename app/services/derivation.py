@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.db import utcnow
 from app.ledger import (
     Anomaly,
     ItemLedger,
@@ -88,8 +90,17 @@ def derive(
         all_events.append(event)
 
     settings = get_settings()
+    # A wrong clock or a late sync is news when it happens, and there is
+    # nothing to do about it afterwards -- no correction clears it. Left
+    # unbounded these flags only accumulate, and bury the ones that describe
+    # something still wrong (an over-advance, a competing correction), which
+    # are never windowed.
+    recent = all_events
+    if settings.clock_flag_days > 0:
+        cutoff = utcnow() - timedelta(days=settings.clock_flag_days)
+        recent = [event for event in all_events if event.received_at >= cutoff]
     anomalies: list[Anomaly] = clock_anomalies(
-        all_events, settings.max_device_ahead_seconds, settings.max_sync_lag_days
+        recent, settings.max_device_ahead_seconds, settings.max_sync_lag_days
     )
 
     ledgers: dict[uuid.UUID, ItemLedger] = {}

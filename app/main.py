@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth, events, images, items, office, reference, reports, status, users
+from app.api import auth, events, images, imports, items, office, reference, reports, status, users
 from app.config import get_settings, require_session_key
 from app.db import dispose_engine, get_engine
 
@@ -67,10 +67,16 @@ async def _lifespan(app: FastAPI):
     dispose_engine()
 
 
+# The docs pages and the schema behind them are served without a session, so
+# on a public host they hand the whole API surface to anyone. LSF_API_DOCS=true
+# turns them on for development.
+_DOCS = get_settings().api_docs
+
 app = FastAPI(
     title="Life Style Track",
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json",
+    docs_url="/api/docs" if _DOCS else None,
+    redoc_url=None,
+    openapi_url="/api/openapi.json" if _DOCS else None,
     lifespan=_lifespan,
 )
 
@@ -78,6 +84,7 @@ app.include_router(auth.router)
 app.include_router(reference.router)
 app.include_router(items.router)
 app.include_router(office.router)
+app.include_router(imports.router)
 app.include_router(images.router)
 app.include_router(events.router)
 app.include_router(reports.router)

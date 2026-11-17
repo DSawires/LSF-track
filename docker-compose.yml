@@ -66,6 +66,16 @@ services:
       LSF_ADMIN_USERNAME: ${LSF_ADMIN_USERNAME:-admin}
       LSF_ADMIN_PASSWORD: ${LSF_ADMIN_PASSWORD:-}
       LSF_DEMO: ${LSF_DEMO:-false}
+      # Tunables documented in .env.example. Listed here because compose only
+      # hands a container the variables it names: without these lines a value
+      # set in .env never reached the app.
+      LSF_SESSION_MAX_AGE_DAYS: ${LSF_SESSION_MAX_AGE_DAYS:-30}
+      LSF_MAX_DEVICE_AHEAD_SECONDS: ${LSF_MAX_DEVICE_AHEAD_SECONDS:-3600}
+      LSF_MAX_SYNC_LAG_DAYS: ${LSF_MAX_SYNC_LAG_DAYS:-14}
+      LSF_CLOCK_FLAG_DAYS: ${LSF_CLOCK_FLAG_DAYS:-30}
+      LSF_MAX_UPLOAD_BYTES: ${LSF_MAX_UPLOAD_BYTES:-10485760}
+      LSF_LOG_LEVEL: ${LSF_LOG_LEVEL:-INFO}
+      LSF_API_DOCS: ${LSF_API_DOCS:-false}
       LSF_UPLOAD_DIR: /srv/lsf/data/uploads
       # One S3 bucket for photos (images/) and database dumps (backups/).
       # Unset means local disk on the uploads volume. On EC2, prefer an
