@@ -23,7 +23,8 @@ def _post_move(client, factory, item, qty=1, occurred_at=None, **extra):
     return client.post("/api/events", json={
         "id": str(uuid.uuid4()),
         "item_id": str(item.id),
-        "item_step_id": str(item.steps[0].id),
+        "stage_id": str(factory.stage("carpentry").id),
+        "from_unstarted": True,
         "station_id": str(factory.station("carpentry_1").id),
         "event_type_id": str(factory.event_type("move").id),
         "qty": qty,
@@ -68,7 +69,7 @@ def test_token_holds_still_on_an_idle_floor_and_moves_with_the_data(world, clien
     changed("a new stage")
     created = client.post("/api/items", json={
         "code": "TOK-2", "project_id": str(factory.project.id), "description": "x",
-        "total_qty": 3, "drawing_revision": "A", "stage_ids": [added.json()["id"]],
+        "total_qty": 3, "drawing_revision": "A",
     })
     assert created.status_code == 201, created.text
     changed("a new item")
@@ -237,6 +238,40 @@ def test_a_project_archives_with_its_items_and_each_can_come_back(world, client)
     ]
     # Loggable again.
     assert _post_move(client, factory, item).status_code == 201
+
+
+def test_an_archived_project_is_not_a_destination(world, client):
+    """No project picker offers an archived project, and the API agrees: an
+    item cannot be created in one or moved into one. An item already inside
+    one can still be edited where it is."""
+    factory, _stages, item = world
+    old = Project(code="OLD-JOB", name="Delivered", is_active=False)
+    factory.db.add(old)
+    factory.db.flush()
+    resident = Item(code="OLD-1", project_id=old.id, description="x", total_qty=2,
+                    sample_qty=0, drawing_revision="A", is_active=False)
+    factory.db.add(resident)
+    factory.db.commit()
+
+    moved = client.patch(f"/api/items/{item.id}", json={"project_id": str(old.id)})
+    assert moved.status_code == 409
+    assert "OLD-JOB is archived" in moved.json()["detail"]
+
+    created = client.post("/api/items", json={
+        "code": "OLD-2", "project_id": str(old.id), "description": "x", "total_qty": 1,
+        "drawing_revision": "A",
+    })
+    assert created.status_code == 409
+
+    # Editing in place, with its own (archived) project named, is not a move.
+    edited = client.patch(
+        f"/api/items/{resident.id}", json={"description": "renamed", "project_id": str(old.id)}
+    )
+    assert edited.status_code == 200
+    # And it can leave for a live project.
+    out = client.patch(f"/api/items/{resident.id}", json={"project_id": str(factory.project.id)})
+    assert out.status_code == 200
+    assert out.json()["project_id"] == str(factory.project.id)
 
 
 def test_archiving_is_not_a_field_edit(world, client):

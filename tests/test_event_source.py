@@ -1,12 +1,12 @@
-"""An entry can say where its units came from.
+"""Sequence-era rework rows that name a source step.
 
-Rework is the case that needs it. "QC sent 5 back to carpentry" used to take
-the 5 from whichever stage was nearest carpentry -- so with a lot resting at
-paint, paint lost the units and QC kept them. Totals stayed right; "where is
-every item right now" did not.
+For a short while before sequences were removed, a rework entry could name the
+step it took its units from (`from_item_step_id`, or `from_done`). Those rows
+are in the log and must keep replaying, and a phone may still be holding
+entries in that shape. Everything here builds a sequence-era item on purpose.
 
-Every test here runs on a sequence that includes a stage added at runtime, so
-nothing about sources can come to depend on which stages exist.
+How entries work now -- any stage to any stage, source always named -- is in
+tests/test_free_movement.py.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import sqlalchemy as sa
 from app.models import Event, ReasonCode
 from app.services.derivation import derive
 from app.services.events import EventRejected
-from app.services.items import steps_are_frozen
 
 from tests.conftest import days_ago, hours_ago
 
@@ -168,12 +167,10 @@ def test_a_source_step_must_belong_to_the_item(split):
 
 def test_a_move_may_name_its_source_too(split):
     """Not only rework: 4 of the 10 at paint go on to inspection, and the entry
-    says so. The source is honoured, and it freezes the sequence like any
-    other reference to a step."""
+    says so. The source is honoured."""
     factory, item, _reason = split
     factory.log(item, 30, 4, at=days_ago(2), from_seq=20)
     assert _where(factory.db, item) == {"paint": (6, 0), "inspection": (14, 0)}
-    assert steps_are_frozen(factory.db, item)
 
 
 def test_the_source_travels_in_the_api_and_counts_as_divergence(world, client):

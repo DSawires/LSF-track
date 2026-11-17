@@ -18,6 +18,7 @@ from app.models import (  # noqa: E402
     EventState,
     EventType,
     Item,
+    ItemStep,
     Project,
     Stage,
     Station,
@@ -26,7 +27,6 @@ from app.models import (  # noqa: E402
 from app.schemas import EventCreate  # noqa: E402
 from app.security import hash_password  # noqa: E402
 from app.services.events import record_event  # noqa: E402
-from app.services.items import assign_steps  # noqa: E402
 from seeds.seed import run as run_seed  # noqa: E402
 
 
@@ -167,8 +167,10 @@ class Factory:
     ) -> Item:
         """An item, live on the floor -- creation is the handoff.
 
-        `stage_codes` is its own production sequence; omitting it leaves an item
-        with no stages, which is what the office screen shows as needing them.
+        Items have no stages of their own; log against one with `move()`.
+        `stage_codes` builds a *sequence-era* item instead: the ordered steps an
+        item carried before sequences were removed, for the tests that prove
+        those rows still replay (and that old queued entries still drain).
         `sample_qty` defaults to 0 here so tests about batch movement start with
         the batch on the floor; the sample flow has tests of its own.
         """
@@ -182,9 +184,49 @@ class Factory:
         )
         self.db.add(item)
         self.db.flush()
-        if stage_codes:
-            assign_steps(self.db, item, [self.stage(c).id for c in stage_codes])
+        for position, stage_code in enumerate(stage_codes or [], start=1):
+            self.db.add(
+                ItemStep(item_id=item.id, seq=position * 10, stage_id=self.stage(stage_code).id)
+            )
+        self.db.flush()
+        self.db.refresh(item)
         return item
+
+    def move(
+        self,
+        item: Item,
+        to: str | None,
+        qty: int,
+        frm: str | None = None,
+        at: datetime | None = None,
+        event_type: str | None = None,
+        station_code: str | None = None,
+        reason_code_id=None,
+        event_id: uuid.UUID | None = None,
+        user_id: uuid.UUID | None = None,
+    ) -> Event:
+        """`qty` units go from `frm` to `to`, as the app logs it now.
+
+        Both are stage codes. `frm=None` is "not started", `frm="done"` is
+        Done; `to=None` is Done (a finish entry).
+        """
+        if event_type is None:
+            event_type = "move" if to is not None else "finish"
+        payload = EventCreate(
+            id=event_id or uuid.uuid4(),
+            item_id=item.id,
+            stage_id=self.stage(to).id if to is not None else None,
+            from_stage_id=self.stage(frm).id if frm not in (None, "done") else None,
+            from_unstarted=frm is None,
+            from_done=frm == "done",
+            event_type_id=self.event_type(event_type).id,
+            qty=qty,
+            station_id=self.station(station_code).id if station_code else None,
+            reason_code_id=reason_code_id,
+            occurred_at=at or utcnow(),
+            user_id=user_id,
+        )
+        return record_event(self.db, payload, self.user).event
 
     def log(
         self,
@@ -202,9 +244,10 @@ class Factory:
         from_seq: int | None = None,
         from_done: bool = False,
     ) -> Event:
-        """`qty` units arrived at step `step_seq`; `step_seq=None` is Done.
-        `legacy_state` writes a row the way the app did before states went.
-        `from_seq` / `from_done` name where the units came from."""
+        """A sequence-era entry: `qty` units arrived at step `step_seq` of the
+        item's old sequence (`step_seq=None` is Done), drawn from the nearest
+        step before it. `legacy_state` writes a row the way the app did before
+        states went; `from_seq` / `from_done` name a source step."""
         step = next(s for s in item.steps if s.seq == step_seq) if step_seq is not None else None
         if event_type is None:
             event_type = "move" if step is not None else "finish"

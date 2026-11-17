@@ -3,18 +3,18 @@
 The format is deliberately what an engineer already has open -- a sheet with a
 header row -- saved as .xlsx or .csv:
 
-    project | project name | client | item | description | qty | sample qty | revision | stages
-    HOTEL-B | Grand Hotel  | Acme   | BST-1| Bedside     | 120 | 1          | A        | Carpentry > Veneer > Paint > QC > Packing
+    project | project name | client | item | description | qty | sample qty | revision
+    HOTEL-B | Grand Hotel  | Acme   | BST-1| Bedside     | 120 | 1          | A
 
-- `project`, `item`, `qty`, `stages` are required; the rest are optional.
+- `project`, `item`, `qty` are required; the rest are optional.
 - `project name` and `client` are only read when the project is new. An
   existing project is added to, never renamed by a file.
-- `qty` is the production batch. `sample qty` (default 1, 0 for none) walks the
-  stages first; the batch is released when it is done.
-- `stages` is the item's own sequence, in order, by stage name or code,
-  separated by `>` (or `,` `;` `|` `→`). Stages are matched against whatever
-  is in the `stages` table right now -- a stage added this morning is usable in
-  this afternoon's file.
+- `qty` is the production batch. `sample qty` (default 1, 0 for none) is built
+  first; the batch is released when it is logged Done.
+
+There is no `stages` column. An item is not given a route: it can be logged at
+any stage in the factory, in any order. Files written for the older format
+still carry one; it is read past, and the preview says so.
 
 Headers are matched loosely (case, spaces, underscores) because the file is
 typed by people, not generated. Validation is all-or-nothing: every row is
@@ -34,8 +34,8 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.db import utcnow
-from app.models import Item, Project, Stage
-from app.services.items import ItemSetupError, assign_steps
+from app.models import Item, Project
+from app.services.items import ItemSetupError
 
 MAX_ROWS = 2000
 MAX_BYTES = 5 * 1024 * 1024
@@ -57,11 +57,12 @@ COLUMNS: dict[str, set[str]] = {
     "qty": {"qty", "quantity", "total qty", "batch qty", "production qty"},
     "sample_qty": {"sample", "sample qty", "samples", "sample quantity"},
     "revision": {"revision", "rev", "drawing revision", "drawing rev"},
-    "stages": {"stages", "sequence", "route"},
 }
-REQUIRED = ("project", "item", "qty", "stages")
+REQUIRED = ("project", "item", "qty")
 
-_STAGE_SPLIT = re.compile(r"\s*(?:>|→|,|;|\|)\s*")
+# Headers of the column older files used for an item's stage sequence. Not
+# read any more; recognised only so the preview can say it was skipped.
+_RETIRED_STAGE_HEADERS = {"stages", "sequence", "route"}
 
 
 class ImportFileError(Exception):
@@ -77,8 +78,6 @@ class PlannedItem:
     qty: int
     sample_qty: int
     revision: str
-    stage_ids: list = field(default_factory=list)
-    stage_names: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -95,6 +94,8 @@ class ImportPlan:
     projects: dict[str, PlannedProject] = field(default_factory=dict)
     items: list[PlannedItem] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
+    # Things worth knowing that do not stop the import.
+    notes: list[str] = field(default_factory=list)
 
     def error(self, row: int | None, message: str) -> None:
         self.errors.append({"row": row, "message": message})
@@ -120,11 +121,11 @@ class ImportPlan:
                     "qty": i.qty,
                     "sample_qty": i.sample_qty,
                     "revision": i.revision,
-                    "stages": i.stage_names,
                 }
                 for i in self.items
             ],
             "errors": self.errors,
+            "notes": self.notes,
         }
 
 
@@ -245,6 +246,12 @@ def plan_import(db: Session, rows: list[tuple[int, list]]) -> ImportPlan:
         )
         return plan
 
+    if any(_norm_header(value) in _RETIRED_STAGE_HEADERS for value in header_values):
+        plan.notes.append(
+            "The stages column is not used any more and was skipped: "
+            "an item can be logged at any stage, in any order."
+        )
+
     data = [(n, v) for n, v in rows[header_at + 1:] if any(_cell(x) for x in v)]
     if not data:
         plan.error(None, "the file has headers but no items")
@@ -253,9 +260,6 @@ def plan_import(db: Session, rows: list[tuple[int, list]]) -> ImportPlan:
         plan.error(None, f"more than {MAX_ROWS} items in one file; split it by project")
         return plan
 
-    stages = list(db.scalars(sa.select(Stage)))
-    by_code = {s.code.lower(): s for s in stages}
-    by_name = {s.name.strip().casefold(): s for s in stages}
     existing_projects = {p.code: p for p in db.scalars(sa.select(Project))}
 
     def get(values: list, key: str) -> str:
@@ -298,24 +302,6 @@ def plan_import(db: Session, rows: list[tuple[int, list]]) -> ImportPlan:
         if len(description) > 255:
             problems.append("description longer than 255 characters")
 
-        stage_text = get(values, "stages")
-        picked: list[Stage] = []
-        if not stage_text:
-            problems.append("no stages")
-        for token in filter(None, _STAGE_SPLIT.split(stage_text)):
-            stage = by_code.get(token.lower()) or by_name.get(token.casefold())
-            if stage is None:
-                problems.append(f"unknown stage '{token}'")
-            elif not stage.is_active:
-                problems.append(f"stage '{stage.name}' is retired")
-            else:
-                picked.append(stage)
-        # Same rule assign_steps enforces, checked here so every row's problem
-        # is reported at once instead of the first one aborting the commit.
-        for stage in picked[:-1]:
-            if stage.is_terminal:
-                problems.append(f"'{stage.name}' finishes the sequence and must be the last stage")
-
         project = existing_projects.get(project_code) if project_code else None
         if project is not None and not project.is_active:
             problems.append(f"project {project_code} is archived; reactivate it first")
@@ -348,8 +334,6 @@ def plan_import(db: Session, rows: list[tuple[int, list]]) -> ImportPlan:
                 qty=qty,
                 sample_qty=sample_qty,
                 revision=revision,
-                stage_ids=[s.id for s in picked],
-                stage_names=[s.name for s in picked],
             )
         )
 
@@ -393,26 +377,15 @@ def commit_import(db: Session, plan: ImportPlan) -> None:
             created_at=moment,
         )
         db.add(item)
-        db.flush()
-        assign_steps(db, item, planned.stage_ids, created_at=moment)
     db.flush()
 
 
-def template_csv(db: Session) -> str:
-    """A header row and one example, built from the stages that exist now."""
-    stages = list(
-        db.scalars(
-            sa.select(Stage).where(Stage.is_active.is_(True)).order_by(Stage.sort_order, Stage.code)
-        )
-    )
-    example = " > ".join(s.name for s in stages if not s.is_terminal)
-    terminal = next((s for s in stages if s.is_terminal), None)
-    if terminal is not None:
-        example = f"{example} > {terminal.name}" if example else terminal.name
+def template_csv() -> str:
+    """A header row and one example."""
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(
-        ["project", "project name", "client", "item", "description", "qty", "sample qty", "revision", "stages"]
+        ["project", "project name", "client", "item", "description", "qty", "sample qty", "revision"]
     )
-    writer.writerow(["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", 100, 1, "A", example])
+    writer.writerow(["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", 100, 1, "A"])
     return out.getvalue()

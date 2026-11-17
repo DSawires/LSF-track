@@ -238,11 +238,8 @@ def test_item_list_filters_by_derived_stage(world, client):
     assert at_paint == []
 
 
-def test_creating_an_item_gives_it_stages_and_hands_it_to_the_floor(client, factory):
+def test_creating_an_item_hands_it_to_the_floor_with_nothing_to_set_up(client, factory):
     factory.db.commit()
-    ref = client.get("/api/reference").json()
-    stage_ids = {s["code"]: s["id"] for s in ref["stages"]}
-
     created = client.post(
         "/api/items",
         json={
@@ -251,84 +248,99 @@ def test_creating_an_item_gives_it_stages_and_hands_it_to_the_floor(client, fact
             "description": "creation test",
             "total_qty": 5,
             "drawing_revision": "B",
-            "stage_ids": [stage_ids["carpentry"], stage_ids["packing"]],
         },
     )
     assert created.status_code == 201
     body = created.json()
-    # Sequence numbers in tens, so a stage can be slotted between two later.
-    assert [s["seq"] for s in body["steps"]] == [10, 20]
+    # No stages of its own, and no sequence to keep in step with.
+    assert "steps" not in body
 
     # Every item starts as its sample: one unit, unless the office says more.
     assert body["sample_qty"] == 1
 
+    def start(qty):
+        return client.post(
+            "/api/events",
+            json={
+                "id": str(uuid.uuid4()),
+                "item_id": body["id"],
+                "stage_id": str(factory.stage("carpentry").id),
+                "from_unstarted": True,
+                "event_type_id": str(factory.event_type("move").id),
+                "station_id": str(factory.station("carpentry_1").id),
+                "qty": qty,
+                "occurred_at": utcnow().isoformat(),
+            },
+        )
+
     # No separate release: the floor can log the sample immediately -- and
     # only the sample, because the batch is not on the floor until it is done.
-    too_many = client.post(
-        "/api/events",
-        json={
-            "id": str(uuid.uuid4()),
-            "item_id": body["id"],
-            "item_step_id": body["steps"][0]["id"],
-            "event_type_id": str(factory.event_type("move").id),
-            "station_id": str(factory.station("carpentry_1").id),
-            "qty": 5,
-            "occurred_at": utcnow().isoformat(),
-        },
-    )
-    assert too_many.status_code == 422
-    posted = client.post(
-        "/api/events",
-        json={
-            "id": str(uuid.uuid4()),
-            "item_id": body["id"],
-            "item_step_id": body["steps"][0]["id"],
-            "event_type_id": str(factory.event_type("move").id),
-            "station_id": str(factory.station("carpentry_1").id),
-            "qty": 1,
-            "occurred_at": utcnow().isoformat(),
-        },
-    )
-    assert posted.status_code == 201
+    assert start(5).status_code == 422
+    assert start(1).status_code == 201
 
 
-def test_item_without_stages_is_refused(client, factory):
+def test_a_new_item_needs_only_a_project_a_code_and_a_quantity(client, factory):
+    """What the Office tab's "New item" form posts at its barest."""
     factory.db.commit()
-    refused = client.post(
+    created = client.post(
         "/api/items",
+        json={"code": "BARE-1", "project_id": str(factory.project.id), "total_qty": 5},
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert (body["description"], body["drawing_revision"], body["sample_qty"]) == ("", "A", 1)
+
+    # Codes are unique across the factory.
+    again = client.post(
+        "/api/items",
+        json={"code": "BARE-1", "project_id": str(factory.project.id), "total_qty": 5},
+    )
+    assert again.status_code == 409
+
+
+def test_a_queued_entry_in_the_old_sequence_shape_still_drains(client, factory):
+    """A phone that has not reopened the app since sequences were removed may
+    be holding entries that name a step. They must go in, not strand in a
+    quarantine nobody can resolve -- and the item carries on under the new
+    rules from wherever they left it."""
+    item = factory.item("OLDQ-1", 10, ["carpentry", "packing"])
+    factory.db.commit()
+
+    old_shape = client.post(
+        "/api/events",
         json={
-            "code": "NOSTAGE-1",
-            "project_id": str(factory.project.id),
-            "description": "no stages",
-            "total_qty": 5,
-            "drawing_revision": "A",
+            "id": str(uuid.uuid4()),
+            "item_id": str(item.id),
+            "item_step_id": str(item.steps[0].id),
+            "event_type_id": str(factory.event_type("move").id),
+            "station_id": str(factory.station("carpentry_1").id),
+            "qty": 4,
+            "occurred_at": hours_ago(2).isoformat(),
         },
     )
-    assert refused.status_code == 422
+    assert old_shape.status_code == 201, old_shape.text
 
-
-def test_stages_freeze_once_the_floor_has_logged_against_them(client, factory):
-    item = factory.item("FREEZE-1", 10, ["carpentry", "packing"])
-    factory.db.commit()
-    ref = client.get("/api/reference").json()
-    stage_ids = {s["code"]: s["id"] for s in ref["stages"]}
-
-    # Before anything is logged, the sequence is still a typo away from fixable.
-    fixed = client.put(
-        f"/api/items/{item.id}/steps",
-        json={"stage_ids": [stage_ids["carpentry"], stage_ids["paint"], stage_ids["packing"]]},
+    # The same units, moved on by an entry in the new shape.
+    onward = client.post(
+        "/api/events",
+        json={
+            "id": str(uuid.uuid4()),
+            "item_id": str(item.id),
+            "stage_id": str(factory.stage("qc").id),
+            "from_stage_id": str(factory.stage("carpentry").id),
+            "event_type_id": str(factory.event_type("move").id),
+            "qty": 3,
+            "occurred_at": hours_ago(1).isoformat(),
+        },
     )
-    assert fixed.status_code == 200
-    assert len(fixed.json()["steps"]) == 3
+    assert onward.status_code == 201, onward.text
 
-    factory.log(item, 10, 4, station_code="carpentry_1")
-    factory.db.commit()
-
-    frozen = client.put(
-        f"/api/items/{item.id}/steps", json={"stage_ids": [stage_ids["carpentry"]]}
-    )
-    assert frozen.status_code == 409
-    assert len(client.get(f"/api/items/{item.id}").json()["steps"]) == 3
+    state = client.get(f"/api/items/{item.id}").json()["state"]
+    assert {p["stage_code"]: p["qty"] for p in state["positions"]} == {
+        None: 6, "carpentry": 1, "qc": 3,
+    }
+    # The sequence itself is gone from the API: nothing to edit, nothing to freeze.
+    assert client.put(f"/api/items/{item.id}/steps", json={"stage_ids": []}).status_code in (404, 405)
 
 
 def test_create_project_endpoint(client, factory):
@@ -339,44 +351,6 @@ def test_create_project_endpoint(client, factory):
     assert created.status_code == 201
     assert created.json()["code"] == "VILLA-9"  # normalised
     assert client.post("/api/projects", json={"code": "VILLA-9"}).status_code == 409
-
-
-def test_editing_one_items_stages_leaves_its_neighbours_alone(client, factory):
-    """The point of per-item stages: there is no shared template to version, so
-    a sequence corrected on one item cannot reach the item it was copied from."""
-    factory.db.commit()
-    stage_ids = {s["code"]: s["id"] for s in client.get("/api/reference").json()["stages"]}
-
-    first = client.post(
-        "/api/items",
-        json={
-            "code": "CHR-1", "project_id": str(factory.project.id),
-            "description": "first chair", "total_qty": 4, "drawing_revision": "A",
-            "stage_ids": [stage_ids["carpentry"], stage_ids["packing"]],
-        },
-    ).json()
-    # The office screen fills its picker from CHR-1; what it posts is the list.
-    second = client.post(
-        "/api/items",
-        json={
-            "code": "CHR-2", "project_id": str(factory.project.id),
-            "description": "same again", "total_qty": 4, "drawing_revision": "A",
-            "stage_ids": [s["stage_id"] for s in first["steps"]],
-        },
-    ).json()
-
-    # CHR-2 turns out to need paint; CHR-1 does not change.
-    client.put(
-        f"/api/items/{second['id']}/steps",
-        json={"stage_ids": [stage_ids["carpentry"], stage_ids["paint"], stage_ids["packing"]]},
-    )
-    assert [s["stage_id"] for s in client.get(f"/api/items/{first['id']}").json()["steps"]] == [
-        stage_ids["carpentry"], stage_ids["packing"]
-    ]
-    assert len(client.get(f"/api/items/{second['id']}").json()["steps"]) == 3
-
-    # An item still needs at least one stage.
-    assert client.put(f"/api/items/{first['id']}/steps", json={"stage_ids": []}).status_code == 422
 
 
 def test_reference_payload_contains_runtime_added_stage(client, factory):
@@ -524,38 +498,35 @@ def test_image_deletion_is_admin_only(world, client, factory, tmp_path, monkeypa
 
 def test_initial_stage_distribution_at_creation(client, factory):
     """A batch that is already part-built when it reaches the system: the
-    quantities are placed as ordinary arrivals, and the rest is unstarted. It
-    has no sample to run, and asking for both is refused."""
+    quantities are placed as ordinary moves out of "not started", and the rest
+    stays there. It has no sample to run, and asking for both is refused."""
     factory.db.commit()
     stage_ids = {s["code"]: s["id"] for s in client.get("/api/reference").json()["stages"]}
     base = {
         "project_id": str(factory.project.id),
         "description": "already mid-production", "total_qty": 100,
         "sample_qty": 0, "drawing_revision": "A",
-        "stage_ids": [stage_ids["carpentry"], stage_ids["paint"], stage_ids["packing"]],
     }
+    at = lambda carpentry, paint: {stage_ids["carpentry"]: carpentry, stage_ids["paint"]: paint}  # noqa: E731
 
-    over = client.post(
-        "/api/items", json={**base, "code": "DIST-OVER", "initial_quantities": {"10": 80, "20": 30}}
-    )
+    over = client.post("/api/items", json={**base, "code": "DIST-OVER", "initial_quantities": at(80, 30)})
     assert over.status_code == 422  # 110 > 100
     # The refusal is total: no half-created item is left behind.
     assert client.get("/api/items?q=DIST-OVER").json()["items"] == []
 
-    created = client.post(
-        "/api/items", json={**base, "code": "DIST-1", "initial_quantities": {"10": 50, "20": 30}}
-    )
+    created = client.post("/api/items", json={**base, "code": "DIST-1", "initial_quantities": at(50, 30)})
     assert created.status_code == 201
 
     state = client.get(f"/api/items/{created.json()['id']}").json()["state"]
-    by_pos = {p["seq"]: p["qty"] for p in state["positions"]}
-    assert by_pos[10] == 50
-    assert by_pos[20] == 30
+    by_stage = {p["stage_code"]: p["qty"] for p in state["positions"]}
+    assert by_stage["carpentry"] == 50
+    assert by_stage["paint"] == 30
     assert state["unstarted_qty"] == 20
 
     with_sample = client.post(
         "/api/items",
-        json={**base, "code": "DIST-2", "sample_qty": 1, "initial_quantities": {"10": 5}},
+        json={**base, "code": "DIST-2", "sample_qty": 1,
+              "initial_quantities": {stage_ids["carpentry"]: 5}},
     )
     assert with_sample.status_code == 422
     assert "sample" in with_sample.json()["detail"]

@@ -239,11 +239,11 @@ def item_state(db: Session, item_ids: list[uuid.UUID], now: datetime | None = No
             stage = refs["stages"].get(position.stage_id) if position.stage_id else None
             positions.append(
                 {
-                    "item_step_id": str(position.item_step_id) if position.item_step_id else None,
+                    # A place is "not started" or a stage; there is at most
+                    # one row per stage, whatever the item's history.
                     "stage_id": str(stage.id) if stage else None,
                     "stage_code": stage.code if stage else None,
                     "stage_name": stage.name if stage else UNSTARTED_LABEL,
-                    "seq": position.seq,
                     "qty": bucket.qty,
                     "sample_qty": bucket.sample_qty,
                     "reworked_qty": bucket.reworked_qty,

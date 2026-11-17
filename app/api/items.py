@@ -5,7 +5,7 @@ import uuid
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session
 
 from app.db import get_db, utcnow
 from app.deps import current_user, require_admin
@@ -17,37 +17,18 @@ from app.models import (
     Project,
     User,
 )
-from app.schemas import ItemCreate, ItemStepsUpdate, ItemUpdate, RevisionBumpRequest
+from app.schemas import ItemCreate, ItemUpdate, RevisionBumpRequest
 from app.services import reports
 from app.services.items import (
     ItemSetupError,
     archive_item,
-    assign_steps,
     bump_revision,
     place_initial_quantities,
-    references_a_step,
-    steps_are_frozen,
 )
 from app.services.sync import items_token
 
 log = logging.getLogger(__name__)
 
-
-def _locked_item_ids(db: Session, item_ids: list[uuid.UUID]) -> set[uuid.UUID]:
-    """Which of these items the floor has already logged against, in one query.
-
-    An item is locked once an event points at one of its steps; item-level
-    events (a revision bump) leave the sequence editable.
-    """
-    if not item_ids:
-        return set()
-    return set(
-        db.scalars(
-            sa.select(Event.item_id)
-            .where(Event.item_id.in_(item_ids), references_a_step())
-            .distinct()
-        )
-    )
 
 router = APIRouter(prefix="/api/items", tags=["items"])
 
@@ -67,7 +48,7 @@ def _icon_urls(db: Session, item_ids: list[uuid.UUID]) -> dict[uuid.UUID, str]:
     return icons
 
 
-def _item_payload(item: Item, icon_url: str | None = None, steps_locked: bool = False) -> dict:
+def _item_payload(item: Item, icon_url: str | None = None) -> dict:
     return {
         "id": str(item.id),
         "icon_url": icon_url,
@@ -79,12 +60,6 @@ def _item_payload(item: Item, icon_url: str | None = None, steps_locked: bool = 
         "sample_qty": item.sample_qty,
         "drawing_revision": item.drawing_revision,
         "created_at": item.created_at.isoformat() if item.created_at else None,
-        # Whether the floor has logged against these stages yet, which is what
-        # decides if the sequence can still be corrected.
-        "steps_locked": steps_locked,
-        "steps": [
-            {"id": str(s.id), "seq": s.seq, "stage_id": str(s.stage_id)} for s in item.steps
-        ],
     }
 
 
@@ -102,7 +77,7 @@ def list_items(
     # next sync simply fetches again. The other order would let it keep stale
     # data under a token that says it is current.
     token = items_token(db)
-    query = sa.select(Item).options(selectinload(Item.steps)).order_by(Item.code)
+    query = sa.select(Item).order_by(Item.code)
     if not include_archived:
         query = query.where(Item.is_active.is_(True))
     if project_id is not None:
@@ -120,7 +95,6 @@ def list_items(
     item_ids = [item.id for item in items]
     state = reports.item_state(db, item_ids) if item_ids else {}
     icons = _icon_urls(db, item_ids)
-    locked = _locked_item_ids(db, item_ids)
 
     rows = []
     for item in items:
@@ -137,7 +111,7 @@ def list_items(
             ):
                 continue
         rows.append({
-            **_item_payload(item, icons.get(item.id), steps_locked=item.id in locked),
+            **_item_payload(item, icons.get(item.id)),
             "state": item_state,
         })
     return {"items": rows, "token": token}
@@ -149,13 +123,13 @@ def get_item(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
-    item = db.get(Item, item_id, options=[selectinload(Item.steps)])
+    item = db.get(Item, item_id)
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
     state = reports.item_state(db, [item.id])
     icon = _icon_urls(db, [item.id]).get(item.id)
     return {
-        **_item_payload(item, icon, steps_locked=steps_are_frozen(db, item)),
+        **_item_payload(item, icon),
         "state": state.get(str(item.id)),
     }
 
@@ -200,10 +174,24 @@ def item_events(
             )
         )
     )
-    return {
-        "events": [{**_event_payload(e), "superseded": e.id in superseded} for e in rows],
-        "total": total,
-    }
+    # A sequence-era row names a step, not a stage. Resolve it here so the phone
+    # can label every entry the same way -- "Paint -> QC" -- without knowing
+    # what a step was.
+    stage_of_step = dict(
+        db.execute(sa.select(ItemStep.id, ItemStep.stage_id).where(ItemStep.item_id == item_id)).all()
+    )
+
+    def resolved(event: Event) -> dict:
+        to_stage = event.stage_id or stage_of_step.get(event.item_step_id)
+        from_stage = event.from_stage_id or stage_of_step.get(event.from_item_step_id)
+        return {
+            **_event_payload(event),
+            "to_stage_id": str(to_stage) if to_stage else None,
+            "from_stage_id": str(from_stage) if from_stage else None,
+            "superseded": event.id in superseded,
+        }
+
+    return {"events": [resolved(e) for e in rows], "total": total}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -214,23 +202,29 @@ def create_item(
 ) -> dict:
     """Create an item and hand it to the floor in one step.
 
-    There is no separate release: an item exists because someone is building it,
-    so it gets its stages here and is loggable immediately -- the sample first,
-    the batch once the sample is done. `initial_quantities` is for a batch that
-    is already part-built when it reaches the system, and needs `sample_qty` 0.
+    There is no separate release and nothing to set up: an item exists because
+    someone is building it, so it is loggable immediately, at any stage -- the
+    sample first, the batch once the sample is done. `initial_quantities` is
+    for a batch that is already part-built when it reaches the system, and
+    needs `sample_qty` 0.
 
-    Projects normally arrive whole through the file import (app/api/imports.py);
-    this is the one-item path underneath it.
+    A whole project usually arrives through the file import
+    (app/api/imports.py); this is the same thing for one item, and what the
+    Office tab's "New item" form posts.
     """
-    if db.get(Project, payload.project_id) is None:
+    project = db.get(Project, payload.project_id)
+    if project is None:
         raise HTTPException(422, "unknown project")
+    if not project.is_active:
+        # Same answer the import gives for a row naming an archived project.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"project {project.code} is archived; reactivate it first",
+        )
     code = payload.code.strip()
     existing = db.scalars(sa.select(Item).where(Item.code == code)).first()
     if existing is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, f"item {code} already exists")
-
-    if not payload.stage_ids:
-        raise HTTPException(422, "pick the stages this item goes through")
 
     item = Item(
         code=code,
@@ -243,44 +237,13 @@ def create_item(
     db.add(item)
     db.flush()
 
-    moment = utcnow()
-    try:
-        steps = assign_steps(db, item, payload.stage_ids, created_at=moment)
-        if payload.initial_quantities:
-            place_initial_quantities(
-                db, item, steps, payload.initial_quantities, user, moment
-            )
-    except ItemSetupError as exc:
-        raise HTTPException(422, str(exc))
+    if payload.initial_quantities:
+        try:
+            place_initial_quantities(db, item, payload.initial_quantities, user, utcnow())
+        except ItemSetupError as exc:
+            raise HTTPException(422, str(exc))
     db.refresh(item)
     return _item_payload(item)
-
-
-@router.put("/{item_id}/steps")
-def set_item_steps(
-    item_id: uuid.UUID,
-    payload: ItemStepsUpdate,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-) -> dict:
-    """Correct the stage sequence of an item nobody has logged against yet.
-
-    Once an event points at one of the steps, the sequence is frozen: the stored
-    events mean "this happened at that step", and rewriting the steps under them
-    would quietly re-label history. At that point the answer is a correction
-    event, or a new item.
-    """
-    item = db.get(Item, item_id)
-    if item is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
-    if not payload.stage_ids:
-        raise HTTPException(422, "an item needs at least one stage")
-    try:
-        assign_steps(db, item, payload.stage_ids)
-    except ItemSetupError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    db.refresh(item)
-    return _item_payload(item, _icon_urls(db, [item.id]).get(item.id))
 
 
 @router.patch("/{item_id}")
@@ -323,8 +286,17 @@ def update_item(
             raise HTTPException(status.HTTP_409_CONFLICT, f"item {code} already exists")
         fields["code"] = code
 
-    if "project_id" in fields and db.get(Project, fields["project_id"]) is None:
-        raise HTTPException(422, "unknown project")
+    if "project_id" in fields:
+        project = db.get(Project, fields["project_id"])
+        if project is None:
+            raise HTTPException(422, "unknown project")
+        # An archived project is not a destination: no picker offers one, and
+        # the API agrees. Staying put in one is fine -- that is not a move.
+        if not project.is_active and project.id != item.project_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"project {project.code} is archived; reactivate it first",
+            )
 
     if "description" in fields:
         fields["description"] = (fields["description"] or "").strip()

@@ -1,8 +1,7 @@
 """Technical-office setup: projects, stages and stations.
 
-There are no shared route templates. An item's sequence of stages is its own,
-picked (or copied off a sibling item) when the item is created -- see
-app/services/items.py.
+Items have no stage sequence and no route: units move freely between stages,
+so there is nothing here to set up per item -- see app/ledger.py.
 
 Stages and stations are the runtime vocabulary the whole design revolves
 around: adding one here is the "no deploy, no migration, no code change"

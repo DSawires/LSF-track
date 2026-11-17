@@ -71,8 +71,8 @@ def test_wip_report_has_a_row_for_a_runtime_stage_and_its_sample(factory):
 
 def test_stage_and_station_added_through_the_admin_api(world, client):
     """The full CLAUDE.md procedure, end to end, through HTTP: add a stage and
-    a station via the admin endpoints, create an item that goes through it, log
-    against it, and see it in the WIP report. Zero code changes, zero deploys."""
+    a station via the admin endpoints, log an item at it, and see it in the WIP
+    report. Zero code changes, zero deploys -- and no item needed setting up."""
     factory, _stages, _item = world
 
     stage = client.post("/api/stages", json={
@@ -88,20 +88,14 @@ def test_stage_and_station_added_through_the_admin_api(world, client):
     })
     assert station.status_code == 201
 
-    carpentry = next(
-        s for s in client.get("/api/reference").json()["stages"] if s["code"] == "carpentry"
-    )
-    # The brand-new stage is pickable for a new item the moment it exists.
-    item = client.post("/api/items", json={
+    # An item that existed before the stage did can be logged there at once.
+    existing = client.post("/api/items", json={
         "code": "GLZ-1", "project_id": _project_id(client), "description": "Glazed cabinet",
         "total_qty": 4, "sample_qty": 0, "drawing_revision": "A",
-        "stage_ids": [carpentry["id"], stage["id"]],
     })
-    assert item.status_code == 201
-    item = item.json()
+    assert existing.status_code == 201
+    item = existing.json()
 
-    steps = client.get(f"/api/items/{item['id']}").json()["steps"]
-    glass_step = next(s for s in steps if s["stage_id"] == stage["id"])
     move = next(
         t for t in client.get("/api/reference").json()["event_types"]
         if t["moves_quantity"] and not (t["is_rework"] or t["is_correction"] or t["is_finish"])
@@ -111,13 +105,14 @@ def test_stage_and_station_added_through_the_admin_api(world, client):
     posted = client.post("/api/events", json={
         "id": str(_uuid.uuid4()),
         "item_id": item["id"],
-        "item_step_id": glass_step["id"],
+        "stage_id": stage["id"],
+        "from_unstarted": True,
         "station_id": station.json()["id"],
         "event_type_id": move["id"],
         "qty": 4,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
     })
-    assert posted.status_code == 201
+    assert posted.status_code == 201, posted.text
 
     wip = client.get("/api/reports/wip").json()
     row = next(r for r in wip["stages"] if r["stage"]["code"] == "glass_shop")
@@ -207,21 +202,6 @@ def test_stage_admin_endpoints_require_admin(factory, client):
         assert floor.patch(
             f"/api/stations/{some_station.id}", json={"is_active": False}
         ).status_code == 403
-
-
-def test_terminal_stage_must_be_the_last_stage_of_an_item(world, client):
-    factory, _stages, _item = world
-    reference = client.get("/api/reference").json()
-    packing = next(s for s in reference["stages"] if s["is_terminal"])
-    carpentry = next(s for s in reference["stages"] if s["code"] == "carpentry")
-
-    response = client.post("/api/items", json={
-        "code": "BACKWARDS-1", "project_id": _project_id(client),
-        "description": "packing before carpentry", "total_qty": 4, "drawing_revision": "A",
-        "stage_ids": [packing["id"], carpentry["id"]],
-    })
-    assert response.status_code == 422
-    assert "must be the last stage" in response.json()["detail"]
 
 
 def test_seed_rerun_does_not_clobber_operator_edits(factory):

@@ -1,4 +1,8 @@
-"""Project import: a spreadsheet in, projects and sample-first items out."""
+"""Project import: a spreadsheet in, projects and sample-first items out.
+
+Most files here still carry the `stages` column from before items lost their
+sequences. That is deliberate: those files are on people's desktops, and they
+must keep importing -- the column is read past, and the preview says so."""
 
 from __future__ import annotations
 
@@ -38,7 +42,9 @@ def test_preview_then_commit_creates_the_project_and_its_items(client, factory):
     assert body["projects"] == [
         {"code": "HOTEL-B", "name": "Grand Hotel", "client": "Acme", "is_new": True, "item_count": 2}
     ]
-    assert body["items"][1]["stages"] == ["Carpentry", "Veneer", "Paint", "Packing"]
+    # The old stages column is skipped, and the preview says so.
+    assert "stages" not in body["items"][1]
+    assert any("stages column" in note for note in body["notes"])
     # A preview writes nothing.
     assert _item(factory, "BST-1") is None
 
@@ -47,9 +53,9 @@ def test_preview_then_commit_creates_the_project_and_its_items(client, factory):
 
     bst = _item(factory, "BST-1")
     assert (bst.total_qty, bst.sample_qty, bst.drawing_revision) == (120, 1, "A")
-    assert [s.seq for s in bst.steps] == [10, 20, 30]
+    assert bst.steps == []  # no sequence is created for anyone any more
     wrd = _item(factory, "WRD-1")
-    assert (wrd.sample_qty, wrd.drawing_revision, len(wrd.steps)) == (2, "B", 4)
+    assert (wrd.sample_qty, wrd.drawing_revision) == (2, "B")
 
     # On the floor as a sample: only the sample exists yet.
     state = client.get(f"/api/items/{bst.id}").json()["state"]
@@ -58,20 +64,19 @@ def test_preview_then_commit_creates_the_project_and_its_items(client, factory):
 
 
 def test_every_problem_is_reported_by_row_and_nothing_is_written(client, factory):
-    factory.item("TAKEN-1", 5, ["carpentry"])
+    factory.item("TAKEN-1", 5)
     factory.db.commit()
     text = HEADER + (
         "JOB-1,,,OK-1,fine,10,,,Carpentry > Packing\n"          # row 2: fine
         "JOB-1,,,BAD-1,,ten,,,Carpentry\n"                       # row 3: qty
-        "JOB-1,,,BAD-2,,5,,,Carpentry > Gilding\n"               # row 4: unknown stage
+        "JOB-1,,,OK-2,,5,,,Carpentry > Gilding\n"                # row 4: fine -- stages are not read
         "JOB-1,,,OK-1,,5,,,Carpentry\n"                          # row 5: duplicate in file
         "JOB-1,,,TAKEN-1,,5,,,Carpentry\n"                       # row 6: exists already
-        "JOB-1,,,BAD-3,,5,,,Packing > Carpentry\n"               # row 7: terminal not last
+        "JOB-1,,,BAD-3,,5,many,,\n"                              # row 7: sample qty
     )
     preview = _post(client, text).json()
     rows = sorted({e["row"] for e in preview["errors"]})
-    assert rows == [3, 4, 5, 6, 7]
-    assert any("Gilding" in e["message"] for e in preview["errors"])
+    assert rows == [3, 5, 6, 7]
 
     refused = _post(client, text, commit=True)
     assert refused.status_code == 422
@@ -99,17 +104,25 @@ def test_archived_project_is_refused(client, factory):
 
 def test_missing_required_column_is_named(client, factory):
     factory.db.commit()
-    body = _post(client, "project,item,qty\nP,I,1\n").json()
-    assert "stages" in body["errors"][0]["message"]
+    body = _post(client, "project,item\nP,I\n").json()
+    assert "qty" in body["errors"][0]["message"]
 
 
-def test_a_stage_added_this_morning_is_usable_in_this_afternoons_file(client, factory):
-    """CLAUDE.md rule 2, through the import: stages match against the table."""
+def test_a_file_needs_no_stages_and_its_items_go_anywhere(client, factory):
+    """The current format: project, item, qty. The item it creates can be
+    logged at a stage that was added to the factory after the import."""
+    factory.db.commit()
+    body = _post(client, "project,item,qty,sample qty\nART-1,GLD-1,4,0\n", commit=True).json()
+    assert body["committed"] is True
+    assert body["notes"] == []  # nothing was skipped: there was no stages column
+
     factory.add_stage("gilding", sort=33)
     factory.db.commit()
-    body = _post(client, HEADER + "ART-1,,,GLD-1,,4,,,Carpentry > Gilding\n", commit=True).json()
-    assert body["committed"] is True
-    assert body["items"][0]["stages"] == ["Carpentry", "Gilding"]
+    item = _item(factory, "GLD-1")
+    factory.move(item, "gilding", 4)
+    factory.db.commit()
+    state = client.get(f"/api/items/{item.id}").json()["state"]
+    assert [(p["stage_code"], p["qty"]) for p in state["positions"]] == [("gilding", 4)]
 
 
 def test_xlsx_with_loose_headers(client, factory):
@@ -126,16 +139,15 @@ def test_xlsx_with_loose_headers(client, factory):
     body = _post(client, buffer.getvalue(), commit=True, filename="job.xlsx").json()
     assert body["errors"] == []
     item = _item(factory, "XL-ITEM")
-    assert (item.total_qty, item.sample_qty, len(item.steps)) == (24, 1, 3)
+    assert (item.total_qty, item.sample_qty) == (24, 1)
 
 
-def test_template_lists_the_stages_that_exist_now(client, factory):
-    factory.add_stage("gilding", sort=33)
+def test_template_is_a_header_and_an_example_that_imports(client, factory):
     factory.db.commit()
     response = client.get("/api/import/template")
     assert response.status_code == 200
-    assert "Gilding" in response.text
     header = response.text.splitlines()[0]
-    assert header.startswith("project,")
-    # The template parses cleanly as an import.
-    assert _post(client, response.text).json()["errors"] == []
+    assert header == "project,project name,client,item,description,qty,sample qty,revision"
+    # The template parses cleanly as an import, with nothing skipped.
+    body = _post(client, response.text).json()
+    assert body["errors"] == [] and body["notes"] == []

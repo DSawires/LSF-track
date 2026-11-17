@@ -23,17 +23,24 @@ class EventCreate(BaseModel):
     item_id: uuid.UUID
     event_type_id: uuid.UUID
     occurred_at: datetime
-    item_step_id: uuid.UUID | None = None
+    # Where the units are now. Empty on a finish entry (they are Done) and on
+    # item-level entries.
+    stage_id: uuid.UUID | None = None
     station_id: uuid.UUID | None = None
-    state_id: uuid.UUID | None = None
     # ge=0: negative movement is a rework/correction event, never a negative
     # qty. The ceiling is far beyond any real batch; it exists so a client bug
     # cannot store a number that breaks every report aggregate.
     qty: int = Field(default=0, ge=0, le=1_000_000)
-    # Where the units came from: one of the item's steps, or Done. Optional --
-    # left empty, the nearest units on the right side of the target move.
-    from_item_step_id: uuid.UUID | None = None
+    # Where they came from: exactly one of these on an entry that moves units.
+    from_stage_id: uuid.UUID | None = None
+    from_unstarted: bool = False
     from_done: bool = False
+    # Sequence-era shape, accepted so queues filled before items lost their
+    # sequences still drain: a step instead of a stage, and an optional source
+    # step (or none at all).
+    item_step_id: uuid.UUID | None = None
+    from_item_step_id: uuid.UUID | None = None
+    state_id: uuid.UUID | None = None
     reason_code_id: uuid.UUID | None = None
     note: str | None = Field(default=None, max_length=2000)
     supersedes_event_id: uuid.UUID | None = None
@@ -55,30 +62,20 @@ class EventBatch(BaseModel):
 class ItemCreate(BaseModel):
     """A new item, live on the floor the moment it is created.
 
-    `stage_ids` is its production sequence, in order. The office screen can fill
-    that list by copying another item in the project, but what arrives here is
-    always just a list of stages: nothing links the two items afterwards.
+    It has no stages of its own: it can be logged at any stage, in any order.
     """
 
     code: str = Field(min_length=1, max_length=64)
     project_id: uuid.UUID
-    description: str = Field(max_length=255)
+    description: str = Field(default="", max_length=255)
     total_qty: int = Field(gt=0, le=1_000_000)
-    # Units that walk the sequence before the batch is released. 0 = no sample.
+    # Units built first, before the batch is released. 0 = no sample.
     sample_qty: int = Field(default=1, ge=0, le=1_000)
-    drawing_revision: str = Field(min_length=1, max_length=32)
-    # 100 stages is far beyond any real sequence; it bounds the request.
-    stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
-    # Where the quantities already are, keyed by step seq -- for entering an
+    drawing_revision: str = Field(default="A", min_length=1, max_length=32)
+    # Where the quantities already are, keyed by stage id -- for entering an
     # item that is mid-production when it reaches the system. Anything not
-    # distributed starts as unstarted.
-    initial_quantities: dict[int, int] = Field(default_factory=dict)
-
-
-class ItemStepsUpdate(BaseModel):
-    """Correct an item's stage sequence, before anything is logged against it."""
-
-    stage_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+    # distributed starts as "not started". 200 stages bounds the request.
+    initial_quantities: dict[uuid.UUID, int] = Field(default_factory=dict, max_length=200)
 
 
 class ItemUpdate(BaseModel):

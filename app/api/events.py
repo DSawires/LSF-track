@@ -22,7 +22,16 @@ def _event_payload(event: Event) -> dict:
     return {
         "id": str(event.id),
         "item_id": str(event.item_id),
+        # Where the units are now (empty on a finish: they are Done), and where
+        # they came from. The *_step_id pair is the sequence-era shape.
+        "stage_id": str(event.stage_id) if event.stage_id else None,
+        "from_stage_id": str(event.from_stage_id) if event.from_stage_id else None,
+        "from_unstarted": bool(event.from_unstarted),
+        "from_done": bool(event.from_done),
         "item_step_id": str(event.item_step_id) if event.item_step_id else None,
+        "from_item_step_id": (
+            str(event.from_item_step_id) if event.from_item_step_id else None
+        ),
         "station_id": str(event.station_id) if event.station_id else None,
         "event_type_id": str(event.event_type_id),
         "state_id": str(event.state_id) if event.state_id else None,
@@ -30,10 +39,6 @@ def _event_payload(event: Event) -> dict:
         # the name travels with the event for the history list to show.
         "state_name": event.state.name if event.state_id and event.state else None,
         "qty": event.qty,
-        "from_item_step_id": (
-            str(event.from_item_step_id) if event.from_item_step_id else None
-        ),
-        "from_done": bool(event.from_done),
         "reason_code_id": str(event.reason_code_id) if event.reason_code_id else None,
         "occurred_at": event.occurred_at.isoformat(),
         "received_at": event.received_at.isoformat(),

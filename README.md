@@ -7,7 +7,7 @@ what has been sitting too long.
 
 The design rules live in [CLAUDE.md](CLAUDE.md) and are load-bearing: an
 event log as the sole source of truth, stages and stations as runtime
-data rather than code, each item owning its own stage sequence, and a fully
+data rather than code, units that move freely between stages, and a fully
 offline-capable PWA with an IndexedDB write queue.
 
 ## Quickstart (Docker — the intended path)
@@ -173,20 +173,20 @@ Dockerfile). To bump: create a fresh venv, `pip install .`, then
 Done in the app by an admin: **Office tab → Stages & stations**.
 
 1. Add the stage with its behaviour flags (`requires_station`,
-   `requires_external_po`, `allows_partial_qty`, `is_terminal` — a closing
-   stage, which must be last in any sequence that uses it — sort order,
-   and `max_days_in_state` — the per-stage aging threshold; empty means the
-   stage is never flagged, which is what outsourced work wants).
+   `requires_external_po`, `allows_partial_qty` — off means a move into the
+   stage must take the whole lot it draws from), its sort order (only the
+   order stages are listed in), and `max_days_in_state` — the per-stage aging
+   threshold; empty means the stage is never flagged, which is what outsourced
+   work wants.
 2. Add stations if the stage has physical instances. Existing stations are
    renamed, reordered and retired in the same place: a rename re-labels the
    work already logged there (events point at the station id, so history is
    not rewritten), and a retired station drops off the logging picker while
    staying named in the reports. Station codes are fixed — retire a station
    and add the replacement rather than repurposing one.
-3. Done. The stage can be named in the next import file (the downloadable
-   template lists it), and items already on the floor keep the sequence their
-   entries were logged against — there is no shared template that could
-   re-version under them.
+3. Done. Every item, new or already on the floor, can be logged at the stage
+   on the phone's next sync. Items have no stage list of their own, so there
+   is nothing else to update.
 
 `event_types` and `reason_codes` extend the same way — every
 behavioural difference is a flag column, and business logic branches only on
@@ -198,47 +198,66 @@ UI survive restarts.
 **Office → Import.** A project and all its items arrive as one spreadsheet
 (.xlsx or .csv), one row per item, header row first:
 
-| project | project name | client | item | description | qty | sample qty | revision | stages |
-|---|---|---|---|---|---|---|---|---|
-| HOTEL-B | Grand Hotel | Acme | BST-1 | Bedside table | 120 | 1 | A | Carpentry > Veneer > Paint > QC > Packing |
+| project | project name | client | item | description | qty | sample qty | revision |
+|---|---|---|---|---|---|---|---|
+| HOTEL-B | Grand Hotel | Acme | BST-1 | Bedside table | 120 | 1 | A |
 
-`project`, `item`, `qty` and `stages` are required. Stages are matched by name
-or code against the `stages` table, separated by `>` (or `,` `;` `|`). A new
-project code creates the project; an existing one is added to (never renamed
-by the file). "Download a template" builds one from today's stages.
+`project`, `item` and `qty` are required. A new project code creates the
+project; an existing one is added to (never renamed by the file). There is no
+`stages` column: an item is not given a route. A file written for the older
+format still imports — the column is skipped, and the preview says so.
 
 The file is previewed first — projects, items, and every problem by
 spreadsheet row — and committed only if the whole file is clean.
 
+**One item at a time.** **Office → Items → New item** adds a single item to an
+existing project without a file: project, code, description, batch qty, sample
+qty, revision. Any engineer can do it.
+
 **Sample first.** Every item starts as its sample (`sample qty`, default 1).
 Only the sample is on the floor until it is logged to Done; that entry releases
-the batch (`qty`), which then follows the same stages. The release is derived
-from the log, so voiding the finishing entry takes the batch back off the floor.
+the batch (`qty`). The release is derived from the log, so voiding the
+finishing entry takes the batch back off the floor.
 
 Creating an item *is* the handoff to the floor: there is no separate release
-step. An item's sequence stays correctable in its editor until the first entry
-is logged against it, and is frozen from then on.
+step and nothing to set up. It can be logged at any stage straight away.
 
 ## Logging
 
-The floor records where units are, nothing more: **item, stage (or Done),
-station, quantity**. There is no queued / in progress / completed within a
-stage. Logs from before that change carry a state and still replay exactly —
-see `app/ledger.py`.
+Units move freely. An item has no sequence: its units rest at "not started", at
+any stage, or in Done, and an entry moves some of them **from one place to
+another**, in any direction. On the phone: tap a batch on the item card, pick
+where it went (any stage, or Done), log. The stage picked last time from that
+place starts out selected, so the usual move is still two taps.
+
+Every entry records both ends — where the units came from and where they are
+now — plus quantity, station, time and who. With no sequence to consult, that
+row is the record of the path a batch actually took, kept so real routes can be
+read out of the log later.
+
+There is no queued / in progress / completed within a stage. Sending work back
+can be a plain move or a "Rework return" (which needs a reason and marks the
+units reworked); only rework takes a finished piece back out of Done. Moving
+units to the stage they are already at is only offered where the stage has
+stations, as a change of booth.
+
+Entries logged while items still had sequences name a step and no source, and
+entries from before states were removed carry a state. Both still replay
+exactly — see `app/ledger.py`.
 
 ## How the pieces fit
 
 - `app/models.py` — schema. `events` rows are never edited (a mistake is
   superseded by a correction); `items` carries no derived state.
 - `app/ledger.py` — the derivation core. Replays an item's events into FIFO
-  lots at not started → each step → Done, gates the batch behind its sample,
+  lots at not started, each stage and Done, gates the batch behind its sample,
   and replays legacy state rows; produces WIP, aging, completion and every
   anomaly (competing/orphaned corrections, clock drift, legacy over-advance).
   Pure logic, no I/O.
 - `app/services/` — `derivation.py` loads and replays; `reports.py` builds the
   WIP, aging and exceptions payloads; `events.py` is the idempotent write path
-  and the over-advance guard; `items.py` assigns an item its stages, places any
-  starting quantities, and records revision bumps; `imports.py` reads, checks
+  and the over-advance guard; `items.py` places any starting quantities,
+  archives, and records revision bumps; `imports.py` reads, checks
   and commits a project file.
 - `app/api/` — FastAPI routers: auth, reference (the offline cache payload),
   items, imports, office (projects, stages, stations), images, events
@@ -258,12 +277,14 @@ see `app/ledger.py`.
 
 ### Decisions worth knowing about
 
-- **Over-quantity moves are rejected, not stored.** The server replays the
-  item's whole log in `occurred_at` order with the candidate included and
-  rejects only if that adds an over-advance — so out-of-order sync is never
-  falsely refused. A rejected entry is quarantined on the phone (tap the sync
-  pill) with the server's reason, a Retry and a Discard; retry is the recovery
-  path once the missing upstream entry lands or a correction frees the units.
+- **Over-quantity moves are rejected, not stored.** An entry may move no more
+  than rests at the place it takes from. The server replays the item's whole
+  log in `occurred_at` order with the candidate included and rejects only if
+  that adds an over-advance, so one phone's offline chain of moves validates
+  whatever order it arrives in. A rejected entry is quarantined on the phone
+  (tap the sync pill) with the server's reason, a Retry and a Discard; retry is
+  the recovery path once the entry it depends on lands from another phone, or
+  a correction frees the units.
 - **`POST /api/events` is idempotent on the client UUID.** Re-posts return the
   stored row; a re-post with a *different* body (any client-controlled field,
   timestamps included) returns the stored row and marks the response
@@ -276,12 +297,12 @@ see `app/ledger.py`.
 - **Aging is per item + stage**, FIFO: 40 units at paint and 50 at QC
   are two rows with independent ages, and a partial advance doesn't reset the
   clock on what stayed behind.
-- **Rework is forward motion.** A rework event pulls units back from
-  downstream, increments their rework count, and completed-count reports
-  exclude re-completions — no double-counting. The entry names the stage (or
-  Done) the units came back from, and the phone asks for it ("Taking them
-  from"): without it the ledger can only take the nearest lot downstream,
-  which is the wrong one whenever another lot rests in between.
+- **Rework is a label, not a direction.** Any move can go "backwards". A
+  rework entry is a move with a reason that increments the units' rework
+  count; completed-count reports exclude re-completions — no double-counting.
+- **The item cards show the queue.** The phone applies its unsynced entries on
+  top of the server's last answer, so a batch moved in a dead spot appears
+  where it was sent and can be tapped and moved on before anything has synced.
 - **Deleting is possible, archiving is the default.** Archiving an item — or a
   whole project with its items — takes it off every list and report, keeps its
   history, and can be undone from the item editor. "Delete for good" removes
@@ -290,12 +311,12 @@ see `app/ledger.py`.
 - **Phones only refetch the item list when something changed.** The reference
   payload carries a token computed from the tables (`app/services/sync.py`);
   a phone holding the same token skips the replay behind `/api/items`.
-- **Done is not a stage.** Units leave the last stage through an event type
-  flagged `is_finish`, which names no step. The phone offers it as "Done ✓"
-  after the last stage.
+- **Done is not a stage.** Units reach it from anywhere through an event type
+  flagged `is_finish`, which names no stage. The phone offers it as "Done ✓"
+  alongside the stages.
 - **`POST /api/items` accepts an initial per-stage distribution** for a batch
   that is already part-built when it reaches the system (with `sample_qty` 0);
-  the placements are ordinary arrivals written deepest-step-first.
+  the placements are ordinary moves out of "not started".
 - **Item photos** are online-only by design: the offline guarantee protects
   the logging path, and multi-megabyte blobs don't belong in its sync queue.
   Files are stored by row id, format-sniffed on upload, and served only

@@ -3,20 +3,17 @@
 Nothing here reads a stored status column, because none exists. Every number the
 application reports is produced by replaying `events` through this module.
 
-The model is a linear chain of positions per item:
+An item's units rest in places: "not started", any stage in the factory, or
+Done. There is no sequence between stages and no route an item must follow. An
+event moves `qty` units from the place it names as its source into the place it
+names as its target, and that is all it does:
 
-    not started -> step 10 -> step 20 -> ... -> Done
+    not started | stage | Done   --qty-->   stage | Done
 
 A unit is at a stage or it is not; there is no queued / in progress / completed
-within a stage. Each position holds FIFO lots of units. An event moves `qty`
-units *into* the position it names, pulling them from the nearest positions
-upstream (or, when the event type is flagged as rework, from the nearest
-positions downstream). Skipped logs -- units logged at veneer that were never
-logged at carpentry -- resolve themselves, because the pull walks as far back as
-it needs. An entry may instead name where its units came from
-(`from_item_step_id`, or `from_done`), and then only that place is drawn from:
-that is what keeps "QC sent 5 back to carpentry" from taking the 5 out of a lot
-resting at paint. Units reach Done through an event type flagged `is_finish`.
+within a stage. Each place holds FIFO lots of units. Units reach Done through
+an event type flagged `is_finish`. A move within one stage (to another station)
+keeps the lot's arrival time: the units have been at that stage all along.
 
 Sample first. Only `item.sample_qty` units exist at the start. The moment that
 many units have reached Done, the production batch (`item.total_qty`) is
@@ -24,17 +21,19 @@ released into "not started", timestamped by the event that finished the sample.
 The release is derived on every replay, never stored: void the finishing entry
 and the batch goes back to not existing.
 
-Legacy rows. Events logged before states were removed carry a `state_id`. Each
-legacy state gets its own slot inside the step, after the step's arrival slot
-and in `sort_order`, so those rows replay exactly as they always did -- a move
-from queued to in progress is a move within the step, and keeps the units'
-arrival time. The complete state at the last step is Done. Reports read every
-slot of a step as "at that stage".
+Legacy rows. Items used to carry an ordered sequence of steps (`item_steps`),
+and an entry named a step and no source: it took its units from the nearest
+step before it (or, for rework, after it), so a skipped log resolved itself.
+Those rows are still in the log and replay exactly as they did. The item's old
+steps become positions in their old order, placed before Done; every other
+stage gets a position after it. A row logged before states were removed also
+carries a `state_id`, and each legacy state gets its own slot inside its step.
+Reports read every slot of a stage -- legacy steps included -- as "at that
+stage", and a new entry naming that stage draws from all of them.
 
-Ordering of steps and legacy states comes from `seq` and `sort_order`. Behaviour
-comes from flags on the row. No function in this module branches on a stage,
-state or event type *code*; adding a stage or an event type must never require
-editing this file.
+Behaviour comes from flags on the row. No function in this module branches on
+a stage, state or event type *code*; adding a stage or an event type must never
+require editing this file.
 """
 
 from __future__ import annotations
@@ -63,16 +62,30 @@ class Lot:
 @dataclass(frozen=True)
 class Position:
     index: int
-    item_step_id: uuid.UUID | None
     stage_id: uuid.UUID | None
-    seq: int | None
-    # Set only on a legacy slot; the arrival slot every new event targets has none.
+    # Set only on a legacy slot: the step it belonged to, its place in the old
+    # sequence, and (for rows that predate the removal of states) its state.
+    item_step_id: uuid.UUID | None = None
+    seq: int | None = None
     state_id: uuid.UUID | None = None
     is_done: bool = False
 
     @property
     def is_unstarted(self) -> bool:
         return self.index == UNSTARTED_INDEX
+
+
+@dataclass(frozen=True)
+class Move:
+    """What one event does: which place it fills, and which it drains, in order."""
+
+    target: int
+    sources: list[int]
+    # The entry said where its units came from, so a shortfall is a shortfall
+    # at that place and not "somewhere before it".
+    named: bool
+    # Free movement between stages, as opposed to a sequence-era row.
+    free: bool
 
 
 @dataclass
@@ -186,7 +199,7 @@ def _sort_key(event: Event) -> tuple:
 
 
 class ItemLedger:
-    """Replays one item's events into positions holding FIFO lots."""
+    """Replays one item's events into places holding FIFO lots."""
 
     def __init__(self, item: Item, steps: list[ItemStep], vocab: Vocabulary) -> None:
         self.item = item
@@ -195,13 +208,12 @@ class ItemLedger:
         self.applied_count = 0
         self.last_event_at: datetime | None = None
 
-        self.positions: list[Position] = [
-            Position(index=UNSTARTED_INDEX, item_step_id=None, stage_id=None, seq=None)
-        ]
+        self.positions: list[Position] = [Position(index=UNSTARTED_INDEX, stage_id=None)]
+        # Legacy rows find their slot by (step, state).
         self._index_by_key: dict[tuple[uuid.UUID | None, uuid.UUID | None], int] = {}
-        # Every slot of a step points at the step's arrival slot, which is the
-        # position reports show for "at this stage".
-        self._display_index: dict[int, int] = {UNSTARTED_INDEX: UNSTARTED_INDEX}
+        # Every position that counts as "at this stage", in the order a new
+        # entry drains them; the first is where a new entry lands.
+        self._stage_slots: dict[uuid.UUID, list[int]] = {}
 
         ordered_steps = sorted(steps, key=lambda s: s.seq)
         ordered_states = vocab.ordered_states
@@ -213,14 +225,12 @@ class ItemLedger:
         )
         last_seq = ordered_steps[-1].seq if ordered_steps else None
         self._stage_by_step: dict[uuid.UUID, Stage] = {}
-        self._step_by_id: dict[uuid.UUID, ItemStep] = {}
         done_keys: list[tuple[uuid.UUID, uuid.UUID]] = []
         for step in ordered_steps:
-            self._step_by_id[step.id] = step
             stage = vocab.stages.get(step.stage_id)
             if stage is not None:
                 self._stage_by_step[step.id] = stage
-            arrival = self._add_position(step, state_id=None)
+            self._add_legacy_slot(step, state_id=None)
             for state in ordered_states:
                 if state.is_complete and (
                     step.seq == last_seq or (stage is not None and stage.is_terminal)
@@ -228,16 +238,22 @@ class ItemLedger:
                     # Completed at the end of the sequence was always "finished".
                     done_keys.append((step.id, state.id))
                     continue
-                slot = self._add_position(step, state_id=state.id)
-                self._display_index[slot] = arrival
+                self._add_legacy_slot(step, state_id=state.id)
 
+        # Done sits after the legacy steps, which is what lets a sequence-era
+        # finish row pull from "everything before it" exactly as it always did.
         self.done_index = len(self.positions)
-        self.positions.append(
-            Position(index=self.done_index, item_step_id=None, stage_id=None, seq=None, is_done=True)
-        )
-        self._display_index[self.done_index] = self.done_index
+        self.positions.append(Position(index=self.done_index, stage_id=None, is_done=True))
         for key in done_keys:
             self._index_by_key[key] = self.done_index
+
+        # Every other stage in the factory: an item can be logged at any of
+        # them. In a fixed order, so a replay is deterministic.
+        for stage in sorted(vocab.stages.values(), key=lambda s: (s.sort_order, s.code)):
+            if stage.id not in self._stage_slots:
+                index = len(self.positions)
+                self.positions.append(Position(index=index, stage_id=stage.id))
+                self._stage_slots[stage.id] = [index]
 
         self.buckets: list[deque[Lot]] = [deque() for _ in self.positions]
 
@@ -253,19 +269,19 @@ class ItemLedger:
         else:
             self._release(start)
 
-    def _add_position(self, step: ItemStep, state_id: uuid.UUID | None) -> int:
+    def _add_legacy_slot(self, step: ItemStep, state_id: uuid.UUID | None) -> int:
         index = len(self.positions)
         self.positions.append(
             Position(
                 index=index,
-                item_step_id=step.id,
                 stage_id=step.stage_id,
+                item_step_id=step.id,
                 seq=step.seq,
                 state_id=state_id,
             )
         )
         self._index_by_key[(step.id, state_id)] = index
-        self._display_index[index] = index
+        self._stage_slots.setdefault(step.stage_id, []).append(index)
         return index
 
     def _release(self, moment: datetime) -> None:
@@ -273,52 +289,88 @@ class ItemLedger:
         if self.item.total_qty > 0:
             self.buckets[UNSTARTED_INDEX].append(Lot(qty=self.item.total_qty, arrived_at=moment))
 
+    # -- what an event does ---------------------------------------------------
+
+    def resolve(self, event: Event, event_type: EventType) -> tuple[Move | None, str | None]:
+        """The move an event describes, or the reason it describes none.
+
+        Shared by the replay and by the write path, so "would this be stored?"
+        and "what does it do once stored?" can never disagree.
+        """
+        free = (
+            event.stage_id is not None
+            or event.from_stage_id is not None
+            or bool(event.from_unstarted)
+        )
+        if free:
+            return self._resolve_free(event, event_type)
+        return self._resolve_legacy(event, event_type)
+
+    def _resolve_free(self, event: Event, event_type: EventType) -> tuple[Move | None, str | None]:
+        if event_type.is_finish:
+            if event.stage_id is not None:
+                return None, "a finish entry moves units to Done and names no stage"
+            target = self.done_index
+        else:
+            slots = self._stage_slots.get(event.stage_id) if event.stage_id else None
+            if not slots:
+                return None, "event names no stage, or one that does not exist"
+            target = slots[0]
+
+        named = [
+            event.from_stage_id is not None,
+            bool(event.from_unstarted),
+            bool(event.from_done),
+        ]
+        if sum(named) != 1:
+            return None, "event must name exactly one place its units come from"
+        if event.from_unstarted:
+            sources = [UNSTARTED_INDEX]
+        elif event.from_done:
+            sources = [self.done_index]
+        else:
+            sources = list(self._stage_slots.get(event.from_stage_id, []))
+            if not sources:
+                return None, "event takes units from a stage that does not exist"
+        if sources == [target] and self.positions[target].is_done:
+            return None, "event moves units from Done to Done"
+        return Move(target=target, sources=sources, named=True, free=True), None
+
+    def _resolve_legacy(
+        self, event: Event, event_type: EventType
+    ) -> tuple[Move | None, str | None]:
+        if event_type.is_finish:
+            target = self.done_index
+        elif event.item_step_id is None:
+            return None, "event names no stage"
+        else:
+            target = self._index_by_key.get((event.item_step_id, event.state_id))
+            if target is None:
+                return None, "event names a step that is not one of this item's stages"
+
+        # Sequence-era rule: everything on the right side of the target,
+        # nearest first -- before it for a move, after it for rework. Done is
+        # the last legacy position; the stages added after it are not part of
+        # any sequence, and only a rework row can reach them.
+        if event_type.is_rework:
+            order = list(range(target + 1, len(self.positions)))
+        else:
+            order = list(range(target - 1, -1, -1))
+        named = event.from_item_step_id is not None or bool(event.from_done)
+        if event.from_done:
+            order = [i for i in order if i == self.done_index]
+        elif event.from_item_step_id is not None:
+            order = [i for i in order if self.positions[i].item_step_id == event.from_item_step_id]
+        if named and not order:
+            side = "after" if event_type.is_rework else "before"
+            return None, f"event names a source that is not {side} its target in the item's sequence"
+        return Move(target=target, sources=order, named=named, free=False), None
+
     # -- replay ---------------------------------------------------------------
 
     def apply_all(self, events: list[Event]) -> None:
         for event in events:
             self.apply(event)
-
-    def target_index(
-        self,
-        item_step_id: uuid.UUID | None,
-        state_id: uuid.UUID | None = None,
-        is_finish: bool = False,
-    ) -> int | None:
-        """The position an event lands in, or None if it names nothing on
-        this item's chain."""
-        if is_finish:
-            return self.done_index
-        if item_step_id is None:
-            return None
-        return self._index_by_key.get((item_step_id, state_id))
-
-    def source_order(
-        self,
-        target_index: int,
-        is_rework: bool,
-        from_item_step_id: uuid.UUID | None = None,
-        from_done: bool = False,
-    ) -> list[int]:
-        """The positions an event landing at `target_index` draws from, in the
-        order it drains them.
-
-        Unnamed, that is every position on the right side of the target,
-        nearest first: upstream for a move, downstream for rework (rework is
-        forward motion -- the units are further along and come back). When the
-        entry names where the units came from, only that place is drawn from,
-        and only if it lies on the right side; an empty list means the named
-        source is not somewhere this event could take units from.
-        """
-        if is_rework:
-            order = list(range(target_index + 1, len(self.positions)))
-        else:
-            order = list(range(target_index - 1, -1, -1))
-        if from_done:
-            return [i for i in order if i == self.done_index]
-        if from_item_step_id is not None:
-            return [i for i in order if self.positions[i].item_step_id == from_item_step_id]
-        return order
 
     def apply(self, event: Event) -> None:
         self.applied_count += 1
@@ -331,7 +383,9 @@ class ItemLedger:
             return
 
         stage = (
-            self._stage_by_step.get(event.item_step_id)
+            self.vocab.stages.get(event.stage_id)
+            if event.stage_id is not None
+            else self._stage_by_step.get(event.item_step_id)
             if event.item_step_id is not None
             else None
         )
@@ -352,42 +406,17 @@ class ItemLedger:
             # Item-level events (a revision bump, say) are history, not movement.
             return
 
-        target_index = self.target_index(
-            event.item_step_id, event.state_id, is_finish=event_type.is_finish
-        )
-        if target_index is None:
-            self._flag(
-                event,
-                "unknown_position",
-                "event names a step that is not one of this item's stages",
-            )
+        move, problem = self.resolve(event, event_type)
+        if move is None:
+            self._flag(event, "unknown_position", problem or "event describes no move")
             return
 
         if event.qty <= 0:
             return
 
-        sources = self.source_order(
-            target_index,
-            event_type.is_rework,
-            event.from_item_step_id,
-            bool(event.from_done),
-        )
-        named = event.from_item_step_id is not None or bool(event.from_done)
-        if named and not sources:
-            self._flag(
-                event,
-                "unknown_position",
-                (
-                    "event names a source that is not "
-                    f"{'downstream' if event_type.is_rework else 'upstream'} of its target "
-                    "on this item's sequence"
-                ),
-            )
-            return
-
-        taken, shortfall = self._take(sources, event.qty)
+        taken, shortfall = self._take(move.sources, event.qty)
         if shortfall:
-            if named:
+            if move.named:
                 where = "at the place it takes them from"
             else:
                 where = "downstream" if event_type.is_rework else "upstream"
@@ -400,20 +429,21 @@ class ItemLedger:
                 ),
             )
 
-        destination = self.buckets[target_index]
-        target_step = self.positions[target_index].item_step_id
+        destination = self.buckets[move.target]
+        target = self.positions[move.target]
         rework_bump = 1 if event_type.is_rework else 0
         for source_index, lot in taken:
-            same_stage = (
-                target_step is not None
-                and self.positions[source_index].item_step_id == target_step
-            )
+            source = self.positions[source_index]
+            # Not an arrival: a move between stations of one stage, or a
+            # legacy move between the states of one step. The units have been
+            # at this stage all along, so their clock keeps running.
+            stayed = (
+                move.free and target.stage_id is not None and source.stage_id == target.stage_id
+            ) or (target.item_step_id is not None and source.item_step_id == target.item_step_id)
             destination.append(
                 Lot(
                     qty=lot.qty,
-                    # A legacy move within one stage (queued -> in progress) is
-                    # not an arrival: the units have been at this stage all along.
-                    arrived_at=lot.arrived_at if same_stage else event.occurred_at,
+                    arrived_at=lot.arrived_at if stayed else event.occurred_at,
                     # Exactly what the event says, never inherited from the source
                     # lot: a stage without stations must not show its units parked
                     # at the previous stage's station.
@@ -470,8 +500,9 @@ class ItemLedger:
     # -- reading it back ------------------------------------------------------
 
     def occupied(self, include_unstarted: bool = True, include_finished: bool = False):
-        """Places currently holding units, in sequence order: not started, each
-        stage (all of its legacy slots merged), Done."""
+        """Places currently holding units: not started, then each stage (every
+        slot of it merged, legacy steps included) in the factory's stage order,
+        then Done."""
         grouped: dict[int, list[Lot]] = {}
         for position in self.positions:
             lots = self.buckets[position.index]
@@ -481,10 +512,24 @@ class ItemLedger:
                 continue
             if position.is_done and not include_finished:
                 continue
-            grouped.setdefault(self._display_index[position.index], []).extend(lots)
+            home = (
+                self._stage_slots[position.stage_id][0]
+                if position.stage_id is not None
+                else position.index
+            )
+            grouped.setdefault(home, []).extend(lots)
+
+        def order(index: int) -> tuple:
+            position = self.positions[index]
+            if position.is_unstarted:
+                return (0, 0, "")
+            if position.is_done:
+                return (2, 0, "")
+            stage = self.vocab.stages.get(position.stage_id)
+            return (1, stage.sort_order if stage else 0, stage.code if stage else "")
 
         result: list[Bucket] = []
-        for index in sorted(grouped):
+        for index in sorted(grouped, key=order):
             lots = grouped[index]
             by_station: dict[uuid.UUID | None, int] = {}
             for lot in lots:
@@ -501,14 +546,9 @@ class ItemLedger:
             )
         return result
 
-    def qty_at(self, item_step_id: uuid.UUID) -> int:
-        """Units at this stage, across every slot of the step."""
-        return sum(
-            lot.qty
-            for position in self.positions
-            if position.item_step_id == item_step_id
-            for lot in self.buckets[position.index]
-        )
+    def qty_in(self, indexes) -> int:
+        """Units resting across these positions."""
+        return sum(lot.qty for index in indexes for lot in self.buckets[index])
 
     @property
     def done_qty(self) -> int:
@@ -534,14 +574,6 @@ class ItemLedger:
     @property
     def phase(self) -> str:
         return "production" if self.released_at is not None else "sample"
-
-    def available_upstream(self, target: int, is_rework: bool = False) -> int:
-        """How many units an event landing at `target` could legitimately move."""
-        if is_rework:
-            indexes = range(target + 1, len(self.positions))
-        else:
-            indexes = range(target - 1, -1, -1)
-        return sum(lot.qty for index in indexes for lot in self.buckets[index])
 
 
 def clock_anomalies(

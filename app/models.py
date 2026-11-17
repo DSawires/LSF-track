@@ -60,7 +60,12 @@ class Stage(Base):
     # Behaviour flags. Add columns here rather than branching on the code.
     requires_station: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     requires_external_po: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    # False = a whole-lot stage: a move into it must take everything resting
+    # at the place it comes from, never split it.
     allows_partial_qty: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    # Legacy only. It used to mark the stage that closed a sequence; there are
+    # no sequences now. It is still read when replaying rows that carry a
+    # legacy state: "completed" at a terminal stage was Done.
     is_terminal: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     # Days in one state at this stage before the aging report and item cards
     # flag it. NULL = no opinion (outsourced work sits for weeks by design).
@@ -159,14 +164,16 @@ class Item(Base):
     current_status, no is_complete. Those come from the event log.
 
     There is no released/unreleased state either. Creating an item IS the
-    handoff to the floor: it is given its stages and is loggable from that
-    moment, and `created_at` is when production started counting.
+    handoff to the floor: it is loggable from that moment, at any stage, and
+    `created_at` is when production started counting. An item has no stages of
+    its own -- no sequence, no route. Where its units have been is whatever
+    the log says.
 
     `drawing_revision` is authored by the technical office rather than derived, and
     every change to it is also written to the log as a revision-bump event.
 
     Every item starts as a sample: only `sample_qty` units exist on the floor
-    until the sample has walked the whole sequence into Done, and at that moment
+    until the sample has been logged Done, and at that moment
     `total_qty` -- the production batch, on top of the sample -- is released
     into "not started". The release is derived from the log by the ledger, never
     stored. `sample_qty` 0 means no sample (items that predate the sample flow).
@@ -195,16 +202,14 @@ class Item(Base):
 
 
 class ItemStep(Base):
-    """One stage in this item's own production sequence.
+    """Legacy: one stage in an item's own ordered sequence.
 
-    Chosen per item when the item is created -- either by picking stages, or by
-    copying the sequence off a sibling item in the same project. There is no
-    shared template behind it: two items only share a sequence because someone
-    copied one, and editing one item's stages can never touch another's.
-
-    Rewritable until the floor logs against the item, frozen from then on: once
-    events reference a step, the step is what that history means. Seq numbers go
-    in tens so a stage can be slotted between two existing ones.
+    Items no longer have sequences -- units move freely between stages, and an
+    entry names the stage directly (`events.stage_id`). Nothing creates these
+    rows any more. They stay because entries logged before that change point
+    at one (`events.item_step_id`), and replaying those needs the order they
+    were logged against: such a row took its units from the nearest step
+    before it. See app/ledger.py.
     """
 
     __tablename__ = "item_steps"
@@ -252,6 +257,13 @@ class Event(Base):
     # Generated on the client so a retry after a lost response is a no-op.
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True)
     item_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("items.id"), index=True)
+    # Where the units are now: a stage. NULL on a finish entry (the units are
+    # Done) and on item-level entries (a revision bump, a correction).
+    stage_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("stages.id"), nullable=True, index=True
+    )
+    # Legacy only: rows logged while items had sequences named a step, not a
+    # stage. New rows leave it NULL.
     item_step_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("item_steps.id"), nullable=True, index=True
     )
@@ -264,16 +276,25 @@ class Event(Base):
         sa.ForeignKey("event_states.id"), nullable=True
     )
     qty: Mapped[int] = mapped_column(sa.Integer, default=0)
-    # Where the units came from, when the entry says so: one of the item's own
-    # steps, or Done. Both empty means "the nearest units on the right side of
-    # the target", which is what every row logged before these columns means.
-    # It matters for rework: QC sending 5 back to carpentry while another lot
-    # rests at paint is only unambiguous if the entry names QC.
-    from_item_step_id: Mapped[uuid.UUID | None] = mapped_column(
-        sa.ForeignKey("item_steps.id"), nullable=True
+    # Where the units came from: a stage, "not started", or Done -- exactly
+    # one of the three on every entry that moves units. Together with the
+    # target above this is the movement itself, kept on the row: from -> to,
+    # how many, when, who. Units move freely, so the log is the only record of
+    # the path a batch actually took.
+    from_stage_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("stages.id"), nullable=True
+    )
+    from_unstarted: Mapped[bool] = mapped_column(
+        sa.Boolean, default=False, server_default=sa.false()
     )
     from_done: Mapped[bool] = mapped_column(
         sa.Boolean, default=False, server_default=sa.false()
+    )
+    # Legacy only: a sequence-era rework row naming the step it took from.
+    # Rows with no source at all are older still, and replay by taking the
+    # nearest units before (or, for rework, after) their step.
+    from_item_step_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("item_steps.id"), nullable=True
     )
     reason_code_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("reason_codes.id"), nullable=True

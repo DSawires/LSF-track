@@ -25,7 +25,6 @@ from app.models import (
 from app.schemas import EventCreate
 from app.security import hash_password
 from app.services.events import record_event
-from app.services.items import assign_steps
 from seeds.seed import run as run_seed
 
 
@@ -70,8 +69,8 @@ def run(db: Session) -> None:
         projects[code] = project
 
     stage_ids = {s.code: s.id for s in db.scalars(sa.select(Stage))}
-    # The standard casegoods sequence. It is not a template any more -- each
-    # demo item simply gets its own copy of it, which is what the app does.
+    # The path casegoods usually take. Nothing holds an item to it -- units
+    # move freely between stages -- so this is only the walk the demo logs.
     casegoods = [
         stage_ids[code] for code in ("carpentry", "veneer", "paint", "qc", "packing")
     ]
@@ -111,43 +110,49 @@ def run(db: Session) -> None:
         )
         db.add(item)
         db.flush()
-        steps = assign_steps(db, item, casegoods, created_at=started)
         moment = started
 
-        # The sample walks the whole sequence first; the batch exists after.
+        def log(to_stage, from_stage, event_type, units):
+            record_event(
+                db,
+                EventCreate(
+                    id=uuid.uuid4(),
+                    item_id=item.id,
+                    stage_id=to_stage,
+                    from_stage_id=from_stage,
+                    from_unstarted=from_stage is None,
+                    event_type_id=event_type.id,
+                    qty=units,
+                    station_id=stations_by_stage.get(to_stage) if to_stage else None,
+                    occurred_at=moment,
+                ),
+                user,
+            )
+
+        # The sample goes through every stage first; the batch exists after.
         if sample_qty:
-            for step in steps:
+            at = None  # None = not started
+            finished = True
+            for stage_id in casegoods:
                 moment += timedelta(hours=4)
                 if moment >= now:
+                    finished = False
                     break
-                _log(db, user, item, step, move_type, sample_qty, moment, stations_by_stage)
+                log(stage_id, at, move_type, sample_qty)
+                at = stage_id
             moment += timedelta(hours=4)
-            if moment >= now:
+            if not finished or moment >= now:
                 continue
-            _log(db, user, item, None, finish_type, sample_qty, moment, stations_by_stage)
+            log(None, at, finish_type, sample_qty)
 
         # Walk the batch down the stages, leaving a spread of ages behind.
         moving = qty
-        for depth, step in enumerate(steps):
+        at = None
+        for depth, stage_id in enumerate(casegoods):
             moment += timedelta(hours=18 + depth * 9)
             if moving <= 0 or moment >= now:
                 break
-            _log(db, user, item, step, move_type, moving, moment, stations_by_stage)
+            log(stage_id, at, move_type, moving)
+            at = stage_id
             # Leave roughly a third behind at each stage.
             moving -= moving // 3
-
-
-def _log(db, user, item, step, event_type, qty, moment, stations_by_stage) -> None:
-    record_event(
-        db,
-        EventCreate(
-            id=uuid.uuid4(),
-            item_id=item.id,
-            item_step_id=step.id if step else None,
-            event_type_id=event_type.id,
-            qty=qty,
-            station_id=stations_by_stage.get(step.stage_id) if step else None,
-            occurred_at=moment,
-        ),
-        user,
-    )

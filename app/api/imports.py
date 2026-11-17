@@ -28,9 +28,9 @@ router = APIRouter(prefix="/api/import", tags=["import"])
 
 
 @router.get("/template")
-def template(db: Session = Depends(get_db), user: User = Depends(current_user)) -> Response:
+def template(user: User = Depends(current_user)) -> Response:
     return Response(
-        content=template_csv(db),
+        content=template_csv(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="lsf-import-template.csv"'},
     )

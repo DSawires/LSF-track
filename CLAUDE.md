@@ -56,7 +56,7 @@ The factory will add stages. Assume this will happen repeatedly and that the per
 adding one will not be a developer.
 
 Adding a stage must require **zero code changes and zero deploys**. It is an insert
-into `stages`. It is pickable on the next item created, with no further setup.
+into `stages`. Every item can be logged at it straight away, with no further setup.
 
 Concretely, this means:
 
@@ -68,51 +68,60 @@ Concretely, this means:
 - No CHECK constraints enumerating stage codes.
 
 Anything stage-specific must be expressed as a **flag or attribute on the stage row**
-(e.g. `requires_external_po`, `allows_partial_qty`, `is_terminal`), never as a branch
+(e.g. `requires_external_po`, `allows_partial_qty`, `requires_station`), never as a branch
 on its name. If a new behaviour is needed, add a column to `stages`, give it a
 default that preserves current behaviour, and branch on the column.
 
 The same applies to `event_types` and `reason_codes`: table-driven, not enums.
 
-### 3. Each item owns its stage sequence
+### 3. Units move freely; the entry is the record of the path
 
-There are no shared route templates. An item's stages are chosen on the item, when
-it is created, and written to `item_steps` — in practice from the `stages` cell of
-its row in the project import file. Two items only share a sequence because the
-file says so twice: nothing links them afterwards, and editing one item's stages
-can never reach another's.
+An item has no stages of its own: no sequence, no route, no template. Its units
+rest in places — "not started", any stage in the factory, or Done — and an entry
+moves some of them from one place to another, in any direction. Nothing has to
+be visited first and nothing has to be last.
 
-This is what makes adding a stage safe. New items pick it up; work already on the
-floor keeps the sequence its events were logged against, because there is no
-template that could reach in and re-version it.
+So every entry that moves units names both ends: the stage they are at now
+(`stage_id`; none on a finish, which puts them in Done) and the place they came
+from (`from_stage_id`, or `from_unstarted`, or `from_done`). That is not
+optional and is never inferred. With no sequence to consult, the row is the
+only record of the path a batch actually took, and it is kept so the real
+routes can be read back out of the log later.
 
-A sequence is rewritable until the floor logs against the item, and frozen from
-then on — once an event points at a step, that step is what the event *means*, and
-rewriting it would quietly re-label work already done.
+Do not reintroduce an order between stages: no "next stage", no "upstream", no
+picker that hides stages an item is not expected to reach, no report that
+assumes a direction. `stages.sort_order` is the order stages are *listed* in,
+nothing more. The phone may remember where units last went from a place and
+offer that first — a default the engineer can see and change, not a rule.
 
-Use sequence numbers in increments of 10 so a stage can be inserted between two
-existing ones without renumbering.
+`item_steps` and `events.item_step_id` are legacy. Items used to carry an
+ordered sequence, and an entry named a step and no source: it took the nearest
+units before that step. Those rows are in the log and replay exactly as they
+did (`app/ledger.py`), and that shape is still accepted on `POST /events` so a
+phone holding old queued entries can drain. Nothing creates a step any more.
 
 ### 4. Quantities live on events
 
 An item is usually a batch (e.g. 120 identical bedside tables). Events carry a `qty`,
 so a batch can partially advance. Never assume an item moves as an indivisible unit.
 
-Quantity in a given state is derived by summing events. A batch advancing more
-units than exist upstream is a **validation error** (422), never silently stored.
-The check simulates the item's whole log in `occurred_at` order with the candidate
-event included, so out-of-order sync is never falsely rejected; a genuine rejection
-is quarantined on the phone with the reason and a Retry button, which is how it
-resolves once a correction voids the conflicting entry or the missing upstream
-event syncs in from another device. Rows that predate the guard still surface as
+Quantity at a place is derived by replaying events. Moving more units than rest
+at the place the entry takes them from is a **validation error** (422), never
+silently stored. The check simulates the item's whole log in `occurred_at` order
+with the candidate event included, so an offline chain of moves validates
+against itself whatever order it arrives in. An entry that reaches the server
+before the one it depends on (a move out of paint before the move into it, from
+another phone) is refused and quarantined on the phone with the reason and a
+Retry button, which is how it resolves once the other entry lands or a
+correction frees the units. Rows that predate the guard still surface as
 `over_advance` anomalies in the exceptions view.
 
 ### 5. Sample first, then the batch — derived, not stored
 
 Every item starts as a sample (`items.sample_qty`, default 1). Until the sample has
-walked the item's whole sequence into Done, only the sample exists on the floor.
-The moment it reaches Done, the production batch (`total_qty`, on top of the
-sample) is released into "not started" and follows the same stages.
+been logged Done — by whatever path it takes — only the sample exists on the
+floor. The moment it reaches Done, the production batch (`total_qty`, on top of
+the sample) is released into "not started".
 
 The release is computed by the ledger on every replay, timestamped by the event
 that finished the sample. It is never a column, never a stored flag, never an
@@ -123,24 +132,26 @@ existing. `sample_qty` 0 means no sample (items that predate the flow).
 
 There are no per-stage states (no queued / in progress / completed). An event
 says "these units are now at this stage"; an event of a type flagged `is_finish`
-moves them off the end of the sequence into Done. `event_states` and
-`events.state_id` survive only because the log already holds rows that reference
-them: the ledger replays those in per-state slots inside their step, and reads
-every slot of a step as "at that stage". Never write a new state; never add one.
+moves them into Done, from wherever they are. A move within one stage only
+means something as a change of station, and does not restart the units' age.
+`event_states` and `events.state_id` survive only because the log already holds
+rows that reference them: the ledger replays those in per-state slots inside
+their step, and reads every slot of a stage as "at that stage". Never write a
+new state; never add one.
 
-### 7. Rework is forward motion, not a reversal
+### 7. Rework is a labelled move, not a reversal
 
-A piece returning from QC to an earlier stage is an event of type `rework_return`
-with a `reason_code` and a target step, not a backwards transition or a deleted
-event. Throughput and cycle-time reports must exclude rework quantities from
-completed counts, or they will double-count.
+Sending work back is an entry like any other — it names where the units came
+from and where they went. What makes it rework is its type: an event type
+flagged `is_rework` requires a `reason_code` and marks the units as reworked.
+It is never a deleted event or an edit to the entry being "undone".
 
-A rework entry names where the units came back from (`from_item_step_id`, or
-`from_done`), and only that place is drawn from. Without it the ledger takes
-the nearest units downstream of the target, which is wrong whenever another lot
-rests in between: QC returning 5 to carpentry must not take them from paint.
-Rows that carry no source — everything logged before the column — still replay
-nearest-first.
+Units can go back to an earlier stage as a plain move too; that is allowed and
+simply is not counted as rework. The one thing only rework can do is take units
+back out of Done, because a finished piece coming back always has a reason.
+
+Throughput and cycle-time reports must exclude rework quantities from completed
+counts, or they will double-count.
 
 ### 8. Facts, not judgments
 
@@ -164,8 +175,10 @@ Names are indicative; Alembic migrations are authoritative.
 - `items` — a batch: code, project, description, total qty (the production
   batch), sample qty, current drawing revision. Creating one **is** the handoff
   to the floor: there is no released/unreleased state, and `created_at` is when
-  the sample started counting. Items arrive through the project import file
-- `item_steps` — this item's own ordered stages, chosen at creation
+  the sample started counting. Items arrive through the project import file,
+  or one at a time from Office → Items. An item has no stages of its own
+- `item_steps` — legacy only (see rule 3): the ordered sequence items used to
+  carry. Never written; read to replay entries that point at a step
 - `events` — the log. See below.
 - `event_types`, `reason_codes` — table-driven vocabularies
 - `event_states` — legacy only (see rule 6); no longer seeded, never written
@@ -184,13 +197,15 @@ Names are indicative; Alembic migrations are authoritative.
 |---|---|
 | `id` | UUID, **generated by the client** |
 | `item_id` | |
-| `item_step_id` | nullable for item-level events (revision bumps) and finish entries |
-| `station_id` | nullable; required where the stage has stations |
+| `stage_id` | where the units are now. NULL on a finish entry (Done) and on item-level events |
+| `station_id` | nullable; set where the stage has stations |
 | `event_type_id` | |
-| `state_id` | legacy only, NULL on every new row (see rule 6) |
 | `qty` | |
-| `from_item_step_id` | nullable; where the units came from. The phone sets it on rework (rule 7) |
-| `from_done` | the units came back out of Done; rework only |
+| `from_stage_id` | where the units came from, if that was a stage |
+| `from_unstarted` | they came from "not started" |
+| `from_done` | they came back out of Done; rework only |
+| `item_step_id`, `from_item_step_id` | legacy only (rule 3): sequence-era rows name steps |
+| `state_id` | legacy only, NULL on every new row (see rule 6) |
 | `reason_code_id` | nullable |
 | `occurred_at` | device time, when it happened on the floor |
 | `received_at` | server time, set on insert |
@@ -199,8 +214,11 @@ Names are indicative; Alembic migrations are authoritative.
 | `note` | nullable, free text, never parsed |
 | `supersedes_event_id` | nullable, for corrections |
 
+Exactly one of `from_stage_id` / `from_unstarted` / `from_done` is set on every
+new entry that moves units.
+
 Index for the queries that matter: `(item_id, occurred_at)`,
-`(station_id, occurred_at)`, `(received_at)`.
+`(station_id, occurred_at)`, `(received_at)`, `(stage_id)`.
 
 ## Offline and sync
 
@@ -237,7 +255,12 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
 - Login, logout, session handling that survives offline shifts
 - Item list, filterable by project and stage, plus free-text search
 - Event logging: pre-selected fields, under fifteen seconds, one-handed on a phone.
-  The picker is the item's stages plus Done; no state picker
+  Tap a batch on the item card (that is "from"), pick where it went — any
+  stage, or Done — and log. The stage picked last time from that place starts
+  out selected. No state picker
+- The item cards show queued entries at once: `localPlaces()` in
+  `static/js/app.js` applies the phone's unsynced queue on top of the server's
+  last answer, so a batch moved in a dead spot can be tapped and moved on
 - WIP by stage and station (depth = units at the stage), with sample units shown
 - Aging report: days at current stage, sorted descending
 - Exceptions view: clock drift, late syncs, competing/orphaned corrections and
@@ -245,13 +268,14 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   Clock and late-sync flags drop off `LSF_CLOCK_FLAG_DAYS` (30) after the entry
   reached the server; flags about something still wrong never do
 - Office → Import: projects and their items arrive as one spreadsheet (.xlsx or
-  .csv, one row per item: project, item, qty, sample qty, revision, stages).
+  .csv, one row per item: project, item, qty, sample qty, revision).
   Previewed, then committed all-or-nothing. Format lives in
-  `app/services/imports.py`; `GET /api/import/template` builds a template from
-  the stages that exist now
-- Office tab: projects, item editing, and admin management of stages/stations.
-  `POST /api/items` (one item, optional mid-production distribution with
-  `sample_qty` 0) remains as the API underneath the import
+  `app/services/imports.py`; `GET /api/import/template` returns a template.
+  A `stages` column from an older file is read past, and the preview says so
+- Office → Items → New item: one item added to a project by hand, without an
+  import, by any engineer. It posts `POST /api/items`, which also takes an
+  optional mid-production distribution by stage (with `sample_qty` 0)
+- Office tab: projects, item editing, and admin management of stages/stations
 - Taking work off the floor (admin): archive an item, or a project together
   with its items — each archive is an event, and both can be reactivated.
   Finished jobs should be archived: every active item is replayed by every
@@ -290,9 +314,8 @@ Performed by an admin in the app: Office tab → "Stages & stations".
 
 1. Add the stage with the appropriate behaviour flags.
 2. Add stations if the stage has physical instances.
-3. Nothing else. No deploy, no migration, no code change. The stage can be named
-   in the next import file (and appears in the downloadable template), and items
-   already on the floor keep the sequence their entries were logged against.
+3. Nothing else. No deploy, no migration, no code change. Every item — new or
+   already on the floor — can be logged at the stage on the phone's next sync.
 
 If a stage cannot be added this way, that is a bug in the design and should be
 fixed rather than patched around.
@@ -318,18 +341,29 @@ fixed rather than patched around.
   deadlock.
 - `/api/docs` is off unless `LSF_API_DOCS=true`: it is served without a
   session, and the production host is on the public internet.
-- `stages.is_terminal` only means "must be last in a sequence". Units finish
-  through a finish entry; the flag completes units only on legacy state rows.
+- `stages.is_terminal` is legacy: it marked the stage that closed a sequence.
+  It is off the admin screen and read only when replaying rows that carry a
+  legacy state. `allows_partial_qty` false now means a move into the stage must
+  take everything resting at the place it comes from.
+- An entry naming a source is refused if it arrives before the entry that put
+  the units there. One phone's own chain always arrives together and is ordered
+  by the server; across phones the refused entry waits under the sync pill with
+  Retry. This replaced the old "skipped stages resolve themselves" behaviour,
+  which depended on a sequence to walk back along.
+- After a deploy the service worker swaps in the new shell, and the page
+  reloads onto it (never while a field has focus). A phone still running the
+  script from before sequences were removed needs the app reopened once.
 
 ## Glossary
 
 - **Item** — a batch of identical pieces tracked as one unit, with a quantity.
-- **Sample** — the first unit(s) of an item, built through every stage before
-  the batch exists. Its completion releases the batch.
-- **Done** — the end of every sequence. Not a stage; reached by a finish entry.
+- **Sample** — the first unit(s) of an item, built before the batch exists.
+  Logging it Done releases the batch.
+- **Place** — where units can rest: not started, a stage, or Done.
+- **Done** — where finished units rest. Not a stage; reached by a finish entry.
 - **Stage** — a step type in production (paint, veneer, …).
 - **Station** — a physical instance of a stage; there are two paint stations.
-- **Sequence** — the ordered stages one item passes through. Per item, not shared.
+- **Move** — an entry: some units, from one place to another. Any direction.
 - **Revision bump** — a drawing revision issued after the item is in production;
   flags any quantity currently in flight.
 - **Outsourced** — work at an external supplier. Modelled as a stage with

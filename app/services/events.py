@@ -6,13 +6,19 @@ Idempotency: the client generates the UUID, so a retry after a lost response fin
 the row already there and returns it. Re-posting is never an error and never
 duplicates.
 
-Rejections are structural or arithmetic, never silent. An unknown id, a step that
-belongs to another item, or a move of more units than the log holds upstream of the
-target all return a 422 with a reason. Nothing is dropped without the client being
-told: the phone quarantines a rejected entry where the engineer can see the reason,
-retry it (the recovery path when the missing upstream entry syncs later from another
-device), or discard it. Batches are applied in occurred_at order so an offline
-session's own sequence of entries always validates against itself.
+Rejections are structural or arithmetic, never silent. An unknown id, an entry
+that does not say where its units came from, or a move of more units than the
+log holds at that place all return a 422 with a reason. Nothing is dropped
+without the client being told: the phone quarantines a rejected entry where the
+engineer can see the reason, retry it (the recovery path when the entry it
+depends on syncs later from another device), or discard it. Batches are applied
+in occurred_at order so an offline session's own chain of moves always
+validates against itself.
+
+An entry names a stage and a source: units move freely, from any place to any
+stage or to Done. The older shape -- a step of the item's sequence, and no
+source -- is still accepted, because a phone that has not reopened the app since
+the change may be holding queued entries in it, and those must drain.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from app.models import (
     Item,
     ItemStep,
     ReasonCode,
+    Stage,
     Station,
     User,
 )
@@ -91,43 +98,62 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
     if event_type is None or not event_type.is_active:
         raise EventRejected("unknown event type", "event_type_id")
 
+    stage = None
     item_step = None
-    if event_type.is_finish and payload.item_step_id is not None:
-        raise EventRejected(
-            "a finish entry moves units to Done and names no stage", "item_step_id"
-        )
-    if payload.item_step_id is not None:
+    if payload.stage_id is not None and payload.item_step_id is not None:
+        raise EventRejected("an entry names a stage or a legacy step, not both", "stage_id")
+    if event_type.is_finish and (payload.stage_id is not None or payload.item_step_id is not None):
+        raise EventRejected("a finish entry moves units to Done and names no stage", "stage_id")
+    if payload.stage_id is not None:
+        stage = db.get(Stage, payload.stage_id)
+        if stage is None:
+            raise EventRejected("unknown stage", "stage_id")
+    elif payload.item_step_id is not None:
+        # Sequence-era payload, from a queue filled before the change.
         item_step = db.get(ItemStep, payload.item_step_id)
         if item_step is None:
             raise EventRejected("unknown item step", "item_step_id")
         if item_step.item_id != item.id:
             raise EventRejected("item step belongs to a different item", "item_step_id")
+        stage = db.get(Stage, item_step.stage_id)
     elif event_type.requires_item_step:
-        raise EventRejected("this event type needs a step", "item_step_id")
+        raise EventRejected("this entry needs a stage", "stage_id")
 
-    # Where the units came from, if the entry says: one of this item's steps,
-    # or Done. Whether that place lies on the right side of the target is a
-    # question about the sequence, answered in _validate_availability.
-    from_step = None
+    # Where the units came from: a stage, "not started", or Done.
+    sources = [
+        payload.from_stage_id is not None,
+        payload.from_unstarted,
+        payload.from_done,
+        payload.from_item_step_id is not None,
+    ]
+    if sum(sources) > 1:
+        raise EventRejected("an entry takes its units from one place only", "from_stage_id")
+    if any(sources) and not event_type.moves_quantity:
+        raise EventRejected(
+            "only an entry that moves units can say where they came from", "from_stage_id"
+        )
+    if payload.from_stage_id is not None and db.get(Stage, payload.from_stage_id) is None:
+        raise EventRejected("unknown source stage", "from_stage_id")
     if payload.from_item_step_id is not None:
-        if payload.from_done:
-            raise EventRejected(
-                "an entry takes its units from one place: a stage or Done, not both",
-                "from_item_step_id",
-            )
         from_step = db.get(ItemStep, payload.from_item_step_id)
         if from_step is None:
             raise EventRejected("unknown source step", "from_item_step_id")
         if from_step.item_id != item.id:
             raise EventRejected("source step belongs to a different item", "from_item_step_id")
-    if from_step is not None or payload.from_done:
-        if not event_type.moves_quantity:
-            raise EventRejected(
-                "only an entry that moves units can say where they came from",
-                "from_item_step_id",
-            )
     if payload.from_done and not event_type.is_rework:
+        # Taking a finished unit back out of Done is rework, and has a reason.
         raise EventRejected("only rework takes units back out of Done", "from_done")
+    legacy_shape = payload.item_step_id is not None or payload.from_item_step_id is not None
+    if event_type.moves_quantity and not legacy_shape:
+        if payload.stage_id is not None and not any(sources):
+            raise EventRejected("say where these units are coming from", "from_stage_id")
+        if (
+            payload.stage_id is not None
+            and payload.from_stage_id == payload.stage_id
+            and payload.station_id is None
+        ):
+            # A move within one stage only means something as a change of station.
+            raise EventRejected("these units are already at that stage", "stage_id")
 
     # States are gone from the floor: a unit is at a stage or it is not. A
     # state_id is still accepted because phones running the previous app
@@ -140,7 +166,7 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         station = db.get(Station, payload.station_id)
         if station is None:
             raise EventRejected("unknown station", "station_id")
-        if item_step is not None and station.stage_id != item_step.stage_id:
+        if stage is not None and station.stage_id != stage.id:
             raise EventRejected("station is not part of this stage", "station_id")
 
     if payload.reason_code_id is not None:
@@ -179,18 +205,13 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
             "occurred_at",
         )
 
-    _validate_availability(db, item, item_step, payload, event_type)
+    _validate_availability(db, item, payload, event_type, occurred_at)
 
     event = Event(
         id=payload.id,
         item_id=item.id,
-        item_step_id=payload.item_step_id,
-        station_id=payload.station_id,
+        **_movement_fields(payload),
         event_type_id=event_type.id,
-        state_id=payload.state_id,
-        qty=payload.qty,
-        from_item_step_id=payload.from_item_step_id,
-        from_done=payload.from_done,
         reason_code_id=payload.reason_code_id,
         occurred_at=occurred_at,
         # Never from the client: this is how a wrong device clock is detected.
@@ -217,23 +238,42 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
     return EventWrite(event=event, created=True)
 
 
-def _validate_availability(db, item: Item, item_step, payload, event_type: EventType) -> None:
+_MOVEMENT_FIELDS = (
+    "stage_id",
+    "item_step_id",
+    "station_id",
+    "state_id",
+    "qty",
+    "from_stage_id",
+    "from_unstarted",
+    "from_done",
+    "from_item_step_id",
+)
+
+
+def _movement_fields(payload) -> dict:
+    """What the entry moves, to where, from where -- as stored on the row."""
+    return {name: getattr(payload, name) for name in _MOVEMENT_FIELDS}
+
+
+def _validate_availability(
+    db, item: Item, payload, event_type: EventType, occurred_at: datetime
+) -> None:
     """Reject a move the log cannot support.
 
-    CLAUDE.md: a batch advancing more units than exist upstream is a validation
-    error, not a stored fact. The test is a simulation, not a running-total
-    check: replay the item's whole log in occurred_at order *with the candidate
-    included*, and reject only if that replay over-advances where the log
-    without it did not. Judging the whole timeline matters because events sync
-    out of order -- a downstream event arriving before its upstream partner
-    must not be refused when the replay will seat both correctly once the
-    partner lands (the ledger deliberately lets skipped intermediate logs
-    resolve themselves).
+    CLAUDE.md: moving more units than rest at the place they are taken from is
+    a validation error, not a stored fact. The test is a simulation, not a
+    running-total check: replay the item's whole log in occurred_at order *with
+    the candidate included*, and reject only if that replay over-advances where
+    the log without it did not. Judging the whole timeline matters because
+    events sync out of order -- a move out of paint arriving before the move
+    into paint must not be refused when the replay will seat both correctly
+    once the partner lands.
 
     A genuine rejection is recoverable: the client quarantines the entry with
     this reason and offers a retry, which is how it resolves once the state of
-    the log changes (a correction voids the conflicting entry, or the missing
-    upstream event syncs in from another device).
+    the log changes (a correction voids the conflicting entry, or the entry it
+    depends on syncs in from another device).
     """
     if not event_type.moves_quantity or payload.qty <= 0:
         return
@@ -247,64 +287,66 @@ def _validate_availability(db, item: Item, item_step, payload, event_type: Event
     steps = list(db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item.id)))
     events = list(db.scalars(sa.select(Event).where(Event.item_id == item.id)))
 
-    def over_advances(candidate_rows: list) -> list:
-        kept, _anomalies = effective_events(candidate_rows)
-        ledger = ItemLedger(item, steps, vocab)
-        ledger.apply_all(kept)
-        return [a for a in ledger.anomalies if a.code == "over_advance"]
-
-    probe = ItemLedger(item, steps, vocab)
-    target = probe.target_index(
-        item_step.id if item_step else None, payload.state_id, is_finish=event_type.is_finish
+    # An entry with no source is the sequence-era shape: "the nearest units
+    # before this step". That only means something on an item that has a
+    # sequence. On any other item it would quietly take from "not started".
+    unsourced = not (
+        payload.from_stage_id is not None
+        or payload.from_unstarted
+        or payload.from_done
+        or payload.from_item_step_id is not None
     )
-    if target is None:
-        raise EventRejected(
-            "this entry does not name a stage on this item's sequence", "item_step_id"
-        )
-    if (payload.from_item_step_id is not None or payload.from_done) and not probe.source_order(
-        target, event_type.is_rework, payload.from_item_step_id, payload.from_done
-    ):
-        side = "after" if event_type.is_rework else "before"
-        raise EventRejected(
-            f"the place these units come from must be {side} the stage they go to",
-            "from_item_step_id",
-        )
+    if unsourced and not steps:
+        raise EventRejected("say where these units are coming from", "from_stage_id")
 
     # A detached stand-in, never added to the session: the replay only reads
     # attributes.
     candidate = Event(
         id=payload.id,
         item_id=item.id,
-        item_step_id=item_step.id if item_step else None,
-        station_id=payload.station_id,
+        **_movement_fields(payload),
         event_type_id=event_type.id,
-        state_id=payload.state_id,
-        qty=payload.qty,
-        from_item_step_id=payload.from_item_step_id,
-        from_done=payload.from_done,
-        occurred_at=payload.occurred_at,
+        occurred_at=occurred_at,
         received_at=utcnow(),
         supersedes_event_id=payload.supersedes_event_id,
     )
-    before = over_advances(events)
-    after = over_advances(events + [candidate])
+
+    def replay(rows: list) -> ItemLedger:
+        kept, _anomalies = effective_events(rows)
+        ledger = ItemLedger(item, steps, vocab)
+        ledger.apply_all(kept)
+        return ledger
+
+    # The same question the replay will ask of the stored row, asked first:
+    # does this entry describe a move at all?
+    move, problem = ItemLedger(item, steps, vocab).resolve(candidate, event_type)
+    if move is None:
+        # Point at the field the engineer would have to change.
+        field = "from_item_step_id" if payload.from_item_step_id is not None else "stage_id"
+        raise EventRejected(f"this entry cannot be placed: {problem}", field)
+
+    before = [a for a in replay(events).anomalies if a.code == "over_advance"]
+    with_candidate = replay(events + [candidate])
+    after = [a for a in with_candidate.anomalies if a.code == "over_advance"]
     if len(after) > len(before):
         blame = next((a for a in after if a.event_id == payload.id), after[-1])
         raise EventRejected(f"the log cannot support this move: {blame.detail}", "qty")
 
-    # allows_partial_qty=False: this stage moves whole batches, never splits.
-    # Enforced as "nothing may be left behind upstream": after the replay with
-    # this event included, every position before the target must be empty.
-    stage = vocab.stages.get(item_step.stage_id) if item_step else None
-    if stage is not None and not stage.allows_partial_qty and not event_type.is_rework:
-        kept, _anomalies = effective_events(events + [candidate])
-        ledger = ItemLedger(item, steps, vocab)
-        ledger.apply_all(kept)
-        left_behind = ledger.available_upstream(target)
+    # allows_partial_qty=False: this stage takes whole lots, never a split.
+    # Enforced as "nothing may be left behind": after the replay with this
+    # event included, the place it drew from must be empty.
+    target_stage = vocab.stages.get(with_candidate.positions[move.target].stage_id)
+    if (
+        target_stage is not None
+        and not target_stage.allows_partial_qty
+        and not event_type.is_rework
+    ):
+        sources = [i for i in move.sources if i != move.target]
+        left_behind = with_candidate.qty_in(sources)
         if left_behind:
             raise EventRejected(
                 (
-                    f"stage '{stage.name}' does not allow partial quantities; "
+                    f"stage '{target_stage.name}' does not allow partial quantities; "
                     f"this move would leave {left_behind} behind"
                 ),
                 "qty",
@@ -339,11 +381,13 @@ def _differs(existing: Event, payload) -> bool:
     a different timestamp or a different superseded target."""
     fields = (
         "item_id",
+        "stage_id",
         "item_step_id",
         "station_id",
         "event_type_id",
         "state_id",
         "qty",
+        "from_stage_id",
         "from_item_step_id",
         "reason_code_id",
         "supersedes_event_id",
@@ -352,8 +396,9 @@ def _differs(existing: Event, payload) -> bool:
     for field in fields:
         if getattr(existing, field) != getattr(payload, field, None):
             return True
-    if bool(existing.from_done) != bool(getattr(payload, "from_done", False)):
-        return True
+    for flag in ("from_unstarted", "from_done"):
+        if bool(getattr(existing, flag)) != bool(getattr(payload, flag, False)):
+            return True
     payload_occurred = getattr(payload, "occurred_at", None)
     if payload_occurred is not None and payload_occurred.tzinfo is not None:
         if existing.occurred_at != payload_occurred:
