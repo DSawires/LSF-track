@@ -1620,6 +1620,7 @@ function officeImport(body) {
   const errors = preview?.errors || [];
   const items = preview?.items || [];
   const ready = preview && !errors.length && items.length;
+  const withPictures = items.filter((i) => i.has_picture).length;
 
   body.innerHTML = `
     <div class="card">
@@ -1639,6 +1640,8 @@ function officeImport(body) {
           <tr><td><strong>qty</strong></td><td>The production batch.</td></tr>
           <tr><td>sample qty</td><td>Optional, default 1. Built first; 0 for no sample.</td></tr>
           <tr><td>revision</td><td>Optional drawing revision, default A.</td></tr>
+          <tr><td>picture</td><td>Optional, .xlsx only. Put a picture on the item's row
+            (Insert → Pictures → <em>Place over Cells</em>) and it becomes the item's icon.</td></tr>
         </tbody>
       </table>
       </div>
@@ -1663,19 +1666,21 @@ function officeImport(body) {
           ${e.row ? `<span class="badge">row ${e.row}</span> ` : ""}${esc(e.message)}
         </div>`).join("")}` : ""}
       ${(preview.notes || []).map((note) => `<p class="muted" style="margin-bottom:6px">${esc(note)}</p>`).join("")}
+      ${withPictures ? `<p class="muted" style="margin-bottom:6px">${withPictures} of ${items.length} item${items.length === 1 ? "" : "s"} ${withPictures === 1 ? "has" : "have"} a picture, which will be set as ${withPictures === 1 ? "its" : "their"} icon.</p>` : ""}
       ${(preview.projects || []).map((p) => `
         <p style="margin-top:8px"><strong>${esc(p.code)}</strong> ${p.is_new ? `<span class="badge">new</span>` : `<span class="badge">existing</span>`}
           <span class="muted">${esc(p.name || "")}${p.client ? ` · ${esc(p.client)}` : ""} · ${p.item_count} item${p.item_count === 1 ? "" : "s"}</span></p>`).join("")}
       ${items.length ? `
       <div class="table-scroll" style="margin-top:8px">
       <table>
-        <thead><tr><th scope="col">Item</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Sample</th></tr></thead>
+        <thead><tr><th scope="col">Item</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Sample</th><th scope="col">Picture</th></tr></thead>
         <tbody>
           ${items.map((i) => `
             <tr>
               <td><strong>${esc(i.code)}</strong><br><span class="muted">${esc(i.description)} · rev ${esc(i.revision)}</span></td>
               <td class="num">${i.qty}</td>
               <td class="num">${i.sample_qty}</td>
+              <td>${i.has_picture ? "✓" : `<span class="muted">—</span>`}</td>
             </tr>`).join("")}
         </tbody>
       </table>
@@ -1719,7 +1724,8 @@ function officeImport(body) {
       try {
         const done = await send(true);
         Object.assign(importState, { file: null, preview: null, error: null, busy: false });
-        toast(`Imported ${done.items.length} item${done.items.length === 1 ? "" : "s"}`);
+        const pictures = done.items.filter((i) => i.has_picture).length;
+        toast(`Imported ${done.items.length} item${done.items.length === 1 ? "" : "s"}${pictures ? ` with ${pictures} picture${pictures === 1 ? "" : "s"}` : ""}`);
         await sync();
         navigate("#/items");
       } catch (error) {

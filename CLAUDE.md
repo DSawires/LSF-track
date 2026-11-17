@@ -271,7 +271,11 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   .csv, one row per item: project, item, qty, sample qty, revision).
   Previewed, then committed all-or-nothing. Format lives in
   `app/services/imports.py`; `GET /api/import/template` returns a template.
-  A `stages` column from an older file is read past, and the preview says so
+  A `stages` column from an older file is read past, and the preview says so.
+  A picture placed over the cells of an item's row in an .xlsx becomes that
+  item's icon on commit; one that cannot be used (wrong format, over 5 MB,
+  placed *inside* a cell) is left out with a note and never blocks the import.
+  Online-only like every other photo: the bytes never enter the sync queue
 - Office → Items → New item: one item added to a project by hand, without an
   import, by any engineer. It posts `POST /api/items`, which also takes an
   optional mid-production distribution by stage (with `sample_qty` 0)

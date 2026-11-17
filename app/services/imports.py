@@ -16,6 +16,12 @@ There is no `stages` column. An item is not given a route: it can be logged at
 any stage in the factory, in any order. Files written for the older format
 still carry one; it is read past, and the preview says so.
 
+Pictures come along too. A picture placed on an item's row of an .xlsx -- over
+the cells, in any column -- becomes that item's icon when the file is
+committed, exactly as if it had been uploaded in the item editor. A picture is
+never a reason to refuse a file: one that cannot be used (wrong format, too
+big, placed *inside* a cell) is left out and the preview says which.
+
 Headers are matched loosely (case, spaces, underscores) because the file is
 typed by people, not generated. Validation is all-or-nothing: every row is
 checked and every problem reported with its spreadsheet row number, and nothing
@@ -27,18 +33,30 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
+import posixpath
 import re
+import uuid
+import zipfile
 from dataclasses import dataclass, field
+from xml.etree import ElementTree
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.db import utcnow
-from app.models import Item, Project
+from app.models import Item, ItemImage, Project, User
+from app.services.images import image_key, sniff
 from app.services.items import ItemSetupError
+from app.storage import get_storage
+
+log = logging.getLogger(__name__)
 
 MAX_ROWS = 2000
-MAX_BYTES = 5 * 1024 * 1024
+# Room for a picture on every row: a couple of hundred thumbnails is a few MB.
+MAX_BYTES = 40 * 1024 * 1024
+# One picture. These become item icons, shown at thumbnail size on a phone.
+MAX_PICTURE_BYTES = 5 * 1024 * 1024
 # How far down a sheet is read looking for items. Blank rows are free, but a
 # sheet formatted to the bottom of Excel is a million of them.
 MAX_SCANNED_ROWS = 50_000
@@ -70,6 +88,14 @@ class ImportFileError(Exception):
 
 
 @dataclass
+class Picture:
+    """A picture lifted out of the file, already checked to be one."""
+
+    data: bytes
+    content_type: str
+
+
+@dataclass
 class PlannedItem:
     row: int
     project_code: str
@@ -78,6 +104,8 @@ class PlannedItem:
     qty: int
     sample_qty: int
     revision: str
+    # The picture on this item's row, if the file carried one.
+    picture: Picture | None = None
 
 
 @dataclass
@@ -121,6 +149,7 @@ class ImportPlan:
                     "qty": i.qty,
                     "sample_qty": i.sample_qty,
                     "revision": i.revision,
+                    "has_picture": i.picture is not None,
                 }
                 for i in self.items
             ],
@@ -135,7 +164,10 @@ class ImportPlan:
 def read_rows(filename: str, content: bytes) -> list[tuple[int, list]]:
     """(spreadsheet row number, cell values) for every row of the first sheet."""
     if len(content) > MAX_BYTES:
-        raise ImportFileError("the file is larger than 5 MB; split it by project")
+        raise ImportFileError(
+            f"the file is larger than {MAX_BYTES // (1024 * 1024)} MB; "
+            "split it by project, or shrink its pictures"
+        )
     if content[:4] == b"PK\x03\x04":
         return _read_xlsx(content)
     if filename.lower().endswith((".xlsx", ".xlsm")):
@@ -195,6 +227,134 @@ def _read_csv(content: bytes) -> list[tuple[int, list]]:
     ]
 
 
+# -- pictures ------------------------------------------------------------------
+
+_NS = {
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+}
+_R_ID = f"{{{_NS['r']}}}id"
+_R_EMBED = f"{{{_NS['r']}}}embed"
+
+_IN_CELL_NOTE = (
+    "This file has pictures placed inside cells (Excel's \"Place in Cell\"). Those "
+    "cannot be read: use Insert > Pictures > Place over Cells, on the item's row."
+)
+
+
+def _relationships(archive: zipfile.ZipFile, part: str) -> dict[str, tuple[str, str]]:
+    """{relationship id: (type, target part)} for one part of the package."""
+    rels_path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+    if rels_path not in archive.namelist():
+        return {}
+    out = {}
+    for rel in ElementTree.fromstring(archive.read(rels_path)).findall("rel:Relationship", _NS):
+        target = rel.get("Target", "")
+        if rel.get("TargetMode") == "External":
+            continue
+        resolved = (
+            target.lstrip("/")
+            if target.startswith("/")
+            else posixpath.normpath(posixpath.join(posixpath.dirname(part), target))
+        )
+        out[rel.get("Id", "")] = (rel.get("Type", ""), resolved)
+    return out
+
+
+def read_pictures(content: bytes) -> tuple[dict[int, Picture], list[str]]:
+    """Pictures on the first sheet of an .xlsx, keyed by the spreadsheet row
+    their top-left corner sits on, plus anything worth telling the office.
+
+    A picture belongs to the row it is anchored to, whatever column it is in;
+    if a row has several, the left-most wins. Read straight out of the package
+    rather than through openpyxl, which needs an imaging library to hand
+    pictures back and would make that a dependency of the server for the sake
+    of looking at the first sixteen bytes.
+
+    Nothing here raises. Pictures are a convenience riding on the import: a
+    file whose pictures cannot be read still imports its items.
+    """
+    if content[:4] != b"PK\x03\x04":
+        return {}, []
+    pictures: dict[int, tuple[int, Picture]] = {}
+    notes: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            if any(name.startswith("xl/richData/") for name in names):
+                notes.append(_IN_CELL_NOTE)
+
+            workbook_rels = _relationships(archive, "xl/workbook.xml")
+            sheets = ElementTree.fromstring(archive.read("xl/workbook.xml")).findall(
+                "main:sheets/main:sheet", _NS
+            )
+            sheet_part = next(
+                (
+                    workbook_rels[sheet.get(_R_ID)][1]
+                    for sheet in sheets
+                    if sheet.get(_R_ID) in workbook_rels
+                    and workbook_rels[sheet.get(_R_ID)][0].endswith("/worksheet")
+                ),
+                None,
+            )
+            if sheet_part is None or sheet_part not in names:
+                return {}, notes
+
+            skipped_format: list[int] = []
+            skipped_size: list[int] = []
+            for kind, drawing_part in _relationships(archive, sheet_part).values():
+                if not kind.endswith("/drawing") or drawing_part not in names:
+                    continue
+                media = _relationships(archive, drawing_part)
+                root = ElementTree.fromstring(archive.read(drawing_part))
+                for anchor in list(root.findall("xdr:twoCellAnchor", _NS)) + list(
+                    root.findall("xdr:oneCellAnchor", _NS)
+                ):
+                    row_text = anchor.findtext("xdr:from/xdr:row", namespaces=_NS)
+                    col_text = anchor.findtext("xdr:from/xdr:col", namespaces=_NS)
+                    blip = anchor.find(".//xdr:pic/xdr:blipFill/a:blip", _NS)
+                    if row_text is None or blip is None:
+                        continue
+                    row, column = int(row_text) + 1, int(col_text or 0)
+                    target = media.get(blip.get(_R_EMBED, ""), ("", ""))[1]
+                    if target not in names:
+                        continue
+                    if row in pictures and pictures[row][0] <= column:
+                        continue
+                    # The declared size, checked before a byte is inflated.
+                    if archive.getinfo(target).file_size > MAX_PICTURE_BYTES:
+                        skipped_size.append(row)
+                        continue
+                    data = archive.read(target)
+                    content_type = sniff(data[:16])
+                    if content_type is None:
+                        skipped_format.append(row)
+                        continue
+                    pictures[row] = (column, Picture(data=data, content_type=content_type))
+
+            def rows(numbers: list[int]) -> str:
+                listed = ", ".join(str(n) for n in sorted(set(numbers))[:12])
+                return listed + (" …" if len(set(numbers)) > 12 else "")
+
+            if skipped_format:
+                notes.append(
+                    f"Pictures on row(s) {rows(skipped_format)} are not JPEG, PNG, WebP, GIF or "
+                    "HEIC and were left out."
+                )
+            if skipped_size:
+                notes.append(
+                    f"Pictures on row(s) {rows(skipped_size)} are larger than "
+                    f"{MAX_PICTURE_BYTES // (1024 * 1024)} MB and were left out."
+                )
+    except (zipfile.BadZipFile, KeyError, ValueError, ElementTree.ParseError):
+        log.exception("could not read the pictures out of an import file")
+        return {}, ["The pictures in this file could not be read; the items are unaffected."]
+    return {row: picture for row, (_column, picture) in pictures.items()}, notes
+
+
 # -- validating ---------------------------------------------------------------
 
 
@@ -223,8 +383,15 @@ def _whole_number(value) -> int | None:
     return int(number)
 
 
-def plan_import(db: Session, rows: list[tuple[int, list]]) -> ImportPlan:
+def plan_import(
+    db: Session,
+    rows: list[tuple[int, list]],
+    pictures: dict[int, Picture] | None = None,
+    picture_notes: list[str] | None = None,
+) -> ImportPlan:
     plan = ImportPlan()
+    pictures = pictures or {}
+    plan.notes.extend(picture_notes or [])
 
     header_at = next((i for i, (_, values) in enumerate(rows) if any(_cell(v) for v in values)), None)
     if header_at is None:
@@ -334,6 +501,7 @@ def plan_import(db: Session, rows: list[tuple[int, list]]) -> ImportPlan:
                 qty=qty,
                 sample_qty=sample_qty,
                 revision=revision,
+                picture=pictures.get(row),
             )
         )
 
@@ -346,9 +514,10 @@ def plan_import(db: Session, rows: list[tuple[int, list]]) -> ImportPlan:
     return plan
 
 
-def commit_import(db: Session, plan: ImportPlan) -> None:
+def commit_import(db: Session, plan: ImportPlan, user: User) -> None:
     """Write a clean plan. Every item gets one creation moment: the file is
-    one handoff to the floor."""
+    one handoff to the floor. A picture on an item's row is stored as its
+    icon, under the name of whoever imported the file."""
     if plan.errors:
         raise ItemSetupError("the file has errors; nothing was imported")
     moment = utcnow()
@@ -366,18 +535,49 @@ def commit_import(db: Session, plan: ImportPlan) -> None:
             db.flush()
         project_ids[planned.code] = project.id
 
-    for planned in plan.items:
-        item = Item(
-            code=planned.code,
-            project_id=project_ids[planned.project_code],
-            description=planned.description,
-            total_qty=planned.qty,
-            sample_qty=planned.sample_qty,
-            drawing_revision=planned.revision,
-            created_at=moment,
-        )
-        db.add(item)
-    db.flush()
+    storage = get_storage()
+    stored: list[str] = []
+    try:
+        for planned in plan.items:
+            item = Item(
+                id=uuid.uuid4(),
+                code=planned.code,
+                project_id=project_ids[planned.project_code],
+                description=planned.description,
+                total_qty=planned.qty,
+                sample_qty=planned.sample_qty,
+                drawing_revision=planned.revision,
+                created_at=moment,
+            )
+            db.add(item)
+            if planned.picture is not None:
+                image_id = uuid.uuid4()
+                key = image_key(image_id)
+                storage.put(key, io.BytesIO(planned.picture.data), planned.picture.content_type)
+                stored.append(key)
+                db.add(
+                    ItemImage(
+                        id=image_id,
+                        item_id=item.id,
+                        kind="icon",
+                        filename=f"{planned.code} (import)"[:255],
+                        content_type=planned.picture.content_type,
+                        size_bytes=len(planned.picture.data),
+                        uploaded_by_user_id=user.id,
+                        uploaded_at=moment,
+                    )
+                )
+        db.flush()
+    except Exception:
+        # All-or-nothing reaches the pictures too: the items are about to be
+        # rolled back, so files already written must not be left behind with
+        # no row that will ever name them.
+        for key in stored:
+            try:
+                storage.delete(key)
+            except Exception:  # best effort; the original failure is what matters
+                log.exception("could not remove %s after a failed import", key)
+        raise
 
 
 def template_csv() -> str:
@@ -385,7 +585,9 @@ def template_csv() -> str:
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(
-        ["project", "project name", "client", "item", "description", "qty", "sample qty", "revision"]
+        ["project", "project name", "client", "item", "description", "qty", "sample qty", "revision", "picture"]
     )
-    writer.writerow(["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", 100, 1, "A"])
+    # The last column is only a place to put a picture once the file is saved
+    # as .xlsx; a CSV cannot carry one, and whatever is typed there is ignored.
+    writer.writerow(["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", 100, 1, "A", ""])
     return out.getvalue()

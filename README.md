@@ -210,6 +210,13 @@ format still imports — the column is skipped, and the preview says so.
 The file is previewed first — projects, items, and every problem by
 spreadsheet row — and committed only if the whole file is clean.
 
+**Pictures.** In an .xlsx, a picture placed on an item's row (Insert →
+Pictures → *Place over Cells*, any column) becomes that item's icon when the
+file is committed. The preview shows which items have one. A picture that
+cannot be used — not JPEG/PNG/WebP/GIF/HEIC, over 5 MB, or placed *inside* a
+cell — is left out with a note; it never stops the items importing. A CSV
+cannot carry pictures. The file may be up to 40 MB.
+
 **One item at a time.** **Office → Items → New item** adds a single item to an
 existing project without a file: project, code, description, batch qty, sample
 qty, revision. Any engineer can do it.

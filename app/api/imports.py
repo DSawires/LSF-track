@@ -20,6 +20,7 @@ from app.services.imports import (
     ImportFileError,
     commit_import,
     plan_import,
+    read_pictures,
     read_rows,
     template_csv,
 )
@@ -49,7 +50,8 @@ def import_file(
     except ImportFileError as exc:
         raise HTTPException(422, {"reason": str(exc), "errors": [{"row": None, "message": str(exc)}]})
 
-    plan = plan_import(db, rows)
+    pictures, picture_notes = read_pictures(content)
+    plan = plan_import(db, rows, pictures, picture_notes)
     body = plan.as_dict()
     if not commit:
         return {**body, "committed": False}
@@ -57,5 +59,5 @@ def import_file(
         raise HTTPException(
             422, {"reason": f"{len(plan.errors)} problem(s) in the file; nothing was imported", **body}
         )
-    commit_import(db, plan)
+    commit_import(db, plan, user)
     return {**body, "committed": True}

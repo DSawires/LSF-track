@@ -25,35 +25,11 @@ from app.db import get_db
 from app.deps import current_user, require_admin
 from app.models import Item, ItemImage, User
 from app.schemas import ImageNoteUpdate
+from app.services.images import image_key as _image_key
+from app.services.images import sniff as _sniff
 from app.storage import get_storage
 
 router = APIRouter(prefix="/api", tags=["images"])
-
-# Magic bytes for the formats phones actually produce.
-_SIGNATURES: list[tuple[bytes, str]] = [
-    (b"\xff\xd8\xff", "image/jpeg"),
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"RIFF", "image/webp"),  # RIFF....WEBP, checked further below
-    (b"GIF87a", "image/gif"),
-    (b"GIF89a", "image/gif"),
-]
-
-
-def _sniff(head: bytes) -> str | None:
-    for signature, content_type in _SIGNATURES:
-        if head.startswith(signature):
-            if content_type == "image/webp" and head[8:12] != b"WEBP":
-                continue
-            return content_type
-    # HEIC/HEIF (iPhone default): ISO-BMFF container, brand at offset 8.
-    if len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"mif1"):
-        return "image/heic"
-    return None
-
-
-def _image_key(image_id: uuid.UUID) -> str:
-    return f"images/{image_id}"
-
 
 _KINDS = {"snag", "icon"}
 
