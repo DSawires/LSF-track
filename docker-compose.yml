@@ -76,6 +76,10 @@ services:
       LSF_MAX_UPLOAD_BYTES: ${LSF_MAX_UPLOAD_BYTES:-10485760}
       LSF_LOG_LEVEL: ${LSF_LOG_LEVEL:-INFO}
       LSF_API_DOCS: ${LSF_API_DOCS:-false}
+      # Arabic drafts of work orders. Empty = the feature is off; nothing else
+      # needs it.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LSF_TRANSLATE_MODEL: ${LSF_TRANSLATE_MODEL:-}
       LSF_UPLOAD_DIR: /srv/lsf/data/uploads
       # One S3 bucket for photos (images/) and database dumps (backups/).
       # Unset means local disk on the uploads volume. On EC2, prefer an

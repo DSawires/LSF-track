@@ -271,8 +271,9 @@ picture, code, description, dimensions, area and phase, drawing revision,
 quantity — followed by notes and signature lines.
 
 - Pick the project, find its items by search and add them. Each line starts
-  as a copy of the item and can be changed for this document: the picture
-  (swap or leave off), the description, the dimensions, the quantity, the
+  as a copy of the item, and every field on it can be changed for this
+  document: the picture (swap or leave off), the code, the drawing revision,
+  the description, the dimensions, the quantity, the area, the phase, the
   order. The picture, description, dimensions and area/phase columns can each
   be switched off.
 - What is written on a work order is its own. It does not change the items,
@@ -283,8 +284,39 @@ quantity — followed by notes and signature lines.
 - It is a record, not a gate: an item can be logged with or without one.
 - Dimensions are a field on the item (import column `dimensions`, or the item
   editor), so they are typed once and prefill every work order.
-- The PDF uses the standard fonts, which cover Western European text only;
-  anything else (Arabic, for instance) prints as `?`.
+- **Language of the PDF**: English, Arabic, or both on one sheet. An Arabic
+  sheet has Arabic captions and reads right to left (first column on the
+  right); "both" is the English sheet with the Arabic title, notes and
+  descriptions under the English ones. Where no Arabic has been written, the
+  English prints. Codes, numbers and dimensions are printed as written in
+  every language. Arabic typed into any field prints as Arabic.
+- **Translate to Arabic** drafts the Arabic with Claude: it fills in whatever
+  Arabic is still empty (title, notes, each line's description), and
+  **Translate** on a line redoes that line. The result lands in ordinary
+  boxes — read it, correct it, and what is in them when you issue is what
+  prints. Edit the English afterwards and the line says its Arabic may be out
+  of date. See "AI translation" below for the key it needs.
+- Other scripts are not covered: a character the fonts cannot draw prints as
+  `?`.
+
+### AI translation
+
+Translation is off until the server has an Anthropic API key. Put it in `.env`
+next to `docker-compose.yml` and restart the app:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+- Without a key everything else works; the Translate button says translation
+  is not set up.
+- Pressing Translate sends that work order's title, notes and line
+  descriptions to Anthropic's API. Nothing is sent at any other time, and
+  nothing else in the app sends data anywhere.
+- It costs a little per use, billed to the key's account. The model is
+  `claude-opus-5-5`; `LSF_TRANSLATE_MODEL` changes it.
+- The Arabic font is IBM Plex Sans Arabic (SIL Open Font License), shipped in
+  `app/assets/fonts/`.
 
 ## Logging
 

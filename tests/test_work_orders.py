@@ -367,3 +367,258 @@ def test_an_item_carries_its_dimensions(client, factory):
     assert [(i["code"], i["dimensions"]) for i in body["items"]] == [("DIM-2", "D450 x H600 mm"), ("DIM-3", "")]
     listed = {i["code"]: i["dimensions"] for i in client.get("/api/items?q=DIM-").json()["items"]}
     assert listed == {"DIM-1": "", "DIM-2": "D450 x H600 mm", "DIM-3": ""}
+
+
+# -- every field on a line is the work order's own ------------------------------
+
+
+def test_every_field_on_a_line_can_be_written_for_the_document(client, job):
+    factory, bed, bench, table = job
+    made = _issue(client, factory, [
+        _line(bed, code="LF-01/A", area="Suites", phase="Mock-up", drawing_revision="C",
+              description="King bed base", dimensions="2000 x 1800 mm", qty=4),
+        # Blanked on purpose: this line prints no area and no phase.
+        _line(bench, area="", phase=""),
+        # Left out: copied from the item as it stands. A blank code is no code.
+        _line(table, code="   "),
+    ])
+    assert made.status_code == 201, made.text
+    first, second, third = made.json()["lines"]
+    assert (first["code"], first["area"], first["phase"], first["drawing_revision"]) == (
+        "LF-01/A", "Suites", "Mock-up", "C",
+    )
+    assert (second["code"], second["area"], second["phase"], second["drawing_revision"]) == ("LF-03", "", "", "A")
+    assert (third["code"], third["drawing_revision"]) == ("SP-03", "A")
+
+    # The item itself is untouched: it is the paper that says something else.
+    factory.db.expire_all()
+    assert (factory.db.get(Item, bed.id).code, factory.db.get(Item, bed.id).drawing_revision) == ("LF-01", "A")
+    # And a line is still found by its item, whatever code it prints.
+    again = _issue(client, factory, [_line(bed, code="X"), _line(bed, code="Y")])
+    assert again.status_code == 409 and "twice" in again.json()["detail"]
+
+    # What was written survives a re-issue that sends it back, as the editor does.
+    kept = client.put(f"/api/work-orders/{made.json()['id']}", json={
+        "project_id": str(factory.project.id),
+        "lines": [{**_line(bed), "id": first["id"], "code": first["code"], "area": first["area"],
+                   "phase": first["phase"], "drawing_revision": first["drawing_revision"]}],
+    }).json()
+    assert (kept["revision"], kept["lines"][0]["code"], kept["lines"][0]["area"]) == (2, "LF-01/A", "Suites")
+
+    pdf = _pdf_text(factory, kept["id"])
+    assert b"LF-01/A" in pdf and b"Suites" in pdf and b"Mock-up" in pdf
+
+
+# -- Arabic -------------------------------------------------------------------
+
+
+def test_a_work_order_keeps_its_arabic_beside_the_english(client, job):
+    factory, bed, _bench, _table = job
+    made = _issue(client, factory, [
+        _line(bed, description="King bed base", description_ar=" قاعدة سرير كينج "),
+    ], title="First release", title_ar="الإصدار الأول", notes_ar="حسب العينة المعتمدة", language="both")
+    assert made.status_code == 201, made.text
+    body = made.json()
+    assert (body["language"], body["title"], body["title_ar"], body["notes_ar"]) == (
+        "both", "First release", "الإصدار الأول", "حسب العينة المعتمدة",
+    )
+    assert body["lines"][0]["description_ar"] == "قاعدة سرير كينج"
+    assert body["lines"][0]["description"] == "King bed base"
+
+    # English unless asked otherwise, and only the three ways the sheet can print.
+    assert _issue(client, factory, [_line(bed)]).json()["language"] == "en"
+    assert _issue(client, factory, [_line(bed)], language="fr").status_code == 422
+
+
+def test_arabic_is_shaped_ordered_and_wrapped_before_it_is_drawn():
+    from app.services import arabic
+
+    assert arabic.has_arabic("خشب") and not arabic.has_arabic("Oak veneer 18 mm")
+    # Shaped: the letters are joined forms, not the isolated ones that were typed.
+    shown = arabic.visual("خشب")
+    assert shown != "خشب" and all(0xFE70 <= ord(char) <= 0xFEFF for char in shown)
+    # Ordered: the sentence starts at the right, and the Latin inside it still
+    # reads left to right.
+    mixed = arabic.visual("خشب MDF 18 مم")
+    assert "MDF 18" in mixed and mixed.index("MDF") > 0 and not mixed.startswith("MDF")
+    # An English line that merely mentions an Arabic word stays left to right.
+    assert arabic.visual("Oak veneer خشب").startswith("Oak veneer")
+    assert "?" not in arabic.visual("الله لا إله إلا")      # every ligature it makes, the font has
+
+    text = "طاولة جانبية بسطح رخام وأرجل معدنية مطلية باللون الذهبي مع درج واحد بمجرى هادئ الغلق"
+    lines = arabic.wrap(text, arabic.REGULAR, 8.5, 120)
+    assert len(lines) > 2
+    assert all(arabic.width_of(line, arabic.REGULAR, 8.5) <= 120 for line in lines)
+    # Nothing lost in the wrapping: the same letters, spaces aside.
+    assert sorted("".join(lines).replace(" ", "")) == sorted(arabic.visual(text).replace(" ", ""))
+    # Line breaks someone typed are kept.
+    assert len(arabic.wrap("سطر أول\nسطر ثان", arabic.REGULAR, 8.5, None)) == 2
+
+
+@pytest.mark.parametrize("language", ["ar", "both"])
+def test_the_pdf_prints_in_arabic(client, job, language):
+    factory, bed, bench, _table = job
+    made = _issue(client, factory, [
+        _line(bed, description="King bed base, oak veneer", description_ar="قاعدة سرير كينج بقشرة بلوط",
+              dimensions="2000 x 1800 mm"),
+        _line(bench, description="Bench"),         # no Arabic written: the English stands in
+    ], title="First release", title_ar="الإصدار الأول", notes="Pack per room set.",
+        notes_ar="التعبئة حسب طقم كل غرفة.", language=language).json()
+
+    pdf = _pdf_text(factory, made["id"])
+    assert pdf[:5] == b"%PDF-"
+    assert b"IBMPlexSansArabic" in pdf                 # the Arabic face is embedded in the file
+    # Codes, numbers and dimensions are printed as written in every language.
+    for text in (b"WO-0001", b"LF-01", b"LF-03", b"2000 x 1800 mm", b"Bench"):
+        assert text in pdf, text
+    if language == "ar":
+        # An Arabic sheet has Arabic captions, and the English wording gives way.
+        for gone in (b"WORK ORDER", b"DESCRIPTION", b"Page 1 of 1", b"King bed base", b"First release"):
+            assert gone not in pdf, gone
+    else:
+        for text in (b"WORK ORDER", b"King bed base", b"First release", b"Pack per room set."):
+            assert text in pdf, text
+
+    # An English sheet is what it was: no Arabic face, unless Arabic was typed.
+    plain = _issue(client, factory, [_line(bed, description_ar="قاعدة سرير")], title_ar="عنوان").json()
+    assert b"IBMPlexSansArabic" not in _pdf_text(factory, plain["id"])
+    typed = _issue(client, factory, [_line(bed, area="غرف النزلاء")]).json()
+    assert b"IBMPlexSansArabic" in _pdf_text(factory, typed["id"])
+
+
+# -- translation --------------------------------------------------------------
+
+
+class _FakeClaude:
+    """Stands in for the Anthropic client: answers each segment with a marked
+    copy, and remembers what it was asked."""
+
+    def __init__(self, answer=None, stop_reason="end_turn", raises=None):
+        self.requests = []
+        self._answer, self._stop_reason, self._raises = answer, stop_reason, raises
+        self.beta = self
+        self.messages = self
+
+    def stream(self, **kwargs):
+        import json
+        from types import SimpleNamespace
+
+        self.requests.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
+        segments = json.loads(kwargs["messages"][0]["content"])
+        answer = self._answer or (lambda rows: [{"id": r["id"], "text": f"ع[{r['text']}]"} for r in rows])
+        message = SimpleNamespace(
+            stop_reason=self._stop_reason,
+            content=[
+                SimpleNamespace(type="thinking", thinking=""),
+                SimpleNamespace(type="text", text=json.dumps({"translations": answer(segments)})),
+            ],
+            _request_id="req_test",
+        )
+
+        class _Stream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get_final_message(self):
+                return message
+
+        return _Stream()
+
+
+def _with_claude(monkeypatch, fake):
+    from app.services import translate
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(translate, "_client", lambda: fake)
+    return fake
+
+
+def _translate(client, texts):
+    return client.post("/api/work-orders/translate", json={"texts": texts})
+
+
+def test_translation_answers_in_order_and_sends_only_what_has_text(client, monkeypatch):
+    fake = _with_claude(monkeypatch, _FakeClaude())
+    answered = _translate(client, ["King bed base", "", "Oak veneer on MDF 18 mm", "   "])
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["translations"] == ["ع[King bed base]", "", "ع[Oak veneer on MDF 18 mm]", ""]
+
+    (request,) = fake.requests
+    import json
+
+    assert [row["text"] for row in json.loads(request["messages"][0]["content"])] == [
+        "King bed base", "Oak veneer on MDF 18 mm",
+    ]
+    assert request["model"] == "claude-opus-5-5"
+    assert request["output_config"]["format"]["type"] == "json_schema"
+    assert "Arabic" in request["system"]
+
+    # Nothing but blanks: nobody is asked anything.
+    assert _translate(client, ["", " "]).json()["translations"] == ["", ""]
+    assert len(fake.requests) == 1
+
+
+def test_a_long_work_order_is_translated_in_several_requests(client, monkeypatch):
+    fake = _with_claude(monkeypatch, _FakeClaude())
+    texts = [f"Item {n}: " + "oak veneer panel " * 20 for n in range(90)]
+    answered = _translate(client, texts).json()["translations"]
+    assert answered == [f"ع[{text}]" for text in texts]
+    assert len(fake.requests) > 2            # split up, and put back together in order
+
+
+def test_translation_says_why_when_it_cannot(client, monkeypatch):
+    import anthropic
+    import httpx2
+
+    from app.services import translate
+
+    # No key: the feature is off, and says how to turn it on.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    off = _translate(client, ["King bed base"])
+    assert off.status_code == 503 and "ANTHROPIC_API_KEY" in off.json()["detail"]
+
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+
+    def status_error(kind, code):
+        return kind("nope", response=httpx2.Response(code, request=request), body=None)
+
+    cases = [
+        (anthropic.AuthenticationError, 401, 503, "API key"),
+        (anthropic.RateLimitError, 429, 503, "busy"),
+        (anthropic.InternalServerError, 500, 502, "trouble"),
+        (anthropic.BadRequestError, 400, 502, "refused"),
+    ]
+    for kind, code, expected, word in cases:
+        _with_claude(monkeypatch, _FakeClaude(raises=status_error(kind, code)))
+        answer = _translate(client, ["King bed base"])
+        assert (answer.status_code, word in answer.json()["detail"]) == (expected, True), answer.text
+
+    _with_claude(monkeypatch, _FakeClaude(raises=anthropic.APIConnectionError(request=request)))
+    assert "reach" in _translate(client, ["King bed base"]).json()["detail"]
+
+    # An answer that is declined, cut short or missing a segment is an error,
+    # never a half-filled work order.
+    _with_claude(monkeypatch, _FakeClaude(stop_reason="refusal"))
+    assert _translate(client, ["King bed base"]).status_code == 502
+    _with_claude(monkeypatch, _FakeClaude(stop_reason="max_tokens"))
+    assert "cut short" in _translate(client, ["King bed base"]).json()["detail"]
+    _with_claude(monkeypatch, _FakeClaude(answer=lambda rows: rows[:-1]))
+    assert "incomplete" in _translate(client, ["one", "two"]).json()["detail"]
+
+    # Too much, or nothing at all, is refused before anyone is asked.
+    assert _translate(client, []).status_code == 422
+    assert _translate(client, ["x" * 4001]).status_code == 422
+    assert translate.is_configured()
+
+
+def test_translation_needs_a_session(client, monkeypatch):
+    fake = _with_claude(monkeypatch, _FakeClaude())
+    client.post("/api/auth/logout")
+    assert _translate(client, ["King bed base"]).status_code == 401
+    assert fake.requests == []

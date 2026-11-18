@@ -16,6 +16,12 @@ dependencies = [
     # Work order PDFs. Pillow reads the pictures (and the logo) that go on them.
     "reportlab>=4.2",
     "pillow>=10.4",
+    # Arabic on those PDFs: letter shaping and right-to-left ordering, both
+    # pure Python (see app/services/arabic.py).
+    "arabic-reshaper>=3.0",
+    "python-bidi>=0.6",
+    # Drafting a work order's Arabic with Claude (app/services/translate.py).
+    "anthropic>=2.10",
 ]
 
 [project.optional-dependencies]

@@ -92,6 +92,7 @@ class Settings:
     s3_bucket: str
     s3_prefix: str
     backup_keep: int
+    translate_model: str
 
     @property
     def session_max_age_seconds(self) -> int:
@@ -123,6 +124,11 @@ def get_settings() -> Settings:
         s3_bucket=os.environ.get("LSF_S3_BUCKET", "").strip(),
         s3_prefix=os.environ.get("LSF_S3_PREFIX", "").strip(),
         backup_keep=_int("LSF_BACKUP_KEEP", 30),
+        # The Claude model that drafts a work order's Arabic. The key itself
+        # (ANTHROPIC_API_KEY) is read by the SDK, straight from the environment,
+        # and only when someone asks for a translation -- see
+        # app/services/translate.py.
+        translate_model=os.environ.get("LSF_TRANSLATE_MODEL", "").strip() or "claude-opus-5-5",
     )
     if settings.domain and not settings.secure_cookies:
         # A real domain means real TLS via the bundled proxy; shipping

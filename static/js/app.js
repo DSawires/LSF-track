@@ -2811,6 +2811,16 @@ const WO_COLUMNS = [
   ["show_location", "Area & phase"],
 ];
 
+/* What the PDF can be printed in. */
+const WO_LANGUAGES = [["en", "English"], ["ar", "Arabic"], ["both", "English and Arabic"]];
+
+/* Every text field on a line, by the data attribute of the input that edits
+   it. All of them are the work order's own wording. */
+const WO_LINE_FIELDS = {
+  woCode: "code", woRev: "drawing_revision", woDesc: "description", woDescAr: "description_ar",
+  woDims: "dimensions", woQty: "qty", woArea: "area", woPhase: "phase",
+};
+
 /* An item's picture, as an image id: its icon URL ends in one. */
 const iconId = (item) => (item?.icon_url ? item.icon_url.split("/").pop() : null);
 
@@ -2821,17 +2831,25 @@ function workOrderLine(item) {
   return {
     key: `new${++workOrderKey}`, id: null, item_id: item.id,
     code: item.code, area: areaName(item), phase: phaseName(item), drawing_revision: item.drawing_revision,
-    description: item.description || "", dimensions: item.dimensions || "", qty: item.total_qty,
+    description: item.description || "", description_ar: "",
+    dimensions: item.dimensions || "", qty: item.total_qty,
     image_id: iconId(item), image_url: item.icon_url || null,
   };
 }
 
 function workOrderDraft(saved, projectId) {
   if (!saved) {
+    // A factory prints in the same language day after day: start from the
+    // one the last work order issued on this device used.
+    const usual = localStorage.getItem("wo-language");
     return { id: null, label: null, revision: 0, project_id: projectId, title: "", notes: "",
+      language: WO_LANGUAGES.some(([code]) => code === usual) ? usual : "en", title_ar: "", notes_ar: "",
       show_picture: true, show_description: true, show_dimensions: true, show_location: true, lines: [] };
   }
-  return { ...saved, lines: saved.lines.map((line) => ({ ...line, key: line.id })) };
+  return {
+    language: "en", title_ar: "", notes_ar: "", ...saved,
+    lines: saved.lines.map((line) => ({ description_ar: "", ...line, key: line.id })),
+  };
 }
 
 /* The project's items that are not on the draft yet and match the search. */
@@ -2968,6 +2986,23 @@ function workOrderEditor(body, projects) {
       <input id="wo-title" maxlength="160" value="${esc(draft.title)}" placeholder="e.g. Guest rooms — first release">
       <label for="wo-notes">Notes</label>
       <textarea id="wo-notes" maxlength="4000" rows="3" placeholder="Finishes, packing, anything production should read first">${esc(draft.notes)}</textarea>
+      <label for="wo-lang">Language of the PDF</label>
+      <select id="wo-lang">
+        ${WO_LANGUAGES.map(([code, name]) => `<option value="${code}" ${code === draft.language ? "selected" : ""}>${name}</option>`).join("")}
+      </select>
+      <div id="wo-ar" ${draft.language === "en" ? "hidden" : ""}>
+        <label for="wo-title-ar">Title in Arabic</label>
+        <input id="wo-title-ar" dir="rtl" lang="ar" maxlength="160" value="${esc(draft.title_ar)}">
+        <label for="wo-notes-ar">Notes in Arabic</label>
+        <textarea id="wo-notes-ar" dir="rtl" lang="ar" maxlength="4000" rows="3">${esc(draft.notes_ar)}</textarea>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">
+          <button class="ghost" id="wo-translate" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Translate to Arabic</button>
+          <span class="muted" id="wo-tr-msg" role="status"></span>
+        </div>
+        <p class="muted" style="margin-top:6px">Fills in the Arabic that is still empty — title, notes and each
+          line's description — as a draft from Claude. Read it and correct it like any other field: what is
+          in the boxes when you issue is what is printed. The text is sent to Anthropic to be translated.</p>
+      </div>
       <label>Columns on the PDF</label>
       <div class="check-row">
         ${WO_COLUMNS.map(([key, name]) => `
@@ -3039,19 +3074,33 @@ function workOrderEditor(body, projects) {
         </div>
         <div class="wo-fields">
           <div class="spread">
-            <span><strong>${esc(line.code)}</strong> ${[line.area, line.phase].filter(Boolean).map((t) => `<span class="badge tag">${esc(t)}</span>`).join(" ")}
-              <span class="muted">rev ${esc(line.drawing_revision)}</span>${line.item_id ? "" : ` <span class="badge">item deleted</span>`}</span>
+            <span class="muted">Line ${index + 1}${line.item_id ? "" : ` <span class="badge">item deleted</span>`}</span>
             <span style="white-space:nowrap">
               <button class="ghost wo-move" data-wo-up="${line.key}" aria-label="Move up" ${index ? "" : "disabled"}>▲</button>
               <button class="ghost wo-move" data-wo-down="${line.key}" aria-label="Move down" ${index < draft.lines.length - 1 ? "" : "disabled"}>▼</button>
               <button class="ghost wo-move" data-wo-drop="${line.key}" aria-label="Take off the work order">✕</button>
             </span>
           </div>
+          <div class="field-grid">
+            <div><label>Code</label><input data-wo-code="${line.key}" maxlength="64" value="${esc(line.code)}"></div>
+            <div><label>Drawing revision</label><input data-wo-rev="${line.key}" maxlength="32" value="${esc(line.drawing_revision)}"></div>
+          </div>
           <label>Description</label>
           <textarea data-wo-desc="${line.key}" maxlength="2000" rows="2">${esc(line.description)}</textarea>
+          ${draft.language === "en" ? "" : `
+          <div class="spread" style="align-items:flex-end">
+            <label>Description in Arabic</label>
+            <button class="ghost wo-tr" data-wo-tr="${line.key}" ${S.online ? "" : "disabled"}>Translate</button>
+          </div>
+          <textarea data-wo-desc-ar="${line.key}" dir="rtl" lang="ar" maxlength="2000" rows="2">${esc(line.description_ar)}</textarea>
+          <p class="warn-text" data-wo-stale="${line.key}" style="margin:4px 0 0" ${line.ar_stale ? "" : "hidden"}>The English was changed after this was translated. Check the Arabic, or press Translate.</p>`}
           <div class="field-grid">
             <div><label>Dimensions</label><input data-wo-dims="${line.key}" maxlength="255" value="${esc(line.dimensions)}"></div>
             <div><label>Quantity</label><input data-wo-qty="${line.key}" type="number" inputmode="numeric" min="1" value="${esc(line.qty)}"></div>
+          </div>
+          <div class="field-grid">
+            <div><label>Area</label><input data-wo-area="${line.key}" maxlength="120" value="${esc(line.area)}"></div>
+            <div><label>Phase</label><input data-wo-phase="${line.key}" maxlength="120" value="${esc(line.phase)}"></div>
           </div>
         </div>
       </div>`).join("") || `<p class="muted">Nothing on it yet. Find the items below and add them.</p>`;
@@ -3080,14 +3129,79 @@ function workOrderEditor(body, projects) {
 
   // One listener each for the whole list of lines: it is repainted whenever
   // its shape changes, and typing must never cause that.
+  const stale = (target, is) => {
+    target.ar_stale = is;
+    const hint = $lines.querySelector(`[data-wo-stale="${target.key}"]`);
+    if (hint) hint.hidden = !is;
+  };
   $lines.oninput = (e) => {
     const data = e.target.dataset || {};
-    if (data.woDesc) line(data.woDesc).description = e.target.value;
-    else if (data.woDims) line(data.woDims).dimensions = e.target.value;
-    else if (data.woQty) { line(data.woQty).qty = e.target.value; saveLabel(); }
+    const attribute = Object.keys(WO_LINE_FIELDS).find((name) => data[name]);
+    if (!attribute) return;
+    const target = line(data[attribute]);
+    const field = WO_LINE_FIELDS[attribute];
+    target[field] = e.target.value;
+    if (field === "qty") saveLabel();
+    // An Arabic description stops matching the moment the English is edited.
+    // Say so on the line; nothing is retranslated behind anyone's back.
+    else if (field === "description") stale(target, !!target.description_ar.trim());
+    else if (field === "description_ar") stale(target, false);
   };
+
+  /* Ask for Arabic and hand each answer to `put`. The answers are a draft:
+     they go into the fields, where they are read and corrected. */
+  const $trMsg = document.getElementById("wo-tr-msg");
+  const sayTr = (text, warn) => { $trMsg.className = warn ? "warn-text" : "muted"; $trMsg.textContent = text; };
+  let translating = false;
+  const translate = async (jobs) => {
+    if (translating) return;
+    translating = true;
+    sayTr(`Translating ${jobs.length} text${jobs.length === 1 ? "" : "s"}…`);
+    try {
+      const { translations } = await api("/api/work-orders/translate", {
+        method: "POST", body: JSON.stringify({ texts: jobs.map((job) => job.text) }),
+      });
+      jobs.forEach((job, index) => job.put(translations[index] || ""));
+      if (workOrders.draft !== draft || !body.isConnected) return; // closed while waiting
+      document.getElementById("wo-title-ar").value = draft.title_ar;
+      document.getElementById("wo-notes-ar").value = draft.notes_ar;
+      paintLines();
+      sayTr(`Translated ${jobs.length}. Read it through before issuing.`);
+    } catch (error) {
+      const detail = error.body?.detail;
+      sayTr(typeof detail === "string" ? detail
+        : isNetworkError(error) ? "No connection — nothing was translated."
+        : "Could not translate.", true);
+    } finally {
+      translating = false;
+    }
+  };
+  document.getElementById("wo-translate").onclick = () => {
+    // Only what is still empty: a translation someone has corrected is theirs.
+    const jobs = [];
+    if (draft.title.trim() && !draft.title_ar.trim()) jobs.push({ text: draft.title, put: (ar) => { if (!draft.title_ar.trim()) draft.title_ar = ar; } });
+    if (draft.notes.trim() && !draft.notes_ar.trim()) jobs.push({ text: draft.notes, put: (ar) => { if (!draft.notes_ar.trim()) draft.notes_ar = ar; } });
+    for (const entry of draft.lines) {
+      if (entry.description.trim() && !entry.description_ar.trim()) {
+        jobs.push({ text: entry.description, put: (ar) => { if (!entry.description_ar.trim()) { entry.description_ar = ar; entry.ar_stale = false; } } });
+      }
+    }
+    if (!jobs.length) {
+      sayTr("Nothing to translate: every Arabic box that has English beside it is already filled. Clear a box to have it translated again.");
+      return;
+    }
+    translate(jobs);
+  };
+
   $lines.onclick = (e) => {
     const data = e.target.dataset || {};
+    if (data.woTr) {
+      // One line, on request: this replaces what is there.
+      const entry = line(data.woTr);
+      if (!entry.description.trim()) { sayTr("That line has no English description to translate.", true); return; }
+      translate([{ text: entry.description, put: (ar) => { entry.description_ar = ar; entry.ar_stale = false; } }]);
+      return;
+    }
     const key = data.woUp || data.woDown || data.woDrop || data.woNopic;
     if (!key) return;
     const at = draft.lines.findIndex((entry) => entry.key === key);
@@ -3141,6 +3255,15 @@ function workOrderEditor(body, projects) {
   document.getElementById("wo-in-phase").onchange = (e) => { workOrders.inPhase = e.target.value; paintResults(); };
   document.getElementById("wo-title").oninput = (e) => { draft.title = e.target.value; };
   document.getElementById("wo-notes").oninput = (e) => { draft.notes = e.target.value; };
+  document.getElementById("wo-title-ar").oninput = (e) => { draft.title_ar = e.target.value; };
+  document.getElementById("wo-notes-ar").oninput = (e) => { draft.notes_ar = e.target.value; };
+  document.getElementById("wo-lang").onchange = (e) => {
+    draft.language = e.target.value;
+    // The Arabic boxes are only on screen when the paper will carry Arabic.
+    // What is in them is kept either way.
+    document.getElementById("wo-ar").hidden = draft.language === "en";
+    paintLines();
+  };
   body.querySelectorAll("[data-wo-col]").forEach((box) => {
     box.onchange = () => { draft[box.dataset.woCol] = box.checked; };
   });
@@ -3174,19 +3297,29 @@ function workOrderEditor(body, projects) {
     err.hidden = true;
     if (!draft.lines.length) return;
     const bad = draft.lines.find((entry) => !Number.isInteger(Number(entry.qty)) || Number(entry.qty) < 1 || String(entry.qty).trim() === "");
-    if (bad) return fail(`${bad.code}: the quantity must be a whole number, 1 or more.`);
+    if (bad) return fail(`${bad.code || "A line"}: the quantity must be a whole number, 1 or more.`);
+    const uncoded = draft.lines.findIndex((entry) => !String(entry.code).trim());
+    if (uncoded >= 0) return fail(`Line ${uncoded + 1} has no code.`);
     const payload = {
       project_id: draft.project_id,
       title: draft.title.trim(),
       notes: draft.notes.trim(),
+      language: draft.language,
+      title_ar: draft.title_ar.trim(),
+      notes_ar: draft.notes_ar.trim(),
       ...Object.fromEntries(WO_COLUMNS.map(([key]) => [key, !!draft[key]])),
       lines: draft.lines.map((entry) => ({
         ...(entry.id ? { id: entry.id } : {}),
         item_id: entry.item_id,
         image_id: entry.image_id,
+        code: String(entry.code).trim(),
+        drawing_revision: String(entry.drawing_revision ?? "").trim(),
         description: entry.description.trim(),
+        description_ar: (entry.description_ar || "").trim(),
         dimensions: entry.dimensions.trim(),
         qty: Number(entry.qty),
+        area: String(entry.area ?? "").trim(),
+        phase: String(entry.phase ?? "").trim(),
       })),
     };
     const go = document.getElementById("wo-save");
@@ -3196,6 +3329,7 @@ function workOrderEditor(body, projects) {
         method: draft.id ? "PUT" : "POST", body: JSON.stringify(payload),
       });
       toast(`${saved.label} Rev ${saved.revision} issued`);
+      localStorage.setItem("wo-language", saved.language);
       workOrders.issued = saved;
       workOrders.project = saved.project_id;
       leave();

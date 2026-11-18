@@ -563,6 +563,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .wo-fields { flex: 1; min-width: 0; }
 .wo-move { width: 34px; min-height: 34px; padding: 0; font-size: 13px; }
 .wo-move:disabled { opacity: .35; }
+.wo-tr { width: auto; min-height: 30px; padding: 4px 12px; font-size: 12px; margin-bottom: 4px; }
+/* Arabic is typed and read right to left; a little more line height keeps its
+   marks from touching the row above. */
+[lang="ar"] { line-height: 1.7; }
 .check-row { display: flex; flex-wrap: wrap; }
 @media (max-width: 420px) {
   .wo-line { flex-direction: column; }

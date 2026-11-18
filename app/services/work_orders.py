@@ -34,8 +34,9 @@ def label(work_order: WorkOrder) -> str:
 
 
 def _lines(db: Session, project: Project, payload, existing: WorkOrder | None) -> list[WorkOrderLine]:
-    """The lines as they will be stored: what the office typed, plus a copy of
-    everything else the document prints about each item."""
+    """The lines as they will be stored. Every printed field is the line's
+    own: what the office sent for it, or -- for a field it left out -- a copy
+    of the item's as it stands now."""
     old = {line.id: line for line in (existing.lines if existing else [])}
     item_ids = [line.item_id for line in payload.lines if line.item_id is not None]
     items = {item.id: item for item in db.scalars(sa.select(Item).where(Item.id.in_(item_ids)))}
@@ -57,6 +58,7 @@ def _lines(db: Session, project: Project, payload, existing: WorkOrder | None) -
             if kept is None or kept.item_id is not None:
                 raise WorkOrderError(f"line {position} names no item")
             code, area, phase, revision = kept.code, kept.area, kept.phase, kept.drawing_revision
+            item_code = kept.code
         else:
             item = items.get(line.item_id)
             if item is None:
@@ -70,6 +72,7 @@ def _lines(db: Session, project: Project, payload, existing: WorkOrder | None) -
             if item.id in seen:
                 raise WorkOrderError(f"{item.code} is on this work order twice", 409)
             seen.add(item.id)
+            item_code = item.code
             code, revision = item.code, item.drawing_revision
             area = areas.get(item.area_id, "") if item.area_id else ""
             phase = phases.get(item.phase_id, "") if item.phase_id else ""
@@ -77,7 +80,18 @@ def _lines(db: Session, project: Project, payload, existing: WorkOrder | None) -
         if line.image_id is not None:
             image = images.get(line.image_id)
             if image is None or image.item_id != line.item_id:
-                raise WorkOrderError(f"line {position}: that picture is not one of {code}'s")
+                raise WorkOrderError(f"line {position}: that picture is not one of {item_code}'s")
+
+        # What the office typed over the item's own wording, for this document
+        # only. The item is not touched.
+        if line.code is not None and line.code.strip():
+            code = line.code.strip()
+        if line.area is not None:
+            area = line.area.strip()
+        if line.phase is not None:
+            phase = line.phase.strip()
+        if line.drawing_revision is not None:
+            revision = line.drawing_revision.strip()
 
         out.append(
             WorkOrderLine(
@@ -86,6 +100,7 @@ def _lines(db: Session, project: Project, payload, existing: WorkOrder | None) -
                 image_id=line.image_id,
                 code=code,
                 description=line.description.strip(),
+                description_ar=line.description_ar.strip(),
                 dimensions=line.dimensions.strip(),
                 qty=line.qty,
                 area=area,
@@ -110,6 +125,9 @@ def save(db: Session, user: User, payload, existing: WorkOrder | None = None) ->
     fields = {
         "title": payload.title.strip(),
         "notes": payload.notes.strip(),
+        "language": payload.language,
+        "title_ar": payload.title_ar.strip(),
+        "notes_ar": payload.notes_ar.strip(),
         "show_picture": payload.show_picture,
         "show_description": payload.show_description,
         "show_dimensions": payload.show_dimensions,
@@ -155,6 +173,9 @@ def payload_of(db: Session, work_order: WorkOrder, with_lines: bool = True) -> d
         "project_id": str(work_order.project_id),
         "title": work_order.title,
         "notes": work_order.notes,
+        "language": work_order.language,
+        "title_ar": work_order.title_ar,
+        "notes_ar": work_order.notes_ar,
         "revision": work_order.revision,
         "show_picture": work_order.show_picture,
         "show_description": work_order.show_description,
@@ -175,6 +196,7 @@ def payload_of(db: Session, work_order: WorkOrder, with_lines: bool = True) -> d
                 "image_url": f"/api/images/{line.image_id}" if line.image_id else None,
                 "code": line.code,
                 "description": line.description,
+                "description_ar": line.description_ar,
                 "dimensions": line.dimensions,
                 "qty": line.qty,
                 "area": line.area,

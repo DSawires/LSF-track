@@ -199,7 +199,12 @@ Names are indicative; Alembic migrations are authoritative.
   loggable before and is after, there is still no released/unreleased flag —
   and no report reads these tables. A line keeps its own copy of everything it
   prints (code, description, dimensions, quantity, area, phase, drawing
-  revision), so editing an item never rewrites a document already issued.
+  revision), so editing an item never rewrites a document already issued; each
+  of those starts from the item and is editable on the line. The Arabic
+  wording sits beside the English (`title_ar`, `notes_ar`, a line's
+  `description_ar`), and `language` (en / ar / both) says what the PDF prints
+  — a fixed set like the banner's colours: what the renderer can draw, not
+  factory vocabulary, read by nothing but the PDF.
   Editing a work order re-issues it as the next revision; earlier revisions
   are not kept. A line outlives its item and its picture (`item_id` and
   `image_id` go NULL)
@@ -325,12 +330,22 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   Finished jobs should be archived: every active item is replayed by every
   report. Deleting an item for good is rule 1's purge
 - Office → Work orders (any engineer; deleting one is admin-only): pick a
-  project, add its items by search, edit each line's picture, description,
-  dimensions and quantity, switch optional columns on or off, issue. The PDF
+  project, add its items by search, edit any field of each line (picture,
+  code, revision, description, dimensions, quantity, area, phase), switch
+  optional columns on or off, issue. The PDF
   (`app/services/work_order_pdf.py`, reportlab) is one table with a row per
   item under the company mark (`static/brand/`). Online-only, like the other
   office screens. A picture chosen for a line is stored as an item image of
   kind `document`, which is not the item's icon
+- Work orders in Arabic: the PDF prints in English, Arabic (mirrored, right to
+  left) or both. Arabic is shaped and ordered in `app/services/arabic.py`
+  before reportlab sees it, so it must be wrapped there too — never hand a
+  shaped line to something that re-wraps. "Translate to Arabic" drafts the
+  Arabic with Claude (`app/services/translate.py`,
+  `POST /api/work-orders/translate`): it stores nothing, the answer goes into
+  editable fields and is saved only when the work order is issued. This is
+  the one place the app sends data out (title, notes, line descriptions, to
+  Anthropic), only on that button, and only if `ANTHROPIC_API_KEY` is set
 - Office → Status (admin only): per-account last sign-in, last logged entry and
   lifetime entry count, plus the green/yellow/red/neutral banner an admin
   publishes to every non-admin. The banner ships in the reference payload, so
@@ -390,6 +405,11 @@ fixed rather than patched around.
   phones cannot both pass the availability check for the same item. A batch
   locks every item it names up front, in id order, so two drains cannot
   deadlock.
+- `ANTHROPIC_API_KEY` is optional and read from the environment by the SDK,
+  never stored. Unset, translation answers 503 "not set up" and nothing else
+  is affected: it must never become a boot requirement. `LSF_TRANSLATE_MODEL`
+  picks the model (default `claude-opus-5-5`). Tests stub the client
+  (`translate._client`); no test calls the API.
 - `/api/docs` is off unless `LSF_API_DOCS=true`: it is served without a
   session, and the production host is on the public internet.
 - `stages.is_terminal` is legacy: it marked the stage that closed a sequence.

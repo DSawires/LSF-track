@@ -19,8 +19,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.db import get_db
 from app.deps import current_user, require_admin
 from app.models import User, WorkOrder
-from app.schemas import WorkOrderSave
-from app.services import work_orders
+from app.schemas import TranslateRequest, WorkOrderSave
+from app.services import translate, work_orders
 from app.services.work_order_pdf import render
 
 log = logging.getLogger(__name__)
@@ -68,6 +68,20 @@ def issue(
     payload: WorkOrderSave, db: Session = Depends(get_db), user: User = Depends(current_user)
 ) -> dict:
     return _save(db, user, payload, None)
+
+
+@router.post("/translate")
+def translate_texts(payload: TranslateRequest, user: User = Depends(current_user)) -> dict:
+    """A first draft of the Arabic for a work order's texts, in the order sent.
+
+    Stores nothing: the answer goes into editable fields on the screen and is
+    saved, corrected or not, when the work order is issued. The texts go to
+    Anthropic's API -- the only place in the app that sends anything out.
+    """
+    try:
+        return {"translations": translate.to_arabic(payload.texts)}
+    except translate.TranslationError as exc:
+        raise HTTPException(exc.status, str(exc))
 
 
 @router.get("/{work_order_id}")

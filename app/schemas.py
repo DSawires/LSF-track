@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -111,20 +111,46 @@ class WorkOrderLineIn(BaseModel):
     # One of that item's pictures, or null for none.
     image_id: uuid.UUID | None = None
     description: str = Field(default="", max_length=2000)
+    description_ar: str = Field(default="", max_length=2000)
     dimensions: str = Field(default="", max_length=255)
     qty: int = Field(ge=1, le=1_000_000)
+    # What the line prints for these. Left out (null), each is copied from the
+    # item as it stands; sent, it is what this document says, whatever the item
+    # says. A blank code is not a code: it falls back to the item's.
+    code: str | None = Field(default=None, max_length=64)
+    area: str | None = Field(default=None, max_length=120)
+    phase: str | None = Field(default=None, max_length=120)
+    drawing_revision: str | None = Field(default=None, max_length=32)
 
 
 class WorkOrderSave(BaseModel):
     project_id: uuid.UUID
     title: str = Field(default="", max_length=160)
     notes: str = Field(default="", max_length=4000)
+    # English, Arabic, or both on the one sheet.
+    language: Literal["en", "ar", "both"] = "en"
+    title_ar: str = Field(default="", max_length=160)
+    notes_ar: str = Field(default="", max_length=4000)
     # Which optional columns the PDF prints.
     show_picture: bool = True
     show_description: bool = True
     show_dimensions: bool = True
     show_location: bool = True
     lines: list[WorkOrderLineIn] = Field(min_length=1, max_length=500)
+
+
+class TranslateRequest(BaseModel):
+    """Texts to put into Arabic, answered in the same order."""
+
+    texts: list[str] = Field(min_length=1, max_length=600)
+
+    @field_validator("texts")
+    @classmethod
+    def _each_within_reason(cls, texts: list[str]) -> list[str]:
+        for text in texts:
+            if len(text) > 4000:
+                raise ValueError("one of the texts is longer than 4000 characters")
+        return texts
 
 
 class ItemsAssign(BaseModel):

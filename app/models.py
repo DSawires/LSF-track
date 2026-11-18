@@ -322,6 +322,14 @@ class WorkOrder(Base):
     show_description: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     show_dimensions: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     show_location: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    # What the paper is printed in: 'en', 'ar' or 'both'. A fixed set like the
+    # banner's colours -- it is what the renderer can draw, not vocabulary the
+    # factory owns -- and nothing but the PDF reads it.
+    language: Mapped[str] = mapped_column(sa.String(8), default="en", server_default="en")
+    # The Arabic wording, typed or machine-translated and then corrected. Kept
+    # beside the English, never instead of it.
+    title_ar: Mapped[str] = mapped_column(sa.String(160), default="", server_default="")
+    notes_ar: Mapped[str] = mapped_column(sa.Text, default="", server_default="")
     issued_at: Mapped[datetime] = mapped_column(default=utcnow)
     issued_by_user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
@@ -334,9 +342,10 @@ class WorkOrder(Base):
 class WorkOrderLine(Base):
     """One item on a work order, as it was written there.
 
-    Everything printed is copied onto the line when it is saved -- code, area,
-    phase, drawing revision -- or typed for it: description, dimensions and
-    quantity start from the item's and can be changed for this document alone.
+    Everything printed is the line's own. Each field starts from the item's --
+    code, description, dimensions, quantity, area, phase, drawing revision --
+    and every one of them can be changed for this document alone, without
+    touching the item. `description_ar` is the description in Arabic.
     `item_id` and `image_id` are kept so the line can be reopened against its
     item and its picture, and both may go: an item deleted for good, or a
     photo removed, leaves the line with its text and no link.
@@ -355,6 +364,7 @@ class WorkOrderLine(Base):
     )
     code: Mapped[str] = mapped_column(sa.String(64))
     description: Mapped[str] = mapped_column(sa.Text, default="")
+    description_ar: Mapped[str] = mapped_column(sa.Text, default="", server_default="")
     dimensions: Mapped[str] = mapped_column(sa.String(255), default="")
     qty: Mapped[int] = mapped_column(sa.Integer)
     area: Mapped[str] = mapped_column(sa.String(120), default="")
