@@ -20,9 +20,11 @@ import uuid
 
 from app.db import get_db
 from app.deps import current_user, require_admin
-from app.models import Item, Project, Stage, Station, User
+from app.models import Area, Item, Phase, Project, Stage, Station, User
 from app.services.items import archive_item
 from app.schemas import (
+    LabelCreate,
+    LabelUpdate,
     ProjectCreate,
     ProjectUpdate,
     StageCreate,
@@ -146,6 +148,99 @@ def update_station(
         setattr(station, field, value)
     db.flush()
     return _station_payload(station)
+
+
+# -- areas and phases ---------------------------------------------------------
+#
+# Two lists of the same shape: a name, an order, and whether it is still on
+# offer. An item points at one of each (or neither). They are edited here and
+# can also be created by an import file that names a new one.
+
+
+def label_payload(row) -> dict:
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "sort_order": row.sort_order,
+        "is_active": row.is_active,
+    }
+
+
+def _name_taken(db: Session, model, name: str, exclude_id: uuid.UUID | None = None) -> bool:
+    # Case-insensitive: "Spa" and "spa" in one filter are the same place twice.
+    query = sa.select(model.id).where(sa.func.lower(model.name) == name.lower())
+    if exclude_id is not None:
+        query = query.where(model.id != exclude_id)
+    return db.scalars(query.limit(1)).first() is not None
+
+
+def _create_label(db: Session, model, payload: LabelCreate, noun: str) -> dict:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(422, f"the {noun} needs a name")
+    if _name_taken(db, model, name):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{noun} '{name}' already exists")
+    row = model(name=name, sort_order=payload.sort_order)
+    db.add(row)
+    db.flush()
+    return label_payload(row)
+
+
+def _update_label(db: Session, model, row_id: uuid.UUID, payload: LabelUpdate, noun: str) -> dict:
+    """Rename, reorder or retire. A rename re-labels every item that points at
+    the row, which is the point: items reference it by id. Retiring one takes
+    it off the pickers; items already in it keep it."""
+    row = db.get(model, row_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown {noun}")
+    fields = payload.model_dump(exclude_unset=True)
+    if "name" in fields:
+        name = (fields["name"] or "").strip()
+        if not name:
+            raise HTTPException(422, f"the {noun} needs a name")
+        if _name_taken(db, model, name, exclude_id=row.id):
+            raise HTTPException(status.HTTP_409_CONFLICT, f"{noun} '{name}' already exists")
+        row.name = name
+    if fields.get("sort_order") is not None:
+        row.sort_order = fields["sort_order"]
+    if fields.get("is_active") is not None:
+        row.is_active = fields["is_active"]
+    db.flush()
+    return label_payload(row)
+
+
+@router.post("/areas", status_code=status.HTTP_201_CREATED)
+def create_area(
+    payload: LabelCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+) -> dict:
+    return _create_label(db, Area, payload, "area")
+
+
+@router.patch("/areas/{area_id}")
+def update_area(
+    area_id: uuid.UUID,
+    payload: LabelUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    return _update_label(db, Area, area_id, payload, "area")
+
+
+@router.post("/phases", status_code=status.HTTP_201_CREATED)
+def create_phase(
+    payload: LabelCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+) -> dict:
+    return _create_label(db, Phase, payload, "phase")
+
+
+@router.patch("/phases/{phase_id}")
+def update_phase(
+    phase_id: uuid.UUID,
+    payload: LabelUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    return _update_label(db, Phase, phase_id, payload, "phase")
 
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)

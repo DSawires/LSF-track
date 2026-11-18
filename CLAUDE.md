@@ -172,8 +172,18 @@ Names are indicative; Alembic migrations are authoritative.
   packing, …). Carries behaviour flags. **Extensible at runtime.**
 - `stations` — physical instances of a stage (paint_1, paint_2, carpentry_1, …).
   Many stations per stage. Recorded on events for load balancing.
-- `items` — a batch: code, project, description, total qty (the production
-  batch), sample qty, current drawing revision. Creating one **is** the handoff
+- `areas`, `phases` — which part of a job a batch is for (guest rooms, the
+  spa) and which phase of it. Two lists the office edits at runtime, shared by
+  every project, table-driven like stages: no enum, no literal names, nothing
+  branches on one. Retired, never deleted
+- `items` — a batch: code, project, area, phase, description, total qty (the
+  production batch), sample qty, current drawing revision. **An item is
+  project + code + area + phase.** The same code can be several items in one
+  project — one per area and phase — each with its own quantity, sample and
+  history; area and phase are optional, and "none" is a value like any other.
+  That identity is enforced in `app/services/items.py` (`identity_taken`,
+  under a lock on the project row), not by a unique index: an index never
+  treats two NULLs as equal. Never show or look up an item by code alone Creating one **is** the handoff
   to the floor: there is no released/unreleased state, and `created_at` is when
   the sample started counting. Items arrive through the project import file,
   or one at a time from Office → Items. An item has no stages of its own
@@ -253,7 +263,10 @@ connection.
 The shipped product (v1 scope plus additions blessed 2026-08-16):
 
 - Login, logout, session handling that survives offline shifts
-- Item list, filterable by project and stage, plus free-text search
+- Item list, filterable by project, stage, area, phase and progress
+  (haven't started / in progress / finished), plus free-text search. Progress
+  is read off where the units are, queued moves included — derived, never a
+  stored status (rule 8)
 - Event logging: pre-selected fields, under fifteen seconds, one-handed on a phone.
   Tap a batch on the item card (that is "from"), pick where it went — any
   stage, or Done — and log. The stage picked last time from that place starts
@@ -263,12 +276,15 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   last answer, so a batch moved in a dead spot can be tapped and moved on
 - WIP by stage and station (depth = units at the stage), with sample units shown
 - Aging report: days at current stage, sorted descending
+- Both reports narrow to an area and a phase as well as a project; the server
+  filters before it replays anything
 - Exceptions view: clock drift, late syncs, competing/orphaned corrections and
   legacy over-advance rows — flags derived from the log, not a third dashboard.
   Clock and late-sync flags drop off `LSF_CLOCK_FLAG_DAYS` (30) after the entry
   reached the server; flags about something still wrong never do
 - Office → Import: projects and their items arrive as one spreadsheet (.xlsx or
-  .csv, one row per item: project, item, qty, sample qty, revision).
+  .csv, one row per item: project, item, qty, sample qty, revision, area,
+  phase). A code may repeat as long as each row has a different area or phase.
   Previewed, then committed all-or-nothing. Format lives in
   `app/services/imports.py`; `GET /api/import/template` returns a template.
   A `stages` column from an older file is read past, and the preview says so.
@@ -280,6 +296,9 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   import, by any engineer. It posts `POST /api/items`, which also takes an
   optional mid-production distribution by stage (with `sample_qty` 0)
 - Office tab: projects, item editing, and admin management of stages/stations
+- Office → Areas & phases (admin): add, rename, reorder and retire the two
+  lists. An import file that names a new area or phase adds it, and the
+  preview says so first
 - Taking work off the floor (admin): archive an item, or a project together
   with its items — each archive is an event, and both can be reactivated.
   Finished jobs should be archived: every active item is replayed by every
@@ -361,6 +380,9 @@ fixed rather than patched around.
 ## Glossary
 
 - **Item** — a batch of identical pieces tracked as one unit, with a quantity.
+  Named by project, code, area and phase together.
+- **Area** — a part of the client's job: guest rooms, the spa.
+- **Phase** — a phase of the job a batch is built and delivered in.
 - **Sample** — the first unit(s) of an item, built before the batch exists.
   Logging it Done releases the batch.
 - **Place** — where units can rest: not started, a stage, or Done.

@@ -56,17 +56,46 @@ def _bucket_rows(
             yield item, bucket
 
 
-def _derive_scope(db: Session, project_id: uuid.UUID | None) -> Derivation:
+def _derive_scope(
+    db: Session,
+    project_id: uuid.UUID | None = None,
+    area_id: uuid.UUID | None = None,
+    phase_id: uuid.UUID | None = None,
+) -> Derivation:
     """Filter BEFORE deriving: replaying every project's events to answer a
-    one-project question does not scale with the log."""
-    if project_id is None:
+    one-project (or one-area, or one-phase) question does not scale with the
+    log. The three narrow together."""
+    if project_id is None and area_id is None and phase_id is None:
         return derive(db)
-    item_ids = list(db.scalars(sa.select(Item.id).where(Item.project_id == project_id)))
-    return derive(db, item_ids=item_ids)
+    query = sa.select(Item.id)
+    if project_id is not None:
+        query = query.where(Item.project_id == project_id)
+    if area_id is not None:
+        query = query.where(Item.area_id == area_id)
+    if phase_id is not None:
+        query = query.where(Item.phase_id == phase_id)
+    return derive(db, item_ids=list(db.scalars(query)))
+
+
+def _item_label(item, refs: dict) -> dict:
+    """Area and phase by name. A code alone no longer says which batch a row is
+    about: the same code can be several items in one project."""
+    area = refs["areas"].get(item.area_id) if item.area_id else None
+    phase = refs["phases"].get(item.phase_id) if item.phase_id else None
+    return {
+        "area_id": str(item.area_id) if item.area_id else None,
+        "phase_id": str(item.phase_id) if item.phase_id else None,
+        "area": area.name if area else None,
+        "phase": phase.name if phase else None,
+    }
 
 
 def wip_report(
-    db: Session, now: datetime | None = None, project_id: uuid.UUID | None = None
+    db: Session,
+    now: datetime | None = None,
+    project_id: uuid.UUID | None = None,
+    area_id: uuid.UUID | None = None,
+    phase_id: uuid.UUID | None = None,
 ) -> dict:
     """Work in progress by stage and station.
 
@@ -76,7 +105,7 @@ def wip_report(
     holding up a whole batch is worth seeing on its own.
     """
     now = now or utcnow()
-    derivation = _derive_scope(db, project_id)
+    derivation = _derive_scope(db, project_id, area_id, phase_id)
     refs = reference_maps(db)
 
     stage_rows: dict[uuid.UUID, dict] = {}
@@ -167,6 +196,8 @@ def aging_report(
     project_id: uuid.UUID | None = None,
     stage_id: uuid.UUID | None = None,
     min_days: float | None = None,
+    area_id: uuid.UUID | None = None,
+    phase_id: uuid.UUID | None = None,
 ) -> dict:
     """Days at the current stage, longest first.
 
@@ -176,7 +207,7 @@ def aging_report(
     reset the clock on the units left behind.
     """
     now = now or utcnow()
-    derivation = _derive_scope(db, project_id)
+    derivation = _derive_scope(db, project_id, area_id, phase_id)
     refs = reference_maps(db)
     rows: list[dict] = []
 
@@ -198,6 +229,7 @@ def aging_report(
                     "description": item.description,
                     "total_qty": item.total_qty,
                     "project_id": str(item.project_id),
+                    **_item_label(item, refs),
                 },
                 "stage": _stage_payload(stage) if stage else None,
                 "label": stage.name if stage else UNSTARTED_LABEL,
@@ -285,6 +317,7 @@ def exceptions_report(db: Session) -> dict:
     never edited to make the numbers add up.
     """
     derivation = derive(db)
+    refs = reference_maps(db)
     rows = []
     for anomaly in derivation.anomalies:
         item = derivation.items.get(anomaly.item_id)
@@ -294,6 +327,7 @@ def exceptions_report(db: Session) -> dict:
                 "event_id": str(anomaly.event_id) if anomaly.event_id else None,
                 "item_id": str(anomaly.item_id),
                 "item_code": item.code if item else None,
+                **(_item_label(item, refs) if item else {"area": None, "phase": None}),
                 "detail": anomaly.detail,
                 "occurred_at": anomaly.occurred_at.isoformat() if anomaly.occurred_at else None,
             }

@@ -27,9 +27,12 @@ from sqlalchemy.orm import Session
 
 from app.db import utcnow
 from app.models import (
+    Area,
     Event,
     EventType,
     Item,
+    Phase,
+    Project,
     Stage,
     User,
 )
@@ -37,6 +40,51 @@ from app.models import (
 
 class ItemSetupError(Exception):
     pass
+
+
+def identity_taken(
+    db: Session,
+    project_id: uuid.UUID,
+    code: str,
+    area_id: uuid.UUID | None,
+    phase_id: uuid.UUID | None,
+    exclude_id: uuid.UUID | None = None,
+) -> bool:
+    """Is there already an item with this project, code, area and phase?
+
+    Those four together are what an item *is*: the same code may be several
+    batches in one project, one per area and phase. "No area" and "no phase"
+    are values like any other, which is why this is a query and not a unique
+    index -- an index would let two items with the same code and no area sit
+    side by side, because it never considers two NULLs equal. Archived items
+    count: bringing one back must not collide with its replacement.
+    """
+    query = sa.select(Item.id).where(
+        Item.project_id == project_id,
+        Item.code == code,
+        Item.area_id == area_id if area_id is not None else Item.area_id.is_(None),
+        Item.phase_id == phase_id if phase_id is not None else Item.phase_id.is_(None),
+    )
+    if exclude_id is not None:
+        query = query.where(Item.id != exclude_id)
+    return db.scalars(query.limit(1)).first() is not None
+
+
+def lock_project(db: Session, project_id: uuid.UUID) -> Project | None:
+    """The project row, locked until the request commits.
+
+    Anything that creates or re-labels an item takes this first, so two
+    requests cannot both check `identity_taken`, both find the way clear and
+    both insert. (SQLite has no row locks and ignores it; it serialises
+    writers on its own.)
+    """
+    return db.get(Project, project_id, with_for_update=True)
+
+
+def identity_label(code: str, area: Area | None, phase: Phase | None) -> str:
+    """How an item is named to a person: "LF-01 (Guest rooms, Phase 2)"."""
+    parts = [part.name for part in (area, phase) if part is not None]
+    return f"{code} ({', '.join(parts)})" if parts else code
 
 
 def archive_item(db: Session, item: Item, user: User) -> None:

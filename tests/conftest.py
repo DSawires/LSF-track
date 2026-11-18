@@ -14,11 +14,13 @@ os.environ["LSF_SECRET_KEY"] = "test-secret-key-long-enough-to-pass-the-length-c
 from app import db as app_db  # noqa: E402
 from app.db import Base, utcnow  # noqa: E402
 from app.models import (  # noqa: E402
+    Area,
     Event,
     EventState,
     EventType,
     Item,
     ItemStep,
+    Phase,
     Project,
     Stage,
     Station,
@@ -158,14 +160,27 @@ class Factory:
         self.db.flush()
         return stage
 
+    def label(self, model, name: str):
+        """An area or a phase by name, added the way the office would."""
+        row = self.db.scalars(sa.select(model).where(model.name == name)).first()
+        if row is None:
+            row = model(name=name)
+            self.db.add(row)
+            self.db.flush()
+        return row
+
     def item(
         self,
         code: str,
         qty: int,
         stage_codes: list[str] | None = None,
         sample_qty: int = 0,
+        area: str | None = None,
+        phase: str | None = None,
     ) -> Item:
         """An item, live on the floor -- creation is the handoff.
+
+        `area` and `phase` are names; the rows are made on first use.
 
         Items have no stages of their own; log against one with `move()`.
         `stage_codes` builds a *sequence-era* item instead: the ordered steps an
@@ -177,6 +192,8 @@ class Factory:
         item = Item(
             code=code,
             project_id=self.project.id,
+            area_id=self.label(Area, area).id if area else None,
+            phase_id=self.label(Phase, phase).id if phase else None,
             description=f"{code} test batch",
             total_qty=qty,
             sample_qty=sample_qty,

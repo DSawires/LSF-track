@@ -510,8 +510,14 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* The upload bar moves, unlike the report bars it borrows its look from. */
 #photo-bar { transition: width 0.15s linear; }
 
-.filters { display: flex; gap: 8px; margin-bottom: 12px; }
-.filters select { flex: 1; padding: 10px; }
+/* Up to five of them on a phone: they wrap three to a row instead of
+   squeezing into one. */
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.filters select { flex: 1 1 30%; min-width: 0; padding: 10px; }
+
+/* Area and phase, beside an item's code. Part of what the item is, so it reads
+   as a label and not as a status. */
+.badge.tag { border: 1px solid var(--line); background: transparent; color: var(--muted); }
 
 .login-wrap { max-width: 340px; margin: 12vh auto 0; }
 .login-wrap h1 { text-align: center; margin-bottom: 18px; font-size: 22px; }

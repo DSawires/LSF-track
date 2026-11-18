@@ -25,7 +25,18 @@ from app.ledger import (
     clock_anomalies,
     effective_events,
 )
-from app.models import Event, EventState, EventType, Item, ItemStep, ReasonCode, Stage, Station
+from app.models import (
+    Area,
+    Event,
+    EventState,
+    EventType,
+    Item,
+    ItemStep,
+    Phase,
+    ReasonCode,
+    Stage,
+    Station,
+)
 
 
 def load_vocabulary(db: Session) -> Vocabulary:
@@ -123,4 +134,6 @@ def reference_maps(db: Session) -> dict[str, dict[uuid.UUID, object]]:
         "states": {row.id: row for row in db.scalars(sa.select(EventState))},
         "event_types": {row.id: row for row in db.scalars(sa.select(EventType))},
         "reason_codes": {row.id: row for row in db.scalars(sa.select(ReasonCode))},
+        "areas": {row.id: row for row in db.scalars(sa.select(Area))},
+        "phases": {row.id: row for row in db.scalars(sa.select(Phase))},
     }

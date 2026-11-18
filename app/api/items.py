@@ -10,10 +10,12 @@ from sqlalchemy.orm import Session
 from app.db import get_db, utcnow
 from app.deps import current_user, require_admin
 from app.models import (
+    Area,
     Event,
     Item,
     ItemImage,
     ItemStep,
+    Phase,
     Project,
     User,
 )
@@ -23,6 +25,9 @@ from app.services.items import (
     ItemSetupError,
     archive_item,
     bump_revision,
+    identity_label,
+    identity_taken,
+    lock_project,
     place_initial_quantities,
 )
 from app.services.sync import items_token
@@ -55,6 +60,9 @@ def _item_payload(item: Item, icon_url: str | None = None) -> dict:
         "is_active": item.is_active,
         "code": item.code,
         "project_id": str(item.project_id),
+        # With project and code, what makes this batch itself.
+        "area_id": str(item.area_id) if item.area_id else None,
+        "phase_id": str(item.phase_id) if item.phase_id else None,
         "description": item.description,
         "total_qty": item.total_qty,
         "sample_qty": item.sample_qty,
@@ -68,6 +76,8 @@ def list_items(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
     project_id: uuid.UUID | None = None,
+    area_id: uuid.UUID | None = None,
+    phase_id: uuid.UUID | None = None,
     stage_id: uuid.UUID | None = None,
     q: str | None = None,
     include_archived: bool = False,
@@ -77,11 +87,17 @@ def list_items(
     # next sync simply fetches again. The other order would let it keep stale
     # data under a token that says it is current.
     token = items_token(db)
-    query = sa.select(Item).order_by(Item.code)
+    # The same code can be several items, so the order has to be total: by
+    # code, then by when each was created.
+    query = sa.select(Item).order_by(Item.code, Item.created_at, Item.id)
     if not include_archived:
         query = query.where(Item.is_active.is_(True))
     if project_id is not None:
         query = query.where(Item.project_id == project_id)
+    if area_id is not None:
+        query = query.where(Item.area_id == area_id)
+    if phase_id is not None:
+        query = query.where(Item.phase_id == phase_id)
     if q:
         # Escape LIKE wildcards so a literal % or _ in the search box matches
         # itself instead of exploding into a scan.
@@ -194,6 +210,31 @@ def item_events(
     return {"events": [resolved(e) for e in rows], "total": total}
 
 
+def _area_and_phase(
+    db: Session,
+    area_id: uuid.UUID | None,
+    phase_id: uuid.UUID | None,
+    keep_area: uuid.UUID | None = None,
+    keep_phase: uuid.UUID | None = None,
+) -> tuple[Area | None, Phase | None]:
+    """The rows behind an item's area and phase, or a 4xx saying which is wrong.
+
+    A retired one cannot be newly chosen -- it is off every picker -- but an
+    item already in it (`keep_*`) may stay there through an unrelated edit.
+    """
+    area = db.get(Area, area_id) if area_id is not None else None
+    if area_id is not None and area is None:
+        raise HTTPException(422, "unknown area")
+    if area is not None and not area.is_active and area.id != keep_area:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"area '{area.name}' is retired")
+    phase = db.get(Phase, phase_id) if phase_id is not None else None
+    if phase_id is not None and phase is None:
+        raise HTTPException(422, "unknown phase")
+    if phase is not None and not phase.is_active and phase.id != keep_phase:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"phase '{phase.name}' is retired")
+    return area, phase
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_item(
     payload: ItemCreate,
@@ -212,7 +253,7 @@ def create_item(
     (app/api/imports.py); this is the same thing for one item, and what the
     Office tab's "New item" form posts.
     """
-    project = db.get(Project, payload.project_id)
+    project = lock_project(db, payload.project_id)
     if project is None:
         raise HTTPException(422, "unknown project")
     if not project.is_active:
@@ -222,13 +263,18 @@ def create_item(
             f"project {project.code} is archived; reactivate it first",
         )
     code = payload.code.strip()
-    existing = db.scalars(sa.select(Item).where(Item.code == code)).first()
-    if existing is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"item {code} already exists")
+    area, phase = _area_and_phase(db, payload.area_id, payload.phase_id)
+    if identity_taken(db, project.id, code, payload.area_id, payload.phase_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{identity_label(code, area, phase)} already exists in {project.code}",
+        )
 
     item = Item(
         code=code,
         project_id=payload.project_id,
+        area_id=payload.area_id,
+        phase_id=payload.phase_id,
         description=payload.description.strip(),
         total_qty=payload.total_qty,
         sample_qty=payload.sample_qty,
@@ -279,11 +325,6 @@ def update_item(
         code = (fields["code"] or "").strip()
         if not code:
             raise HTTPException(422, "item code is required")
-        clash = db.scalars(
-            sa.select(Item).where(Item.code == code, Item.id != item_id)
-        ).first()
-        if clash is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, f"item {code} already exists")
         fields["code"] = code
 
     if "project_id" in fields:
@@ -300,6 +341,28 @@ def update_item(
 
     if "description" in fields:
         fields["description"] = (fields["description"] or "").strip()
+
+    # Project, code, area and phase are what the item is. Changing any of them
+    # must not land it on top of another batch.
+    if {"code", "project_id", "area_id", "phase_id"} & fields.keys():
+        target_project = fields.get("project_id") or item.project_id
+        target_code = fields.get("code", item.code)
+        target_area = fields["area_id"] if "area_id" in fields else item.area_id
+        target_phase = fields["phase_id"] if "phase_id" in fields else item.phase_id
+        lock_project(db, target_project)
+        area, phase = _area_and_phase(
+            db,
+            target_area,
+            target_phase,
+            # Staying in a retired area or phase is not choosing one.
+            keep_area=item.area_id,
+            keep_phase=item.phase_id,
+        )
+        if identity_taken(db, target_project, target_code, target_area, target_phase, item.id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{identity_label(target_code, area, phase)} already exists in that project",
+            )
 
     if "is_active" in fields:
         # Only the way back is a field edit. Archiving goes through DELETE,

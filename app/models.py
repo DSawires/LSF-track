@@ -157,8 +157,44 @@ class ReasonCode(Base):
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
 
+class Area(Base):
+    """Where in the client's job a piece belongs: guest rooms, the spa, the
+    all-day dining room. A list the office edits at runtime, like stages, and
+    shared by every project -- nothing in the application branches on a name.
+    """
+
+    __tablename__ = "areas"
+
+    id: Mapped[uuid.UUID] = _pk()
+    name: Mapped[str] = mapped_column(sa.String(120), unique=True, index=True)
+    sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+
+class Phase(Base):
+    """A phase of a job: which delivery a batch is being built for. The same
+    kind of list as `areas`, edited in the same place.
+    """
+
+    __tablename__ = "phases"
+
+    id: Mapped[uuid.UUID] = _pk()
+    name: Mapped[str] = mapped_column(sa.String(120), unique=True, index=True)
+    sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+
+
 class Item(Base):
     """A batch of identical pieces.
+
+    What makes it *this* batch is four things together: project, code, area and
+    phase. The same code can be several items in one project -- the king bed
+    base for the phase 1 rooms and for the phase 2 rooms are separate batches,
+    each with its own quantity, its own sample and its own history. Area and
+    phase are optional; an item with neither is simply "the" item of that code
+    in its project. Uniqueness is enforced in app/services/items.py rather
+    than by a constraint, because a NULL area or phase is part of the identity
+    and a unique index treats NULLs as never equal.
 
     Deliberately carries no derived production state: no current_stage, no
     current_status, no is_complete. Those come from the event log.
@@ -182,8 +218,14 @@ class Item(Base):
     __tablename__ = "items"
 
     id: Mapped[uuid.UUID] = _pk()
-    code: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True)
+    code: Mapped[str] = mapped_column(sa.String(64), index=True)
     project_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("projects.id"), index=True)
+    area_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("areas.id"), nullable=True, index=True
+    )
+    phase_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("phases.id"), nullable=True, index=True
+    )
     description: Mapped[str] = mapped_column(sa.String(255))
     # Archived items keep their history but disappear from lists and reports,
     # and can be reactivated. Deleting one for good (an admin purge) takes its

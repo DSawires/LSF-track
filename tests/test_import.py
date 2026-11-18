@@ -71,7 +71,7 @@ def test_every_problem_is_reported_by_row_and_nothing_is_written(client, factory
         "JOB-1,,,BAD-1,,ten,,,Carpentry\n"                       # row 3: qty
         "JOB-1,,,OK-2,,5,,,Carpentry > Gilding\n"                # row 4: fine -- stages are not read
         "JOB-1,,,OK-1,,5,,,Carpentry\n"                          # row 5: duplicate in file
-        "JOB-1,,,TAKEN-1,,5,,,Carpentry\n"                       # row 6: exists already
+        "PRJ,,,TAKEN-1,,5,,,Carpentry\n"                         # row 6: exists already in PRJ
         "JOB-1,,,BAD-3,,5,many,,\n"                              # row 7: sample qty
     )
     preview = _post(client, text).json()
@@ -147,7 +147,9 @@ def test_template_is_a_header_and_an_example_that_imports(client, factory):
     response = client.get("/api/import/template")
     assert response.status_code == 200
     header = response.text.splitlines()[0]
-    assert header == "project,project name,client,item,description,qty,sample qty,revision,picture"
+    assert header == (
+        "project,project name,client,item,description,qty,sample qty,revision,area,phase,picture"
+    )
     # The template parses cleanly as an import, with nothing skipped.
     body = _post(client, response.text).json()
     assert body["errors"] == [] and body["notes"] == []
@@ -356,7 +358,9 @@ def test_a_failed_import_leaves_no_picture_files_behind(factory, tmp_path, monke
             revision="A", picture=Picture(data=PNG, content_type="image/png"),
         ))
 
-    with pytest.raises(sa.exc.IntegrityError):
+    from app.services.items import ItemSetupError
+
+    with pytest.raises(ItemSetupError):
         commit_import(factory.db, plan, factory.user)
     factory.db.rollback()
     assert storage.list("images/") == []

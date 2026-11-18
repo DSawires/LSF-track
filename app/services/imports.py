@@ -3,10 +3,15 @@
 The format is deliberately what an engineer already has open -- a sheet with a
 header row -- saved as .xlsx or .csv:
 
-    project | project name | client | item | description | qty | sample qty | revision
-    HOTEL-B | Grand Hotel  | Acme   | BST-1| Bedside     | 120 | 1          | A
+    project | project name | client | item | description | qty | sample qty | revision | area | phase
+    HOTEL-B | Grand Hotel  | Acme   | BST-1| Bedside     | 120 | 1          | A        | Guest rooms | Phase 1
 
 - `project`, `item`, `qty` are required; the rest are optional.
+- `area` and `phase` say which part of the job, and which phase of it, the
+  batch is for. Matched by name against the lists the office keeps; a name
+  that is not on a list yet is added to it when the file is committed, and
+  the preview says so first. The same item code may appear on several rows as
+  long as each has a different area or phase: those are separate batches.
 - `project name` and `client` are only read when the project is new. An
   existing project is added to, never renamed by a file.
 - `qty` is the production batch. `sample qty` (default 1, 0 for none) is built
@@ -45,9 +50,9 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.db import utcnow
-from app.models import Item, ItemImage, Project, User
+from app.models import Area, Item, ItemImage, Phase, Project, User
 from app.services.images import image_key, sniff
-from app.services.items import ItemSetupError
+from app.services.items import ItemSetupError, identity_taken, lock_project
 from app.storage import get_storage
 
 log = logging.getLogger(__name__)
@@ -65,6 +70,7 @@ MAX_SCANNED_ROWS = 50_000
 # rather than a DataError at commit.
 _PROJECT_CODE_MAX = 32
 _ITEM_CODE_MAX = 64
+_LABEL_MAX = 120
 
 COLUMNS: dict[str, set[str]] = {
     "project": {"project", "project code", "job", "job code"},
@@ -75,6 +81,8 @@ COLUMNS: dict[str, set[str]] = {
     "qty": {"qty", "quantity", "total qty", "batch qty", "production qty"},
     "sample_qty": {"sample", "sample qty", "samples", "sample quantity"},
     "revision": {"revision", "rev", "drawing revision", "drawing rev"},
+    "area": {"area", "zone", "location"},
+    "phase": {"phase", "project phase", "delivery phase"},
 }
 REQUIRED = ("project", "item", "qty")
 
@@ -104,6 +112,10 @@ class PlannedItem:
     qty: int
     sample_qty: int
     revision: str
+    # As they will be stored: the name on the list (existing spelling wins over
+    # the file's), or the file's own spelling for one that is new. "" = none.
+    area: str = ""
+    phase: str = ""
     # The picture on this item's row, if the file carried one.
     picture: Picture | None = None
 
@@ -124,6 +136,9 @@ class ImportPlan:
     errors: list[dict] = field(default_factory=list)
     # Things worth knowing that do not stop the import.
     notes: list[str] = field(default_factory=list)
+    # Names the file uses that are not on the lists yet, in file order.
+    new_areas: list[str] = field(default_factory=list)
+    new_phases: list[str] = field(default_factory=list)
 
     def error(self, row: int | None, message: str) -> None:
         self.errors.append({"row": row, "message": message})
@@ -149,12 +164,16 @@ class ImportPlan:
                     "qty": i.qty,
                     "sample_qty": i.sample_qty,
                     "revision": i.revision,
+                    "area": i.area or None,
+                    "phase": i.phase or None,
                     "has_picture": i.picture is not None,
                 }
                 for i in self.items
             ],
             "errors": self.errors,
             "notes": self.notes,
+            "new_areas": self.new_areas,
+            "new_phases": self.new_phases,
         }
 
 
@@ -428,16 +447,39 @@ def plan_import(
         return plan
 
     existing_projects = {p.code: p for p in db.scalars(sa.select(Project))}
+    areas = {a.name.casefold(): a for a in db.scalars(sa.select(Area))}
+    phases = {ph.name.casefold(): ph for ph in db.scalars(sa.select(Phase))}
+    new_areas: dict[str, str] = {}   # casefolded -> the first spelling in the file
+    new_phases: dict[str, str] = {}
+
+    def label(text: str, existing: dict, fresh: dict, noun: str, problems: list[str]) -> str:
+        """The name this row's area or phase will be stored under."""
+        if not text:
+            return ""
+        if len(text) > _LABEL_MAX:
+            problems.append(f"{noun} longer than {_LABEL_MAX} characters")
+            return ""
+        key = text.casefold()
+        row = existing.get(key)
+        if row is not None:
+            if not row.is_active:
+                problems.append(f"{noun} '{row.name}' is retired; reactivate it first")
+            return row.name
+        return fresh.setdefault(key, text)
 
     def get(values: list, key: str) -> str:
         index = columns.get(key)
         return _cell(values[index]) if index is not None and index < len(values) else ""
 
-    seen_items: dict[str, int] = {}
+    # An item is project + code + area + phase, so that is what may not repeat.
+    seen_items: dict[tuple[str, str, str, str], int] = {}
     for row, values in data:
         project_code = get(values, "project").upper()
         code = get(values, "item")
         problems: list[str] = []
+        area = label(get(values, "area"), areas, new_areas, "area", problems)
+        phase = label(get(values, "phase"), phases, new_phases, "phase", problems)
+        identity = (project_code, code, area.casefold(), phase.casefold())
 
         if not project_code:
             problems.append("no project code")
@@ -447,10 +489,14 @@ def plan_import(
             problems.append("no item code")
         elif len(code) > _ITEM_CODE_MAX:
             problems.append(f"item code longer than {_ITEM_CODE_MAX} characters")
-        elif code in seen_items:
-            problems.append(f"item {code} is also on row {seen_items[code]}")
+        elif identity in seen_items:
+            where = ", ".join(part for part in (area, phase) if part)
+            problems.append(
+                f"item {code}{f' ({where})' if where else ''} is also on row {seen_items[identity]}"
+                + ("" if where else "; give the rows different areas or phases if they are separate batches")
+            )
         else:
-            seen_items[code] = row
+            seen_items[identity] = row
 
         qty_cell = values[columns["qty"]] if columns["qty"] < len(values) else None
         qty = _whole_number(qty_cell)
@@ -501,14 +547,48 @@ def plan_import(
                 qty=qty,
                 sample_qty=sample_qty,
                 revision=revision,
+                area=area,
+                phase=phase,
                 picture=pictures.get(row),
             )
         )
 
-    if seen_items:
-        clashes = db.scalars(sa.select(Item.code).where(Item.code.in_(list(seen_items))))
-        for code in clashes:
-            plan.error(seen_items[code], f"item {code} already exists")
+    # Against what is already there. Only an existing project can hold a clash,
+    # and only on an area and phase that both exist already.
+    for planned in plan.items:
+        project = existing_projects.get(planned.project_code)
+        if project is None:
+            continue
+        area_row = areas.get(planned.area.casefold()) if planned.area else None
+        phase_row = phases.get(planned.phase.casefold()) if planned.phase else None
+        if (planned.area and area_row is None) or (planned.phase and phase_row is None):
+            continue
+        if identity_taken(
+            db,
+            project.id,
+            planned.code,
+            area_row.id if area_row else None,
+            phase_row.id if phase_row else None,
+        ):
+            where = ", ".join(part for part in (planned.area, planned.phase) if part)
+            plan.error(
+                planned.row,
+                f"item {planned.code}{f' ({where})' if where else ''} already exists in "
+                f"{planned.project_code}",
+            )
+
+    # Only names used by rows that are actually going in.
+    used_areas = {i.area.casefold() for i in plan.items}
+    used_phases = {i.phase.casefold() for i in plan.items}
+    plan.new_areas = [name for key, name in new_areas.items() if key in used_areas]
+    plan.new_phases = [name for key, name in new_phases.items() if key in used_phases]
+    for noun, names in (("area", plan.new_areas), ("phase", plan.new_phases)):
+        if names:
+            plan.notes.append(
+                f"New {noun}{'' if len(names) == 1 else 's'}, added to the list on import: "
+                + ", ".join(names)
+                + "."
+            )
 
     plan.errors.sort(key=lambda e: (e["row"] is not None, e["row"] or 0))
     return plan
@@ -535,14 +615,44 @@ def commit_import(db: Session, plan: ImportPlan, user: User) -> None:
             db.flush()
         project_ids[planned.code] = project.id
 
+    # One writer at a time per project, then look again: the plan was checked
+    # a moment ago, and another import may have landed in that moment.
+    for project_id in sorted(project_ids.values(), key=str):
+        lock_project(db, project_id)
+
+    def labels(model, wanted: list[str]) -> dict[str, uuid.UUID]:
+        """{casefolded name: id}, creating the rows the file introduces."""
+        rows = {row.name.casefold(): row for row in db.scalars(sa.select(model))}
+        last = max((row.sort_order for row in rows.values()), default=0)
+        for name in wanted:
+            if name.casefold() not in rows:
+                last += 10
+                row = model(name=name, sort_order=last)
+                db.add(row)
+                rows[name.casefold()] = row
+        db.flush()
+        return {key: row.id for key, row in rows.items()}
+
+    area_ids = labels(Area, plan.new_areas)
+    phase_ids = labels(Phase, plan.new_phases)
+
     storage = get_storage()
     stored: list[str] = []
     try:
         for planned in plan.items:
+            area_id = area_ids.get(planned.area.casefold()) if planned.area else None
+            phase_id = phase_ids.get(planned.phase.casefold()) if planned.phase else None
+            if identity_taken(db, project_ids[planned.project_code], planned.code, area_id, phase_id):
+                raise ItemSetupError(
+                    f"item {planned.code} on row {planned.row} was created by someone else "
+                    "while this file was being imported; nothing was imported"
+                )
             item = Item(
                 id=uuid.uuid4(),
                 code=planned.code,
                 project_id=project_ids[planned.project_code],
+                area_id=area_id,
+                phase_id=phase_id,
                 description=planned.description,
                 total_qty=planned.qty,
                 sample_qty=planned.sample_qty,
@@ -585,9 +695,10 @@ def template_csv() -> str:
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(
-        ["project", "project name", "client", "item", "description", "qty", "sample qty", "revision", "picture"]
+        ["project", "project name", "client", "item", "description", "qty", "sample qty", "revision",
+         "area", "phase", "picture"]
     )
     # The last column is only a place to put a picture once the file is saved
     # as .xlsx; a CSV cannot carry one, and whatever is typed there is ignored.
-    writer.writerow(["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", 100, 1, "A", ""])
+    writer.writerow(["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", 100, 1, "A", "", "", ""])
     return out.getvalue()

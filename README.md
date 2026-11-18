@@ -198,11 +198,16 @@ UI survive restarts.
 **Office → Import.** A project and all its items arrive as one spreadsheet
 (.xlsx or .csv), one row per item, header row first:
 
-| project | project name | client | item | description | qty | sample qty | revision |
-|---|---|---|---|---|---|---|---|
-| HOTEL-B | Grand Hotel | Acme | BST-1 | Bedside table | 120 | 1 | A |
+| project | project name | client | item | description | qty | sample qty | revision | area | phase |
+|---|---|---|---|---|---|---|---|---|---|
+| HOTEL-B | Grand Hotel | Acme | BST-1 | Bedside table | 120 | 1 | A | Guest rooms | Phase 1 |
+| HOTEL-B | | | BST-1 | Bedside table | 60 | 1 | A | Guest rooms | Phase 2 |
 
-`project`, `item` and `qty` are required. A new project code creates the
+`project`, `item` and `qty` are required. `area` and `phase` are optional:
+which part of the job, and which phase of it, the batch is for. The same item
+code may appear on several rows as long as each has a different area or phase
+— those are separate batches. A name that is not on the list yet is added to
+it on import, and the preview says so first. A new project code creates the
 project; an existing one is added to (never renamed by the file). There is no
 `stages` column: an item is not given a route. A file written for the older
 format still imports — the column is skipped, and the preview says so.
@@ -228,6 +233,24 @@ finishing entry takes the batch back off the floor.
 
 Creating an item *is* the handoff to the floor: there is no separate release
 step and nothing to set up. It can be logged at any stage straight away.
+
+## Areas and phases
+
+An item is **project + code + area + phase**. The king bed base for the phase 1
+rooms and for the phase 2 rooms are two items with the same code, each with its
+own quantity, sample and history, so production can be followed per area and
+per phase.
+
+- **Office → Areas & phases** (admin) keeps the two lists: add, rename,
+  reorder, retire. They are shared by every project. Renaming one re-labels
+  every item filed under it; retiring one takes it off the pickers and leaves
+  its items where they are.
+- An item gets its area and phase from the import file, the New item form, or
+  its editor. Both are optional.
+- The **Items** list filters by area, phase and progress (haven't started / in
+  progress / finished); **Reports** narrow WIP and aging to an area and a
+  phase. Wherever an item is shown, its area and phase are shown with its
+  code.
 
 ## Logging
 

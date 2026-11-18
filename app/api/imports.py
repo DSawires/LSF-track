@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.deps import current_user
 from app.models import User
+from app.services.items import ItemSetupError
 from app.services.imports import (
     MAX_BYTES,
     ImportFileError,
@@ -59,5 +60,10 @@ def import_file(
         raise HTTPException(
             422, {"reason": f"{len(plan.errors)} problem(s) in the file; nothing was imported", **body}
         )
-    commit_import(db, plan, user)
+    try:
+        commit_import(db, plan, user)
+    except ItemSetupError as exc:
+        # Something changed between the check and the write. Nothing was
+        # imported; the office previews again and sees what.
+        raise HTTPException(409, {"reason": str(exc), **body})
     return {**body, "committed": True}

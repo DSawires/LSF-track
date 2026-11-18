@@ -17,7 +17,9 @@ from sqlalchemy.orm import Session
 from app.db import get_db, utcnow
 from app.deps import current_user
 from app.models import (
+    Area,
     EventType,
+    Phase,
     Project,
     ReasonCode,
     Stage,
@@ -91,6 +93,16 @@ def reference(db: Session = Depends(get_db), user: User = Depends(current_user))
         "reason_codes": [
             {"id": str(r.id), "code": r.code, "name": r.name, "is_active": r.is_active}
             for r in reason_codes
+        ],
+        # The two lists an item is filed under. Inactive rows travel too: an
+        # item already in a retired area still has to be labelled.
+        "areas": [
+            {"id": str(a.id), "name": a.name, "sort_order": a.sort_order, "is_active": a.is_active}
+            for a in db.scalars(sa.select(Area).order_by(Area.sort_order, Area.name))
+        ],
+        "phases": [
+            {"id": str(p.id), "name": p.name, "sort_order": p.sort_order, "is_active": p.is_active}
+            for p in db.scalars(sa.select(Phase).order_by(Phase.sort_order, Phase.name))
         ],
         "projects": [
             {

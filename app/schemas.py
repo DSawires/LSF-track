@@ -72,6 +72,11 @@ class ItemCreate(BaseModel):
     # Units built first, before the batch is released. 0 = no sample.
     sample_qty: int = Field(default=1, ge=0, le=1_000)
     drawing_revision: str = Field(default="A", min_length=1, max_length=32)
+    # Which part of the job, and which phase of it, this batch is for. Both
+    # optional. With project and code they are what the item is: the same code
+    # can be created again for another area or phase.
+    area_id: uuid.UUID | None = None
+    phase_id: uuid.UUID | None = None
     # Where the quantities already are, keyed by stage id -- for entering an
     # item that is mid-production when it reaches the system. Anything not
     # distributed starts as "not started". 200 stages bounds the request.
@@ -86,7 +91,23 @@ class ItemUpdate(BaseModel):
     project_id: uuid.UUID | None = None
     description: str | None = Field(default=None, max_length=255)
     total_qty: int | None = Field(default=None, gt=0, le=1_000_000)
+    # Sent as null to clear; left out to leave alone.
+    area_id: uuid.UUID | None = None
+    phase_id: uuid.UUID | None = None
     # `true` brings an archived item back. Archiving is DELETE, not this.
+    is_active: bool | None = None
+
+
+class LabelCreate(BaseModel):
+    """A new area or phase: one more entry in a list the office owns."""
+
+    name: str = Field(min_length=1, max_length=120)
+    sort_order: int = 0
+
+
+class LabelUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    sort_order: int | None = None
     is_active: bool | None = None
 
 

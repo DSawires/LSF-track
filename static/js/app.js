@@ -351,6 +351,59 @@ function placeName(key) {
   return stageById(key)?.name || "?";
 }
 
+/* An item is project + code + area + phase: the same code can be several
+   batches in one project, one per area and phase, each with its own quantity
+   and history. So a code is never shown alone -- wherever an item is named, its
+   area and phase are named with it. Both are optional, and both are lists the
+   office edits; nothing here knows what any of them is called. */
+const NONE = "none"; // filter value for "filed under no area / no phase"
+
+function labelRow(list, id) { return (S.ref?.[list] || []).find((row) => row.id === id) || null; }
+const areaName = (item) => labelRow("areas", item?.area_id)?.name || "";
+const phaseName = (item) => labelRow("phases", item?.phase_id)?.name || "";
+
+/* "LF-01 (Guest rooms, Phase 2)" -- for sentences, prompts and plain text. */
+function itemName(item) {
+  const tags = [areaName(item), phaseName(item)].filter(Boolean);
+  return tags.length ? `${item.code} (${tags.join(", ")})` : item.code;
+}
+
+/* The same, as badges beside a code. */
+function itemTags(item) {
+  return [areaName(item), phaseName(item)].filter(Boolean)
+    .map((name) => `<span class="badge tag">${esc(name)}</span>`).join(" ");
+}
+
+/* What an Area or Phase filter offers: every row still on the list, plus any
+   retired one that items on screen are still filed under -- and "none", when
+   some items are filed under nothing, so those can be found too. */
+function labelOptions(list, field, items, noneLabel) {
+  const used = new Set(items.map((item) => item[field]).filter(Boolean));
+  const rows = (S.ref?.[list] || []).filter((row) => row.is_active || used.has(row.id));
+  const options = rows.map((row) => ({ id: row.id, name: row.name }));
+  if (rows.length && items.some((item) => !item[field])) options.push({ id: NONE, name: noneLabel });
+  return options;
+}
+const matchesLabel = (item, field, filter) =>
+  !filter || (filter === NONE ? !item[field] : item[field] === filter);
+
+/* Has anyone touched it yet? Read off where the units are, queued moves
+   included -- a fact about the log, never something typed in.
+     unstarted: every unit is still "not started"
+     finished:  every unit is Done
+     progress:  anything in between */
+function progressOf(item) {
+  const { places, done } = localPlaces(item);
+  const started = done > 0 || places.some((p) => p.key !== UNSTARTED);
+  if (!started) return "unstarted";
+  return places.length ? "progress" : "finished";
+}
+const PROGRESS = [
+  ["unstarted", "Haven't started"],
+  ["progress", "In progress"],
+  ["finished", "Finished"],
+];
+
 /* A remembered filter, dropped if what it points at is no longer on offer.
 
    Filters live in sessionStorage, so one set before a project was archived
@@ -694,7 +747,7 @@ function viewSyncStatus() {
       from && to ? `${placeName(from)} → ${placeName(to)}` : to ? placeName(to) : "",
       q.qty ? `${q.qty} pcs` : "",
     ].filter(Boolean).join(" · ");
-    return { code: item?.code || "unknown item", what, when: new Date(q._queued_at || Date.now()).toLocaleString() };
+    return { code: item ? itemName(item) : "unknown item", what, when: new Date(q._queued_at || Date.now()).toLocaleString() };
   };
 
   const entryRow = (q, actions) => {
@@ -788,12 +841,21 @@ function viewItems() {
   // every other item.
   const filterProject = validFilter("f-project", projects);
   const filterStage = sessionStorage.getItem("f-stage") || "";
+  const inProject = S.items.filter((item) => !filterProject || item.project_id === filterProject);
+  const areas = labelOptions("areas", "area_id", inProject, "No area");
+  const phases = labelOptions("phases", "phase_id", inProject, "No phase");
+  const filterArea = validFilter("f-area", areas);
+  const filterPhase = validFilter("f-phase", phases);
+  const filterProgress = validFilter("f-progress", PROGRESS.map(([id]) => ({ id })));
 
   const matches = (item, text) => {
     if (filterProject && item.project_id !== filterProject) return false;
+    if (!matchesLabel(item, "area_id", filterArea)) return false;
+    if (!matchesLabel(item, "phase_id", filterPhase)) return false;
+    if (filterProgress && progressOf(item) !== filterProgress) return false;
     // "At paint" means some of it rests at paint right now, queued moves included.
     if (filterStage && !localPlaces(item).places.some((p) => p.key === filterStage)) return false;
-    return !text || `${item.code} ${item.description}`.toLowerCase().includes(text);
+    return !text || `${itemName(item)} ${item.description}`.toLowerCase().includes(text);
   };
   const list = (text) =>
     S.items.filter((item) => matches(item, text)).map(itemRow).join("")
@@ -811,6 +873,20 @@ function viewItems() {
         <option value="">All stages</option>
         ${stages.map((s) => `<option value="${s.id}" ${s.id === filterStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
       </select>
+      ${areas.length ? `
+      <select id="f-area" aria-label="Area">
+        <option value="">All areas</option>
+        ${areas.map((a) => `<option value="${a.id}" ${a.id === filterArea ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+      </select>` : ""}
+      ${phases.length ? `
+      <select id="f-phase" aria-label="Phase">
+        <option value="">All phases</option>
+        ${phases.map((ph) => `<option value="${ph.id}" ${ph.id === filterPhase ? "selected" : ""}>${esc(ph.name)}</option>`).join("")}
+      </select>` : ""}
+      <select id="f-progress" aria-label="Progress">
+        <option value="">Any progress</option>
+        ${PROGRESS.map(([id, name]) => `<option value="${id}" ${id === filterProgress ? "selected" : ""}>${name}</option>`).join("")}
+      </select>
     </div>
     <div class="row-list">
       ${list((sessionStorage.getItem("f-q") || "").toLowerCase())}
@@ -822,6 +898,10 @@ function viewItems() {
   document.getElementById("f-stage").onchange = (e) => {
     sessionStorage.setItem("f-stage", e.target.value); render();
   };
+  for (const id of ["f-area", "f-phase", "f-progress"]) {
+    const select = document.getElementById(id);
+    if (select) select.onchange = (e) => { sessionStorage.setItem(id, e.target.value); render(); };
+  }
   // Filter the list live but don't re-render around the keyboard; the input
   // keeps focus and the rows below it re-draw.
   document.getElementById("f-q").oninput = (e) => {
@@ -861,6 +941,7 @@ function itemRow(item) {
               <strong>${esc(item.code)}</strong>
               <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
             </div>
+            ${itemTags(item) ? `<div style="margin-top:3px">${itemTags(item)}</div>` : ""}
             <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
             ${inSample ? `<div style="margin-bottom:6px"><span class="badge sample">Sample</span>
               <span class="muted">batch of ${item.total_qty} follows once the sample is done</span></div>` : ""}
@@ -979,6 +1060,7 @@ function viewLogScreen(itemId, fromKey) {
             <h2>${esc(item.code)}</h2>
             <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
           </div>
+          ${itemTags(item) ? `<div style="margin:2px 0">${itemTags(item)}</div>` : ""}
           <div class="muted">${esc(item.description)}</div>
         </div>
       </div>
@@ -1431,6 +1513,12 @@ async function viewReports() {
   const fProject = validFilter("r-project", projects);
   const fStage = sessionStorage.getItem("r-stage") || "";
   const fDays = sessionStorage.getItem("r-days") || "";
+  // The reports are computed on the server, which narrows by area and phase
+  // before it replays anything. No "none" here: that is a question for the list.
+  const areas = (S.ref?.areas || []).filter((a) => a.is_active);
+  const phases = (S.ref?.phases || []).filter((ph) => ph.is_active);
+  const fArea = validFilter("r-area", areas);
+  const fPhase = validFilter("r-phase", phases);
 
   $view.innerHTML = `<p class="muted">Loading reports…</p>`;
   let wip, aging, exceptions;
@@ -1442,13 +1530,17 @@ async function viewReports() {
     return response.json();
   };
   try {
-    const wipQuery = fProject ? `?project_id=${fProject}` : "";
+    const wipParams = new URLSearchParams();
     const agingParams = new URLSearchParams({ limit: "40" });
-    if (fProject) agingParams.set("project_id", fProject);
+    for (const params of [wipParams, agingParams]) {
+      if (fProject) params.set("project_id", fProject);
+      if (fArea) params.set("area_id", fArea);
+      if (fPhase) params.set("phase_id", fPhase);
+    }
     if (fStage) agingParams.set("stage_id", fStage);
     if (fDays) agingParams.set("min_days", fDays);
     [wip, aging, exceptions] = await Promise.all([
-      fetchReport(`/api/reports/wip${wipQuery}`),
+      fetchReport(`/api/reports/wip?${wipParams}`),
       fetchReport(`/api/reports/aging?${agingParams}`),
       fetchReport("/api/reports/exceptions"),
     ]);
@@ -1473,6 +1565,16 @@ async function viewReports() {
         <option value="">All stages</option>
         ${stages.map((s) => `<option value="${s.id}" ${s.id === fStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
       </select>
+      ${areas.length ? `
+      <select id="r-area" aria-label="Area">
+        <option value="">All areas</option>
+        ${areas.map((a) => `<option value="${a.id}" ${a.id === fArea ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
+      </select>` : ""}
+      ${phases.length ? `
+      <select id="r-phase" aria-label="Phase">
+        <option value="">All phases</option>
+        ${phases.map((ph) => `<option value="${ph.id}" ${ph.id === fPhase ? "selected" : ""}>${esc(ph.name)}</option>`).join("")}
+      </select>` : ""}
       <select id="r-days">
         <option value="">Any age</option>
         ${[1, 2, 3, 5, 7, 14].map((d) => `<option value="${d}" ${String(d) === fDays ? "selected" : ""}>≥ ${d}d</option>`).join("")}
@@ -1502,7 +1604,8 @@ async function viewReports() {
         <tbody>
           ${aging.rows.map((row) => `
             <tr>
-              <td><a href="#/items/${row.item.id}" style="color:inherit">${esc(row.item.code)}</a></td>
+              <td><a href="#/items/${row.item.id}" style="color:inherit">${esc(row.item.code)}</a>${
+                row.item.area || row.item.phase ? `<br><span class="muted">${esc([row.item.area, row.item.phase].filter(Boolean).join(" · "))}</span>` : ""}</td>
               <td>${esc(row.label)}${row.sample_qty ? ` <span class="badge sample">sample</span>` : ""}${row.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</td>
               <td class="num">${row.qty}</td>
               <td class="num" style="${row.overdue ? "color:var(--warn);font-weight:700" : ""}">${row.days_in_state.toFixed(1)}${row.overdue ? " ⚠" : ""}</td>
@@ -1517,16 +1620,15 @@ async function viewReports() {
       <h2>Needs review (${exceptions.rows.length})</h2>
       ${exceptions.rows.slice(0, 20).map((row) => `
         <div style="padding:6px 0;border-bottom:1px solid var(--line)">
-          <span class="badge">${esc(row.code)}</span> <strong>${esc(row.item_code || "")}</strong>
+          <span class="badge">${esc(row.code)}</span> <strong>${esc(row.item_code || "")}</strong>${
+            row.area || row.phase ? ` <span class="muted">${esc([row.area, row.phase].filter(Boolean).join(" · "))}</span>` : ""}
           <div class="muted">${esc(row.detail)}</div>
         </div>`).join("")}
     </div>` : ""}`;
 
-  for (const [id, key] of [["r-project", "r-project"], ["r-stage", "r-stage"], ["r-days", "r-days"]]) {
-    document.getElementById(id).onchange = (e) => {
-      sessionStorage.setItem(key, e.target.value);
-      render();
-    };
+  for (const id of ["r-project", "r-stage", "r-area", "r-phase", "r-days"]) {
+    const select = document.getElementById(id);
+    if (select) select.onchange = (e) => { sessionStorage.setItem(id, e.target.value); render(); };
   }
 }
 
@@ -1558,6 +1660,7 @@ const OFFICE_SECTIONS = [
   { key: "items", label: "Items" },
   { key: "projects", label: "Projects" },
   { key: "stages", label: "Stages", admin: true },
+  { key: "areas", label: "Areas & phases", admin: true },
   { key: "users", label: "Users", admin: true },
   { key: "status", label: "Status", admin: true },
 ];
@@ -1579,6 +1682,7 @@ function viewOffice(section) {
     items: officeItems,
     projects: officeProjects,
     stages: officeStages,
+    areas: officeAreas,
     users: officeUsers,
     status: officeStatus,
   }[current.key])(body);
@@ -1635,7 +1739,10 @@ function officeImport(body) {
         <tbody>
           <tr><td><strong>project</strong></td><td>Project code. New codes create the project; existing ones are added to.</td></tr>
           <tr><td>project name, client</td><td>Optional. Only used when the project is new.</td></tr>
-          <tr><td><strong>item</strong></td><td>Item code, unique across the factory.</td></tr>
+          <tr><td><strong>item</strong></td><td>Item code. It may repeat on several rows, as long as each
+            has a different area or phase: those are separate batches.</td></tr>
+          <tr><td>area, phase</td><td>Optional. Which part of the job, and which phase of it, the batch is
+            for. A name not on the list yet is added to it.</td></tr>
           <tr><td>description</td><td>Optional.</td></tr>
           <tr><td><strong>qty</strong></td><td>The production batch.</td></tr>
           <tr><td>sample qty</td><td>Optional, default 1. Built first; 0 for no sample.</td></tr>
@@ -1677,7 +1784,7 @@ function officeImport(body) {
         <tbody>
           ${items.map((i) => `
             <tr>
-              <td><strong>${esc(i.code)}</strong><br><span class="muted">${esc(i.description)} · rev ${esc(i.revision)}</span></td>
+              <td><strong>${esc(i.code)}</strong>${[i.area, i.phase].filter(Boolean).map((t) => ` <span class="badge tag">${esc(t)}</span>`).join("")}<br><span class="muted">${esc(i.description)} · rev ${esc(i.revision)}</span></td>
               <td class="num">${i.qty}</td>
               <td class="num">${i.sample_qty}</td>
               <td>${i.has_picture ? "✓" : `<span class="muted">—</span>`}</td>
@@ -1769,6 +1876,12 @@ function officeItems(body) {
         <label for="ni-desc">Description</label>
         <input id="ni-desc" maxlength="255" autocomplete="off">
         <div class="field-grid">
+          <div><label for="ni-area">Area</label>${labelSelect("areas", sessionStorage.getItem("ni-area"), `id="ni-area"`)}</div>
+          <div><label for="ni-phase">Phase</label>${labelSelect("phases", sessionStorage.getItem("ni-phase"), `id="ni-phase"`)}</div>
+        </div>
+        <p class="muted" style="margin-top:6px">Optional. The same code can be added again for another
+        area or phase — each is its own batch.</p>
+        <div class="field-grid">
           <div><label for="ni-qty">Batch qty</label><input id="ni-qty" type="number" inputmode="numeric" min="1"></div>
           <div><label for="ni-sample">Sample qty</label><input id="ni-sample" type="number" inputmode="numeric" min="0" placeholder="1"></div>
         </div>
@@ -1792,9 +1905,10 @@ function officeItems(body) {
   const go = document.getElementById("ni-go");
   if (go) {
     const value = (id) => document.getElementById(id).value.trim();
-    document.getElementById("ni-project").onchange = (e) => {
-      sessionStorage.setItem("ni-project", e.target.value); // the next one is usually the same job
-    };
+    for (const id of ["ni-project", "ni-area", "ni-phase"]) {
+      // The next one is usually for the same job, area and phase.
+      document.getElementById(id).onchange = (e) => { sessionStorage.setItem(id, e.target.value); };
+    }
     go.onclick = async () => {
       const err = document.getElementById("ni-err");
       const fail = (message) => { err.textContent = message; err.hidden = false; };
@@ -1813,12 +1927,14 @@ function officeItems(body) {
             project_id: value("ni-project"),
             code,
             description: value("ni-desc"),
+            area_id: value("ni-area") || null,
+            phase_id: value("ni-phase") || null,
             total_qty: qty,
             sample_qty: sample,
             drawing_revision: value("ni-rev") || "A",
           }),
         });
-        toast(`${created.code} added — it is on the Items list now`);
+        toast(`${itemName(created)} added — it is on the Items list now`);
         // Clear what was typed, but not the project: the next one is usually
         // for the same job.
         for (const id of ["ni-code", "ni-desc", "ni-qty", "ni-sample", "ni-rev"]) {
@@ -1964,6 +2080,7 @@ async function loadItemEditors() {
       <summary style="cursor:pointer;padding:6px 0">
         <strong>${esc(item.code)}</strong>
         <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
+        ${itemTags(item)}
         ${item.is_active ? "" : `<span class="badge">archived</span>`}
         <br><span class="muted">${esc(item.description)} · ${item.total_qty} pcs${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
       </summary>
@@ -1977,6 +2094,10 @@ async function loadItemEditors() {
         <label>Description</label>
         <input data-it-desc="${item.id}" value="${esc(item.description)}" ${isAdmin ? "" : "disabled"}>
         ${projectField(item)}
+        <div class="field-grid">
+          <div><label>Area</label>${labelSelect("areas", item.area_id, `data-it-area="${item.id}" ${isAdmin ? "" : "disabled"}`)}</div>
+          <div><label>Phase</label>${labelSelect("phases", item.phase_id, `data-it-phase="${item.id}" ${isAdmin ? "" : "disabled"}`)}</div>
+        </div>
         ${isAdmin ? `
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
           <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
@@ -2038,6 +2159,8 @@ async function loadItemEditors() {
         code,
         description: field("data-it-desc", id).value.trim(),
         total_qty: Number(field("data-it-qty", id).value) || byId.get(id).total_qty,
+        area_id: field("data-it-area", id).value || null,
+        phase_id: field("data-it-phase", id).value || null,
       };
       // Empty means "leave it where it is": the item's project is archived and
       // nothing was picked to move it to.
@@ -2146,7 +2269,7 @@ async function loadItemEditors() {
       // Typing the code, because this deletes the item's logged events along
       // with it and there is no undo behind it.
       const typed = prompt(
-        `Delete ${item.code} for good?\n\nThis destroys the item and its ${events} logged event(s). ` +
+        `Delete ${itemName(item)} for good?\n\nThis destroys the item and its ${events} logged event(s). ` +
         `It cannot be undone — archiving is what you want for anything really built.\n\n` +
         `Type ${item.code} to confirm:`
       );
@@ -2240,6 +2363,124 @@ function officeProjects(body) {
         await sync();
       } catch (error) {
         alert(error.body?.detail || "Could not archive the project.");
+      }
+    };
+  });
+}
+
+/* A picker over one of the two lists. Retired rows are left off, except the
+   one an item is already filed under: drop that and the select would quietly
+   show "none", and the next Save would un-file the item. */
+function labelSelect(list, selected, attrs) {
+  const rows = (S.ref?.[list] || []).filter((row) => row.is_active || row.id === selected);
+  return `
+    <select ${attrs}>
+      <option value="">— none —</option>
+      ${rows.map((row) => `<option value="${row.id}" ${row.id === selected ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : " (retired)"}</option>`).join("")}
+    </select>`;
+}
+
+/* ------------------------------------------------- office: areas & phases -- */
+
+/* Two lists of the same shape, edited the same way: which part of a job a
+   batch is for, and which phase of it. They are what the Area and Phase
+   filters are made of. Renaming one re-labels every item filed under it;
+   retiring one takes it off the pickers and leaves its items where they are. */
+const LABEL_LISTS = [
+  { list: "areas", field: "area_id", noun: "area", title: "Areas",
+    blurb: "The parts of a job: guest rooms, the spa, the all-day dining room.", example: "Guest rooms" },
+  { list: "phases", field: "phase_id", noun: "phase", title: "Phases",
+    blurb: "The phases a job is built and delivered in.", example: "Phase 1" },
+];
+
+function officeAreas(body) {
+  body.innerHTML = LABEL_LISTS.map(({ list, field, noun, title, blurb, example }) => {
+    const rows = S.ref?.[list] || [];
+    return `
+    <div class="card">
+      <h2>${title}</h2>
+      <p class="muted" style="margin-bottom:8px">${blurb} Every item can be filed under one, from the
+      import file or its editor, and the Items list and Reports can be narrowed to it.</p>
+      ${rows.map((row) => {
+        const count = S.items.filter((item) => item[field] === row.id).length;
+        return `
+        <details data-panel="${list}:${row.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
+          <summary style="cursor:pointer;padding:6px 0">
+            <strong>${esc(row.name)}</strong>${row.is_active ? "" : ` <span class="badge">retired</span>`}
+            <span class="muted"> · ${count} item${count === 1 ? "" : "s"} on the floor</span>
+          </summary>
+          <div style="padding:8px 0 12px">
+            <div class="field-grid">
+              <div><label>Name</label><input data-lb-name="${list}:${row.id}" maxlength="120" value="${esc(row.name)}"></div>
+              <div><label>Sort order</label><input data-lb-sort="${list}:${row.id}" type="number" inputmode="numeric" value="${row.sort_order}"></div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+              <button class="ghost" data-lb-save="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
+              <button class="ghost" data-lb-toggle="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${row.is_active ? "Retire" : "Reactivate"}</button>
+            </div>
+          </div>
+        </details>`;
+      }).join("") || `<p class="muted">No ${noun}s yet.</p>`}
+      <label style="margin-top:12px">Add ${noun === "area" ? "an" : "a"} ${noun}</label>
+      <div class="qty-row">
+        <input data-lb-new="${list}" maxlength="120" placeholder="e.g. ${example}" style="flex:1;text-align:left;padding:10px">
+        <button class="ghost" data-lb-add="${list}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Add</button>
+      </div>
+      <p class="warn-text" data-lb-err="${list}" role="alert" hidden></p>
+    </div>`;
+  }).join("");
+
+  const meta = (list) => LABEL_LISTS.find((entry) => entry.list === list);
+  const refuse = (error, fallback) => alert(typeof error.body?.detail === "string" ? error.body.detail : fallback);
+  const patch = async (key, payload, done) => {
+    const [list, id] = key.split(":");
+    try {
+      await api(`/api/${list}/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
+      toast(done);
+      await sync(); // refreshes the lists, and the filters made from them
+    } catch (error) {
+      refuse(error, `Could not update the ${meta(list).noun}.`);
+    }
+  };
+
+  body.querySelectorAll("[data-lb-save]").forEach((button) => {
+    button.onclick = () => {
+      const key = button.dataset.lbSave;
+      const name = body.querySelector(`[data-lb-name="${key}"]`).value.trim();
+      if (!name) return;
+      patch(key, { name, sort_order: Number(body.querySelector(`[data-lb-sort="${key}"]`).value) || 0 }, "Saved");
+    };
+  });
+  body.querySelectorAll("[data-lb-toggle]").forEach((button) => {
+    button.onclick = () => {
+      const [list, id] = button.dataset.lbToggle.split(":");
+      const row = labelRow(list, id);
+      const { field, noun } = meta(list);
+      const count = S.items.filter((item) => item[field] === id).length;
+      if (row.is_active && count && !confirm(
+        `Retire ${row.name}? ${count} item${count === 1 ? " is" : "s are"} filed under it and will stay there; it just cannot be picked for new ones.`)) return;
+      patch(button.dataset.lbToggle, { is_active: !row.is_active },
+        row.is_active ? `${row.name} retired` : `${row.name} is back on the list`);
+    };
+  });
+  body.querySelectorAll("[data-lb-add]").forEach((button) => {
+    button.onclick = async () => {
+      const list = button.dataset.lbAdd;
+      const input = body.querySelector(`[data-lb-new="${list}"]`);
+      const err = body.querySelector(`[data-lb-err="${list}"]`);
+      const name = input.value.trim();
+      err.hidden = true;
+      if (!name) return;
+      const last = Math.max(0, ...(S.ref?.[list] || []).map((row) => row.sort_order));
+      try {
+        await api(`/api/${list}`, { method: "POST", body: JSON.stringify({ name, sort_order: last + 10 }) });
+        input.value = "";
+        dirtyFields.clear();
+        toast(`${name} added`);
+        await sync();
+      } catch (error) {
+        err.textContent = typeof error.body?.detail === "string" ? error.body.detail : `Could not add the ${meta(list).noun}.`;
+        err.hidden = false;
       }
     };
   });
