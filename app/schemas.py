@@ -98,9 +98,22 @@ class ItemUpdate(BaseModel):
     is_active: bool | None = None
 
 
-class LabelCreate(BaseModel):
-    """A new area or phase: one more entry in a list the office owns."""
+class ItemsAssign(BaseModel):
+    """File many items under an area and/or a phase at once.
 
+    Only the fields that are sent are changed: leave `phase_id` out and every
+    item keeps the phase it has; send it as null and they all lose it.
+    """
+
+    item_ids: list[uuid.UUID] = Field(min_length=1, max_length=5000)
+    area_id: uuid.UUID | None = None
+    phase_id: uuid.UUID | None = None
+
+
+class LabelCreate(BaseModel):
+    """A new area or phase: one more entry in a project's own list."""
+
+    project_id: uuid.UUID
     name: str = Field(min_length=1, max_length=120)
     sort_order: int = 0
 

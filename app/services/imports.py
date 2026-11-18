@@ -8,9 +8,9 @@ header row -- saved as .xlsx or .csv:
 
 - `project`, `item`, `qty` are required; the rest are optional.
 - `area` and `phase` say which part of the job, and which phase of it, the
-  batch is for. Matched by name against the lists the office keeps; a name
-  that is not on a list yet is added to it when the file is committed, and
-  the preview says so first. The same item code may appear on several rows as
+  batch is for. Each project has its own lists; a name is matched against the
+  row's project, and one that project does not have yet is added to it when
+  the file is committed -- the preview says so first. The same item code may appear on several rows as
   long as each has a different area or phase: those are separate batches.
 - `project name` and `client` are only read when the project is new. An
   existing project is added to, never renamed by a file.
@@ -136,9 +136,10 @@ class ImportPlan:
     errors: list[dict] = field(default_factory=list)
     # Things worth knowing that do not stop the import.
     notes: list[str] = field(default_factory=list)
-    # Names the file uses that are not on the lists yet, in file order.
-    new_areas: list[str] = field(default_factory=list)
-    new_phases: list[str] = field(default_factory=list)
+    # Names the file uses that their project does not have yet, in file order:
+    # (project code, name).
+    new_areas: list[tuple[str, str]] = field(default_factory=list)
+    new_phases: list[tuple[str, str]] = field(default_factory=list)
 
     def error(self, row: int | None, message: str) -> None:
         self.errors.append({"row": row, "message": message})
@@ -172,8 +173,8 @@ class ImportPlan:
             ],
             "errors": self.errors,
             "notes": self.notes,
-            "new_areas": self.new_areas,
-            "new_phases": self.new_phases,
+            "new_areas": [{"project": p, "name": n} for p, n in self.new_areas],
+            "new_phases": [{"project": p, "name": n} for p, n in self.new_phases],
         }
 
 
@@ -447,19 +448,24 @@ def plan_import(
         return plan
 
     existing_projects = {p.code: p for p in db.scalars(sa.select(Project))}
-    areas = {a.name.casefold(): a for a in db.scalars(sa.select(Area))}
-    phases = {ph.name.casefold(): ph for ph in db.scalars(sa.select(Phase))}
-    new_areas: dict[str, str] = {}   # casefolded -> the first spelling in the file
-    new_phases: dict[str, str] = {}
+    # Each project has its own areas and phases, so a name only means something
+    # next to a project code.
+    code_of = {p.id: p.code for p in existing_projects.values()}
+    areas = {(code_of[a.project_id], a.name.casefold()): a for a in db.scalars(sa.select(Area))}
+    phases = {(code_of[ph.project_id], ph.name.casefold()): ph for ph in db.scalars(sa.select(Phase))}
+    new_areas: dict[tuple[str, str], str] = {}   # (project, casefolded) -> first spelling in the file
+    new_phases: dict[tuple[str, str], str] = {}
 
-    def label(text: str, existing: dict, fresh: dict, noun: str, problems: list[str]) -> str:
+    def label(
+        project_code: str, text: str, existing: dict, fresh: dict, noun: str, problems: list[str]
+    ) -> str:
         """The name this row's area or phase will be stored under."""
         if not text:
             return ""
         if len(text) > _LABEL_MAX:
             problems.append(f"{noun} longer than {_LABEL_MAX} characters")
             return ""
-        key = text.casefold()
+        key = (project_code, text.casefold())
         row = existing.get(key)
         if row is not None:
             if not row.is_active:
@@ -477,8 +483,8 @@ def plan_import(
         project_code = get(values, "project").upper()
         code = get(values, "item")
         problems: list[str] = []
-        area = label(get(values, "area"), areas, new_areas, "area", problems)
-        phase = label(get(values, "phase"), phases, new_phases, "phase", problems)
+        area = label(project_code, get(values, "area"), areas, new_areas, "area", problems)
+        phase = label(project_code, get(values, "phase"), phases, new_phases, "phase", problems)
         identity = (project_code, code, area.casefold(), phase.casefold())
 
         if not project_code:
@@ -559,8 +565,10 @@ def plan_import(
         project = existing_projects.get(planned.project_code)
         if project is None:
             continue
-        area_row = areas.get(planned.area.casefold()) if planned.area else None
-        phase_row = phases.get(planned.phase.casefold()) if planned.phase else None
+        area_row = areas.get((planned.project_code, planned.area.casefold())) if planned.area else None
+        phase_row = (
+            phases.get((planned.project_code, planned.phase.casefold())) if planned.phase else None
+        )
         if (planned.area and area_row is None) or (planned.phase and phase_row is None):
             continue
         if identity_taken(
@@ -578,14 +586,17 @@ def plan_import(
             )
 
     # Only names used by rows that are actually going in.
-    used_areas = {i.area.casefold() for i in plan.items}
-    used_phases = {i.phase.casefold() for i in plan.items}
-    plan.new_areas = [name for key, name in new_areas.items() if key in used_areas]
-    plan.new_phases = [name for key, name in new_phases.items() if key in used_phases]
-    for noun, names in (("area", plan.new_areas), ("phase", plan.new_phases)):
-        if names:
+    used_areas = {(i.project_code, i.area.casefold()) for i in plan.items}
+    used_phases = {(i.project_code, i.phase.casefold()) for i in plan.items}
+    plan.new_areas = [(key[0], name) for key, name in new_areas.items() if key in used_areas]
+    plan.new_phases = [(key[0], name) for key, name in new_phases.items() if key in used_phases]
+    for noun, fresh in (("area", plan.new_areas), ("phase", plan.new_phases)):
+        by_project: dict[str, list[str]] = {}
+        for project_code, name in fresh:
+            by_project.setdefault(project_code, []).append(name)
+        for project_code, names in by_project.items():
             plan.notes.append(
-                f"New {noun}{'' if len(names) == 1 else 's'}, added to the list on import: "
+                f"New {noun}{'' if len(names) == 1 else 's'} for {project_code}, added on import: "
                 + ", ".join(names)
                 + "."
             )
@@ -620,16 +631,26 @@ def commit_import(db: Session, plan: ImportPlan, user: User) -> None:
     for project_id in sorted(project_ids.values(), key=str):
         lock_project(db, project_id)
 
-    def labels(model, wanted: list[str]) -> dict[str, uuid.UUID]:
-        """{casefolded name: id}, creating the rows the file introduces."""
-        rows = {row.name.casefold(): row for row in db.scalars(sa.select(model))}
-        last = max((row.sort_order for row in rows.values()), default=0)
-        for name in wanted:
-            if name.casefold() not in rows:
-                last += 10
-                row = model(name=name, sort_order=last)
+    def labels(model, wanted: list[tuple[str, str]]) -> dict[tuple[str, str], uuid.UUID]:
+        """{(project code, casefolded name): id} for the projects in this file,
+        creating the rows the file introduces."""
+        code_of = {project_id: code for code, project_id in project_ids.items()}
+        rows = {
+            (code_of[row.project_id], row.name.casefold()): row
+            for row in db.scalars(sa.select(model).where(model.project_id.in_(project_ids.values())))
+        }
+        last: dict[str, int] = {}
+        for (project_code, _name), row in rows.items():
+            last[project_code] = max(last.get(project_code, 0), row.sort_order)
+        for project_code, name in wanted:
+            key = (project_code, name.casefold())
+            if key not in rows:
+                last[project_code] = last.get(project_code, 0) + 10
+                row = model(
+                    project_id=project_ids[project_code], name=name, sort_order=last[project_code]
+                )
                 db.add(row)
-                rows[name.casefold()] = row
+                rows[key] = row
         db.flush()
         return {key: row.id for key, row in rows.items()}
 
@@ -640,8 +661,12 @@ def commit_import(db: Session, plan: ImportPlan, user: User) -> None:
     stored: list[str] = []
     try:
         for planned in plan.items:
-            area_id = area_ids.get(planned.area.casefold()) if planned.area else None
-            phase_id = phase_ids.get(planned.phase.casefold()) if planned.phase else None
+            area_id = (
+                area_ids.get((planned.project_code, planned.area.casefold())) if planned.area else None
+            )
+            phase_id = (
+                phase_ids.get((planned.project_code, planned.phase.casefold())) if planned.phase else None
+            )
             if identity_taken(db, project_ids[planned.project_code], planned.code, area_id, phase_id):
                 raise ItemSetupError(
                     f"item {planned.code} on row {planned.row} was created by someone else "

@@ -173,9 +173,11 @@ Names are indicative; Alembic migrations are authoritative.
 - `stations` — physical instances of a stage (paint_1, paint_2, carpentry_1, …).
   Many stations per stage. Recorded on events for load balancing.
 - `areas`, `phases` — which part of a job a batch is for (guest rooms, the
-  spa) and which phase of it. Two lists the office edits at runtime, shared by
-  every project, table-driven like stages: no enum, no literal names, nothing
-  branches on one. Retired, never deleted
+  spa) and which phase of it. **Each project has its own two lists**
+  (`project_id`; a name is unique within a project), edited at runtime and
+  table-driven like stages: no enum, no literal names, nothing branches on
+  one. An item can only be filed under its own project's. One that items use
+  is retired, not deleted; one nothing is filed under can be deleted
 - `items` — a batch: code, project, area, phase, description, total qty (the
   production batch), sample qty, current drawing revision. **An item is
   project + code + area + phase.** The same code can be several items in one
@@ -183,7 +185,8 @@ Names are indicative; Alembic migrations are authoritative.
   history; area and phase are optional, and "none" is a value like any other.
   That identity is enforced in `app/services/items.py` (`identity_taken`,
   under a lock on the project row), not by a unique index: an index never
-  treats two NULLs as equal. Never show or look up an item by code alone Creating one **is** the handoff
+  treats two NULLs as equal. Never show or look up an item by code alone.
+  Creating one **is** the handoff
   to the floor: there is no released/unreleased state, and `created_at` is when
   the sample started counting. Items arrive through the project import file,
   or one at a time from Office → Items. An item has no stages of its own
@@ -296,9 +299,16 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   import, by any engineer. It posts `POST /api/items`, which also takes an
   optional mid-production distribution by stage (with `sample_qty` 0)
 - Office tab: projects, item editing, and admin management of stages/stations
-- Office → Areas & phases (admin): add, rename, reorder and retire the two
-  lists. An import file that names a new area or phase adds it, and the
-  preview says so first
+- Office → Areas & phases (admin): pick a project, then add, rename, reorder,
+  retire or delete its areas and phases. An import file that names an area or
+  phase its project does not have adds it, and the preview says so first.
+  Pickers everywhere offer only the relevant project's; with no project
+  chosen, a filter names each one with its project ("HOTEL-B · Spa"). The
+  same page files many of that project's items at once: search (commas
+  separate alternatives), tick, search again — the ticks are kept — then set
+  an area and/or a phase on everything ticked. `POST /api/items/assign` does
+  it all-or-nothing: if any two items would become the same batch, nothing
+  changes
 - Taking work off the floor (admin): archive an item, or a project together
   with its items — each archive is an event, and both can be reactivated.
   Finished jobs should be archived: every active item is replayed by every

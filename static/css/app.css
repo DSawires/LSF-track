@@ -515,6 +515,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .filters select { flex: 1 1 30%; min-width: 0; padding: 10px; }
 
+/* A list of things to tick. Rows are whole-width tap targets, and the list
+   scrolls inside its card so the "file" button below it stays in reach. */
+.pick-list { max-height: 52vh; overflow-y: auto; border-top: 1px solid var(--line); }
+.pick-row {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 52px; padding: 8px 2px; margin: 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px; color: var(--text); cursor: pointer;
+}
+.pick-row input[type="checkbox"] { width: 22px; height: 22px; flex: none; }
+
 /* Area and phase, beside an item's code. Part of what the item is, so it reads
    as a label and not as a status. */
 .badge.tag { border: 1px solid var(--line); background: transparent; color: var(--muted); }

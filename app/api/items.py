@@ -19,7 +19,7 @@ from app.models import (
     Project,
     User,
 )
-from app.schemas import ItemCreate, ItemUpdate, RevisionBumpRequest
+from app.schemas import ItemCreate, ItemsAssign, ItemUpdate, RevisionBumpRequest
 from app.services import reports
 from app.services.items import (
     ItemSetupError,
@@ -214,25 +214,36 @@ def _area_and_phase(
     db: Session,
     area_id: uuid.UUID | None,
     phase_id: uuid.UUID | None,
+    project_id: uuid.UUID,
     keep_area: uuid.UUID | None = None,
     keep_phase: uuid.UUID | None = None,
 ) -> tuple[Area | None, Phase | None]:
     """The rows behind an item's area and phase, or a 4xx saying which is wrong.
 
-    A retired one cannot be newly chosen -- it is off every picker -- but an
-    item already in it (`keep_*`) may stay there through an unrelated edit.
+    Each must be one of the item's own project's: areas and phases are kept
+    per project, and "Spa" in another job is another place. A retired one
+    cannot be newly chosen -- it is off every picker -- but an item already in
+    it (`keep_*`) may stay there through an unrelated edit.
     """
-    area = db.get(Area, area_id) if area_id is not None else None
-    if area_id is not None and area is None:
-        raise HTTPException(422, "unknown area")
-    if area is not None and not area.is_active and area.id != keep_area:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"area '{area.name}' is retired")
-    phase = db.get(Phase, phase_id) if phase_id is not None else None
-    if phase_id is not None and phase is None:
-        raise HTTPException(422, "unknown phase")
-    if phase is not None and not phase.is_active and phase.id != keep_phase:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"phase '{phase.name}' is retired")
-    return area, phase
+    out = []
+    for model, row_id, keep, noun in (
+        (Area, area_id, keep_area, "area"),
+        (Phase, phase_id, keep_phase, "phase"),
+    ):
+        row = db.get(model, row_id) if row_id is not None else None
+        if row_id is not None and row is None:
+            raise HTTPException(422, f"unknown {noun}")
+        if row is not None and row.project_id != project_id:
+            owner = db.get(Project, row.project_id)
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{noun} '{row.name}' belongs to project {owner.code if owner else '?'}; "
+                f"pick one of this project's {noun}s, or none",
+            )
+        if row is not None and not row.is_active and row.id != keep:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"{noun} '{row.name}' is retired")
+        out.append(row)
+    return out[0], out[1]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -263,7 +274,7 @@ def create_item(
             f"project {project.code} is archived; reactivate it first",
         )
     code = payload.code.strip()
-    area, phase = _area_and_phase(db, payload.area_id, payload.phase_id)
+    area, phase = _area_and_phase(db, payload.area_id, payload.phase_id, project.id)
     if identity_taken(db, project.id, code, payload.area_id, payload.phase_id):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -290,6 +301,102 @@ def create_item(
             raise HTTPException(422, str(exc))
     db.refresh(item)
     return _item_payload(item)
+
+
+@router.post("/assign")
+def assign_items(
+    payload: ItemsAssign,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """File a selection of items under an area and/or a phase in one go.
+
+    What Office -> Areas & phases posts after someone has searched, ticked and
+    chosen. All-or-nothing, like the import: area and phase are part of what an
+    item *is*, so the whole selection is checked first, and if any item would
+    end up the same batch as another -- two ticked items collapsing into one
+    identity, or one landing on an item that was not ticked -- nothing changes
+    and the answer names them.
+    """
+    sent = payload.model_fields_set & {"area_id", "phase_id"}
+    if not sent:
+        raise HTTPException(422, "say which to set: an area, a phase, or both")
+    ids = list(dict.fromkeys(payload.item_ids))
+    items = list(db.scalars(sa.select(Item).where(Item.id.in_(ids)).order_by(Item.code)))
+    if len(items) != len(ids):
+        raise HTTPException(
+            422, f"{len(ids) - len(items)} of those items no longer exist; refresh and try again"
+        )
+    # An area or a phase belongs to one project, so a selection that is given
+    # one must all be in that project. (Clearing has no such limit.)
+    projects = {item.project_id for item in items}
+    naming = ("area_id" in sent and payload.area_id) or ("phase_id" in sent and payload.phase_id)
+    if naming and len(projects) > 1:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "nothing was changed: the ticked items are in more than one project, and an "
+            "area or phase belongs to one. File each project's items separately.",
+        )
+    area, phase = _area_and_phase(
+        db,
+        payload.area_id if "area_id" in sent else None,
+        payload.phase_id if "phase_id" in sent else None,
+        next(iter(projects)),
+    )
+    for project_id in sorted(projects, key=str):
+        lock_project(db, project_id)
+
+    def target(item: Item) -> tuple:
+        return (
+            item.project_id,
+            item.code,
+            payload.area_id if "area_id" in sent else item.area_id,
+            payload.phase_id if "phase_id" in sent else item.phase_id,
+        )
+
+    # Everything else that shares a project and code with the selection: the
+    # only rows a re-filed item could land on.
+    others = {
+        tuple(row)
+        for row in db.execute(
+            sa.select(Item.project_id, Item.code, Item.area_id, Item.phase_id).where(
+                Item.project_id.in_({item.project_id for item in items}),
+                Item.code.in_({item.code for item in items}),
+                Item.id.not_in(ids),
+            )
+        )
+    }
+    seen: set[tuple] = set()
+    clashes: list[str] = []
+    for item in items:
+        identity = target(item)
+        if identity in seen or identity in others:
+            clashes.append(item.code)
+        seen.add(identity)
+    if clashes:
+        codes = sorted(set(clashes))
+        named = ", ".join(codes[:8]) + (" …" if len(codes) > 8 else "")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"nothing was changed: {len(clashes)} item(s) would become the same batch as "
+            f"another with the same code, area and phase ({named}). Untick them, or give "
+            "them a different area or phase.",
+        )
+
+    for item in items:
+        _project, _code, item.area_id, item.phase_id = target(item)
+    db.flush()
+    log.info(
+        "%d item(s) filed by %s: %s",
+        len(items),
+        admin.username,
+        ", ".join(
+            f"{noun} -> {row.name if row else 'none'}"
+            for noun, row, key in (("area", area, "area_id"), ("phase", phase, "phase_id"))
+            if key in sent
+        ),
+    )
+    return {"updated": len(items)}
 
 
 @router.patch("/{item_id}")
@@ -354,6 +461,7 @@ def update_item(
             db,
             target_area,
             target_phase,
+            target_project,
             # Staying in a retired area or phase is not choosing one.
             keep_area=item.area_id,
             keep_phase=item.phase_id,

@@ -158,28 +158,33 @@ class ReasonCode(Base):
 
 
 class Area(Base):
-    """Where in the client's job a piece belongs: guest rooms, the spa, the
-    all-day dining room. A list the office edits at runtime, like stages, and
-    shared by every project -- nothing in the application branches on a name.
+    """Where in a client's job a piece belongs: guest rooms, the spa, the
+    all-day dining room. Each project has its own list, which the office edits
+    at runtime -- nothing in the application branches on a name, and "Spa" in
+    one hotel is not "Spa" in another.
     """
 
     __tablename__ = "areas"
+    __table_args__ = (sa.UniqueConstraint("project_id", "name", name="uq_areas_project_name"),)
 
     id: Mapped[uuid.UUID] = _pk()
-    name: Mapped[str] = mapped_column(sa.String(120), unique=True, index=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("projects.id"), index=True)
+    name: Mapped[str] = mapped_column(sa.String(120))
     sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
 
 class Phase(Base):
     """A phase of a job: which delivery a batch is being built for. The same
-    kind of list as `areas`, edited in the same place.
+    kind of list as `areas`, per project, edited in the same place.
     """
 
     __tablename__ = "phases"
+    __table_args__ = (sa.UniqueConstraint("project_id", "name", name="uq_phases_project_name"),)
 
     id: Mapped[uuid.UUID] = _pk()
-    name: Mapped[str] = mapped_column(sa.String(120), unique=True, index=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("projects.id"), index=True)
+    name: Mapped[str] = mapped_column(sa.String(120))
     sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 

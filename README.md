@@ -206,8 +206,9 @@ UI survive restarts.
 `project`, `item` and `qty` are required. `area` and `phase` are optional:
 which part of the job, and which phase of it, the batch is for. The same item
 code may appear on several rows as long as each has a different area or phase
-— those are separate batches. A name that is not on the list yet is added to
-it on import, and the preview says so first. A new project code creates the
+— those are separate batches. Each project has its own areas and phases: a
+name its project does not have yet is added to that project on import, and the
+preview says so first. A new project code creates the
 project; an existing one is added to (never renamed by the file). There is no
 `stages` column: an item is not given a route. A file written for the older
 format still imports — the column is skipped, and the preview says so.
@@ -241,12 +242,20 @@ rooms and for the phase 2 rooms are two items with the same code, each with its
 own quantity, sample and history, so production can be followed per area and
 per phase.
 
-- **Office → Areas & phases** (admin) keeps the two lists: add, rename,
-  reorder, retire. They are shared by every project. Renaming one re-labels
+- **Each project has its own areas and phases.** "Spa" in one hotel is not
+  "Spa" in another, and an item can only be filed under its own project's.
+- **Office → Areas & phases** (admin): pick the project at the top, then add,
+  rename, reorder or retire its areas and phases. Renaming one re-labels
   every item filed under it; retiring one takes it off the pickers and leaves
-  its items where they are.
+  its items where they are; one with nothing filed under it can be deleted.
 - An item gets its area and phase from the import file, the New item form, or
   its editor. Both are optional.
+- **Filing many at once.** On the same page, for the chosen project: search
+  for items (`bed base, LF-03` finds both — commas separate alternatives, words
+  narrow), tick them, search again and tick more, then choose the area and/or
+  phase and file the lot. "In no area" / "In no phase" show what is still
+  unfiled. If two of the ticked items would end up as the same batch, nothing
+  is changed and the message names them.
 - The **Items** list filters by area, phase and progress (haven't started / in
   progress / finished); **Reports** narrow WIP and aging to an area and a
   phase. Wherever an item is shown, its area and phase are shown with its

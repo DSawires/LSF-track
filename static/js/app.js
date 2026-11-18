@@ -354,8 +354,9 @@ function placeName(key) {
 /* An item is project + code + area + phase: the same code can be several
    batches in one project, one per area and phase, each with its own quantity
    and history. So a code is never shown alone -- wherever an item is named, its
-   area and phase are named with it. Both are optional, and both are lists the
-   office edits; nothing here knows what any of them is called. */
+   area and phase are named with it. Both are optional. Each project keeps its
+   own list of each, edited in the office; nothing here knows what any of them
+   is called. */
 const NONE = "none"; // filter value for "filed under no area / no phase"
 
 function labelRow(list, id) { return (S.ref?.[list] || []).find((row) => row.id === id) || null; }
@@ -374,13 +375,22 @@ function itemTags(item) {
     .map((name) => `<span class="badge tag">${esc(name)}</span>`).join(" ");
 }
 
-/* What an Area or Phase filter offers: every row still on the list, plus any
-   retired one that items on screen are still filed under -- and "none", when
-   some items are filed under nothing, so those can be found too. */
-function labelOptions(list, field, items, noneLabel) {
+/* What an Area or Phase filter offers. Areas and phases belong to a project,
+   so with a project chosen it is that project's list; with none chosen it is
+   every live project's, each named with its project ("HOTEL-B · Spa"), because
+   two jobs can both have a Spa. Either way: every row still on the list, plus
+   any retired one that items on screen are still filed under -- and "none",
+   when some items are filed under nothing, so those can be found too. */
+function labelOptions(list, field, items, noneLabel, projectId) {
   const used = new Set(items.map((item) => item[field]).filter(Boolean));
-  const rows = (S.ref?.[list] || []).filter((row) => row.is_active || used.has(row.id));
-  const options = rows.map((row) => ({ id: row.id, name: row.name }));
+  const projects = new Map((S.ref?.projects || []).map((pr) => [pr.id, pr]));
+  const rows = (S.ref?.[list] || []).filter((row) =>
+    (row.is_active || used.has(row.id))
+    && (projectId ? row.project_id === projectId
+      : used.has(row.id) || projects.get(row.project_id)?.is_active !== false));
+  const named = (row) => (projectId ? row.name : `${projects.get(row.project_id)?.code || "?"} · ${row.name}`);
+  const options = rows.map((row) => ({ id: row.id, name: named(row) }));
+  if (!projectId) options.sort((x, y) => x.name.localeCompare(y.name));
   if (rows.length && items.some((item) => !item[field])) options.push({ id: NONE, name: noneLabel });
   return options;
 }
@@ -842,8 +852,8 @@ function viewItems() {
   const filterProject = validFilter("f-project", projects);
   const filterStage = sessionStorage.getItem("f-stage") || "";
   const inProject = S.items.filter((item) => !filterProject || item.project_id === filterProject);
-  const areas = labelOptions("areas", "area_id", inProject, "No area");
-  const phases = labelOptions("phases", "phase_id", inProject, "No phase");
+  const areas = labelOptions("areas", "area_id", inProject, "No area", filterProject);
+  const phases = labelOptions("phases", "phase_id", inProject, "No phase", filterProject);
   const filterArea = validFilter("f-area", areas);
   const filterPhase = validFilter("f-phase", phases);
   const filterProgress = validFilter("f-progress", PROGRESS.map(([id]) => ({ id })));
@@ -1515,8 +1525,8 @@ async function viewReports() {
   const fDays = sessionStorage.getItem("r-days") || "";
   // The reports are computed on the server, which narrows by area and phase
   // before it replays anything. No "none" here: that is a question for the list.
-  const areas = (S.ref?.areas || []).filter((a) => a.is_active);
-  const phases = (S.ref?.phases || []).filter((ph) => ph.is_active);
+  const areas = labelOptions("areas", "area_id", [], "", fProject);
+  const phases = labelOptions("phases", "phase_id", [], "", fProject);
   const fArea = validFilter("r-area", areas);
   const fPhase = validFilter("r-phase", phases);
 
@@ -1742,7 +1752,7 @@ function officeImport(body) {
           <tr><td><strong>item</strong></td><td>Item code. It may repeat on several rows, as long as each
             has a different area or phase: those are separate batches.</td></tr>
           <tr><td>area, phase</td><td>Optional. Which part of the job, and which phase of it, the batch is
-            for. A name not on the list yet is added to it.</td></tr>
+            for. Each project has its own; a name it does not have yet is added to it.</td></tr>
           <tr><td>description</td><td>Optional.</td></tr>
           <tr><td><strong>qty</strong></td><td>The production batch.</td></tr>
           <tr><td>sample qty</td><td>Optional, default 1. Built first; 0 for no sample.</td></tr>
@@ -1850,6 +1860,13 @@ function officeImport(body) {
 
 /* ---------------------------------------------------------- office: items -- */
 
+/* The area and phase pickers of the New item form, for one project. */
+function newItemLabels(projectId) {
+  return `
+          <div><label for="ni-area">Area</label>${labelSelect("areas", sessionStorage.getItem("ni-area"), `id="ni-area"`, projectId)}</div>
+          <div><label for="ni-phase">Phase</label>${labelSelect("phases", sessionStorage.getItem("ni-phase"), `id="ni-phase"`, projectId)}</div>`;
+}
+
 /* One item, added by hand: the extra wardrobe the client asked for after the
    import, the piece nobody put on the schedule. Open to every engineer, like
    the import -- adding work to a project is not an admin job; rewriting what
@@ -1875,12 +1892,9 @@ function officeItems(body) {
         </div>
         <label for="ni-desc">Description</label>
         <input id="ni-desc" maxlength="255" autocomplete="off">
-        <div class="field-grid">
-          <div><label for="ni-area">Area</label>${labelSelect("areas", sessionStorage.getItem("ni-area"), `id="ni-area"`)}</div>
-          <div><label for="ni-phase">Phase</label>${labelSelect("phases", sessionStorage.getItem("ni-phase"), `id="ni-phase"`)}</div>
-        </div>
-        <p class="muted" style="margin-top:6px">Optional. The same code can be added again for another
-        area or phase — each is its own batch.</p>
+        <div class="field-grid" id="ni-labels">${newItemLabels(projects.some((p) => p.id === remembered) ? remembered : projects[0].id)}</div>
+        <p class="muted" style="margin-top:6px">Optional, and from the project's own lists. The same code can
+        be added again for another area or phase — each is its own batch.</p>
         <div class="field-grid">
           <div><label for="ni-qty">Batch qty</label><input id="ni-qty" type="number" inputmode="numeric" min="1"></div>
           <div><label for="ni-sample">Sample qty</label><input id="ni-sample" type="number" inputmode="numeric" min="0" placeholder="1"></div>
@@ -1905,10 +1919,19 @@ function officeItems(body) {
   const go = document.getElementById("ni-go");
   if (go) {
     const value = (id) => document.getElementById(id).value.trim();
-    for (const id of ["ni-project", "ni-area", "ni-phase"]) {
-      // The next one is usually for the same job, area and phase.
-      document.getElementById(id).onchange = (e) => { sessionStorage.setItem(id, e.target.value); };
-    }
+    // The next one is usually for the same job, area and phase.
+    const remember = () => {
+      for (const id of ["ni-area", "ni-phase"]) {
+        document.getElementById(id).onchange = (e) => { sessionStorage.setItem(id, e.target.value); };
+      }
+    };
+    document.getElementById("ni-project").onchange = (e) => {
+      sessionStorage.setItem("ni-project", e.target.value);
+      // Another project, another pair of lists.
+      document.getElementById("ni-labels").innerHTML = newItemLabels(e.target.value);
+      remember();
+    };
+    remember();
     go.onclick = async () => {
       const err = document.getElementById("ni-err");
       const fail = (message) => { err.textContent = message; err.hidden = false; };
@@ -2074,6 +2097,16 @@ async function loadItemEditors() {
         </select>`;
   };
   target.classList.remove("muted");
+  // An item's area and phase come from its project's lists. Shown for another
+  // project (the one it is about to be moved to), nothing is selected: its
+  // current area does not exist there.
+  const editorLabels = (item, projectId) => {
+    const own = projectId === item.project_id;
+    const lock = isAdmin ? "" : "disabled";
+    return `
+          <div><label>Area</label>${labelSelect("areas", own ? item.area_id : null, `data-it-area="${item.id}" ${lock}`, projectId)}</div>
+          <div><label>Phase</label>${labelSelect("phases", own ? item.phase_id : null, `data-it-phase="${item.id}" ${lock}`, projectId)}</div>`;
+  };
 
   target.innerHTML = items.map((item) => `
     <details data-panel="item:${item.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
@@ -2094,10 +2127,7 @@ async function loadItemEditors() {
         <label>Description</label>
         <input data-it-desc="${item.id}" value="${esc(item.description)}" ${isAdmin ? "" : "disabled"}>
         ${projectField(item)}
-        <div class="field-grid">
-          <div><label>Area</label>${labelSelect("areas", item.area_id, `data-it-area="${item.id}" ${isAdmin ? "" : "disabled"}`)}</div>
-          <div><label>Phase</label>${labelSelect("phases", item.phase_id, `data-it-phase="${item.id}" ${isAdmin ? "" : "disabled"}`)}</div>
-        </div>
+        <div class="field-grid" data-it-labels="${item.id}">${editorLabels(item, item.project_id)}</div>
         ${isAdmin ? `
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
           <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
@@ -2149,6 +2179,15 @@ async function loadItemEditors() {
 
   const byId = new Map(items.map((i) => [i.id, i]));
   const field = (attr, id) => target.querySelector(`[${attr}="${id}"]`);
+
+  // Picking another project swaps the area and phase pickers to its lists.
+  target.querySelectorAll("[data-it-project]").forEach((select) => {
+    select.onchange = () => {
+      const item = byId.get(select.dataset.itProject);
+      const holder = field("data-it-labels", item.id);
+      if (holder) holder.innerHTML = editorLabels(item, select.value || item.project_id);
+    };
+  });
 
   target.querySelectorAll("[data-it-save]").forEach((button) => {
     button.onclick = async () => {
@@ -2368,15 +2407,17 @@ function officeProjects(body) {
   });
 }
 
-/* A picker over one of the two lists. Retired rows are left off, except the
-   one an item is already filed under: drop that and the select would quietly
-   show "none", and the next Save would un-file the item. */
-function labelSelect(list, selected, attrs) {
-  const rows = (S.ref?.[list] || []).filter((row) => row.is_active || row.id === selected);
+/* A picker over one project's areas or phases. Retired rows are left off,
+   except the one an item is already filed under: drop that and the select
+   would quietly show "none", and the next Save would un-file the item. */
+function labelSelect(list, selected, attrs, projectId) {
+  const rows = (S.ref?.[list] || []).filter((row) =>
+    row.project_id === projectId && (row.is_active || row.id === selected));
+  const picked = rows.some((row) => row.id === selected) ? selected : null;
   return `
     <select ${attrs}>
       <option value="">— none —</option>
-      ${rows.map((row) => `<option value="${row.id}" ${row.id === selected ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : " (retired)"}</option>`).join("")}
+      ${rows.map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : " (retired)"}</option>`).join("")}
     </select>`;
 }
 
@@ -2393,14 +2434,231 @@ const LABEL_LISTS = [
     blurb: "The phases a job is built and delivered in.", example: "Phase 1" },
 ];
 
+/* Filing many items at once: search, tick, search again, tick more, then put
+   everything ticked under an area and/or a phase.
+
+   The ticks are kept here, not in the DOM, for two reasons. They have to
+   outlive a search -- a batch is usually gathered from several ("bed", then
+   "bench", then "LF-07") -- and the list they sit in is repainted on every
+   keystroke and on every background sync. */
+const KEEP = "keep"; // "leave this one as it is"
+const filing = {
+  // `project` is the one the whole Areas & phases page is showing.
+  q: "", project: "", inArea: "", inPhase: "", onlyTicked: false,
+  ticked: new Set(), area: KEEP, phase: KEEP,
+};
+const FILING_SHOWN = 300; // rows painted; ticking "all" still takes every match
+
+/* A search box that takes several things at once. Commas separate alternatives
+   and the words inside one must all be there: "bed base, LF-03" finds every
+   bed base and LF-03 as well. Matched against the code, the description, the
+   project, and the area and phase an item is already under. */
+function filingMatcher(query) {
+  const alternatives = query.toLowerCase().split(",")
+    .map((part) => part.trim().split(/\s+/).filter(Boolean))
+    .filter((words) => words.length);
+  if (!alternatives.length) return () => true;
+  const projectCode = new Map((S.ref?.projects || []).map((pr) => [pr.id, pr.code]));
+  return (item) => {
+    const text = `${item.code} ${item.description} ${projectCode.get(item.project_id) || ""} ${areaName(item)} ${phaseName(item)}`.toLowerCase();
+    return alternatives.some((words) => words.every((word) => text.includes(word)));
+  };
+}
+
+function filingMatches() {
+  const matches = filingMatcher(filing.q);
+  return S.items.filter((item) =>
+    item.project_id === filing.project
+    && matchesLabel(item, "area_id", filing.inArea)
+    && matchesLabel(item, "phase_id", filing.inPhase)
+    && (!filing.onlyTicked || filing.ticked.has(item.id))
+    && matches(item));
+}
+
+function filingCard() {
+  const own = (list) => (S.ref?.[list] || []).filter((row) => row.project_id === filing.project);
+  const current = (list, picked, any, none) => `
+        <option value="">${any}</option>
+        <option value="${NONE}" ${picked === NONE ? "selected" : ""}>${none}</option>
+        ${own(list).map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : " (retired)"}</option>`).join("")}`;
+  const target = (list, picked) => `
+        <option value="${KEEP}">— leave as it is —</option>
+        <option value="${NONE}" ${picked === NONE ? "selected" : ""}>— none —</option>
+        ${own(list).filter((row) => row.is_active).map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}</option>`).join("")}`;
+  return `
+    <div class="card">
+      <h2>File items under an area or phase</h2>
+      <p class="muted" style="margin-bottom:8px">Search this project's items, tick them, choose where they
+      go, apply. The ticks stay while you search again, so one batch can be gathered from several searches.</p>
+      <input id="fl-q" type="search" value="${esc(filing.q)}" style="margin-bottom:8px"
+             placeholder="Search — several at once with commas: bed base, LF-03">
+      <div class="filters">
+        <select id="fl-in-area" aria-label="Currently in area">${current("areas", filing.inArea, "In any area", "In no area")}</select>
+        <select id="fl-in-phase" aria-label="Currently in phase">${current("phases", filing.inPhase, "In any phase", "In no phase")}</select>
+      </div>
+      <div class="spread" style="margin-bottom:6px;flex-wrap:wrap;gap:8px">
+        <span class="muted" id="fl-count"></span>
+        <span style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="ghost" id="fl-all" style="width:auto;padding:8px 14px">Tick all found</button>
+          <button class="ghost" id="fl-none" style="width:auto;padding:8px 14px">Untick everything</button>
+        </span>
+      </div>
+      <label class="pick-row" style="border:0;min-height:0;padding:2px 0 8px">
+        <input type="checkbox" id="fl-only" ${filing.onlyTicked ? "checked" : ""}>
+        <span class="muted">Show only what is ticked</span>
+      </label>
+      <div id="fl-results" class="pick-list"></div>
+      <div class="field-grid" style="margin-top:12px">
+        <div><label for="fl-area">Set area to</label><select id="fl-area">${target("areas", filing.area)}</select></div>
+        <div><label for="fl-phase">Set phase to</label><select id="fl-phase">${target("phases", filing.phase)}</select></div>
+      </div>
+      <div style="height:10px"></div>
+      <button class="primary" id="fl-go"></button>
+      <p class="warn-text" id="fl-err" role="alert" hidden></p>
+    </div>`;
+}
+
+function bindFiling(body) {
+  const $results = document.getElementById("fl-results");
+  if (!$results) return;
+  const projectCode = new Map((S.ref?.projects || []).map((pr) => [pr.id, pr.code]));
+
+  // Ticks for items that have since been archived or deleted mean nothing.
+  const live = new Set(S.items.map((item) => item.id));
+  for (const id of filing.ticked) if (!live.has(id)) filing.ticked.delete(id);
+
+  const label = () => {
+    const n = filing.ticked.size;
+    const chosen = filing.area !== KEEP || filing.phase !== KEEP;
+    const go = document.getElementById("fl-go");
+    go.textContent = !S.online ? "Filing needs a connection"
+      : !n ? "Tick the items to file"
+      : !chosen ? "Choose an area or a phase to set"
+      : `File ${n} item${n === 1 ? "" : "s"}`;
+    go.disabled = !S.online || !n || !chosen;
+  };
+  const paint = () => {
+    const found = filingMatches();
+    const shown = found.slice(0, FILING_SHOWN);
+    const tickedHere = found.filter((item) => filing.ticked.has(item.id)).length;
+    document.getElementById("fl-count").textContent =
+      `${found.length} found · ${filing.ticked.size} ticked${filing.ticked.size !== tickedHere ? ` (${tickedHere} of them here)` : ""}`;
+    $results.innerHTML = shown.map((item) => `
+      <label class="pick-row">
+        <input type="checkbox" data-fl-pick="${item.id}" ${filing.ticked.has(item.id) ? "checked" : ""}>
+        <span style="min-width:0">
+          <strong>${esc(item.code)}</strong> ${itemTags(item)}
+          <br><span class="muted">${esc(projectCode.get(item.project_id) || "")} · ${item.total_qty} pcs${item.description ? ` · ${esc(item.description)}` : ""}</span>
+        </span>
+      </label>`).join("")
+      + (found.length > shown.length ? `<p class="muted" style="padding:8px 0">Showing the first ${shown.length} of ${found.length}. Narrow the search to see the rest — "Tick all found" still takes all ${found.length}.</p>` : "")
+      || `<p class="muted" style="padding:8px 0">${filing.onlyTicked ? "Nothing is ticked." : "No items match."}</p>`;
+    label();
+  };
+
+  // One listener for the whole list: it is repainted on every keystroke.
+  $results.onchange = (e) => {
+    const id = e.target?.dataset?.flPick;
+    if (!id) return;
+    if (e.target.checked) filing.ticked.add(id); else filing.ticked.delete(id);
+    // Repainting is cheap and keeps the count, the list and the button honest
+    // together; the box that was ticked keeps its place because the order is
+    // the same.
+    const top = $results.scrollTop;
+    paint();
+    $results.scrollTop = top;
+  };
+  document.getElementById("fl-q").oninput = (e) => { filing.q = e.target.value; paint(); };
+  for (const [id, key] of [["fl-in-area", "inArea"], ["fl-in-phase", "inPhase"]]) {
+    document.getElementById(id).onchange = (e) => { filing[key] = e.target.value; paint(); };
+  }
+  for (const [id, key] of [["fl-area", "area"], ["fl-phase", "phase"]]) {
+    document.getElementById(id).onchange = (e) => { filing[key] = e.target.value; label(); };
+  }
+  document.getElementById("fl-only").onchange = (e) => { filing.onlyTicked = e.target.checked; paint(); };
+  document.getElementById("fl-all").onclick = () => {
+    for (const item of filingMatches()) filing.ticked.add(item.id);
+    paint();
+  };
+  document.getElementById("fl-none").onclick = () => { filing.ticked.clear(); filing.onlyTicked = false; document.getElementById("fl-only").checked = false; paint(); };
+
+  document.getElementById("fl-go").onclick = async () => {
+    const err = document.getElementById("fl-err");
+    err.hidden = true;
+    const ids = [...filing.ticked];
+    if (!ids.length || (filing.area === KEEP && filing.phase === KEEP)) return;
+    const payload = { item_ids: ids };
+    const where = [];
+    for (const [key, list, field, noun] of [["area", "areas", "area_id", "area"], ["phase", "phases", "phase_id", "phase"]]) {
+      if (filing[key] === KEEP) continue;
+      payload[field] = filing[key] === NONE ? null : filing[key];
+      where.push(filing[key] === NONE ? `no ${noun}` : labelRow(list, filing[key])?.name || noun);
+    }
+    if (!confirm(`File ${ids.length} item${ids.length === 1 ? "" : "s"} under ${where.join(" and ")}?`)) return;
+    const go = document.getElementById("fl-go");
+    go.disabled = true;
+    try {
+      const done = await api("/api/items/assign", { method: "POST", body: JSON.stringify(payload) });
+      toast(`${done.updated} item${done.updated === 1 ? "" : "s"} filed under ${where.join(" and ")}`);
+      // Done with this batch: start the next one clean, but keep the search --
+      // the next thing is usually to look at what is left.
+      filing.ticked.clear();
+      filing.onlyTicked = false;
+      filing.area = KEEP;
+      filing.phase = KEEP;
+      dirtyFields.clear();
+      await sync();
+      if (body.isConnected) officeAreas(body);
+    } catch (error) {
+      const detail = error.body?.detail;
+      err.textContent = typeof detail === "string" ? detail
+        : isNetworkError(error) ? "No connection — nothing was changed."
+        : "Could not file the items.";
+      err.hidden = false;
+      label();
+    }
+  };
+
+  paint();
+}
+
 function officeAreas(body) {
-  body.innerHTML = LABEL_LISTS.map(({ list, field, noun, title, blurb, example }) => {
-    const rows = S.ref?.[list] || [];
+  // The whole page is one project's: its areas, its phases, its items.
+  const projects = (S.ref?.projects || []).filter((pr) => pr.is_active !== false);
+  if (!projects.length) {
+    body.innerHTML = `
+    <div class="card">
+      <h2>Areas &amp; phases</h2>
+      <p class="muted">Areas and phases belong to a project, and there is no active project yet.
+      Projects arrive through <a href="#/office/import">Import</a>.</p>
+    </div>`;
+    return;
+  }
+  const stored = sessionStorage.getItem("lb-project");
+  const projectId = projects.some((pr) => pr.id === stored) ? stored : projects[0].id;
+  if (filing.project !== projectId) {
+    // Another job: its items are a different set, and so are its lists.
+    filing.ticked.clear();
+    Object.assign(filing, { project: projectId, inArea: "", inPhase: "", onlyTicked: false, area: KEEP, phase: KEEP });
+  }
+  const project = projects.find((pr) => pr.id === projectId);
+
+  body.innerHTML = `
+    <div class="card">
+      <label for="lb-project" style="margin-top:0">Project</label>
+      <select id="lb-project">
+        ${projects.map((pr) => `<option value="${pr.id}" ${pr.id === projectId ? "selected" : ""}>${esc(pr.code)} — ${esc(pr.name)}</option>`).join("")}
+      </select>
+      <p class="muted" style="margin-top:6px">Each project has its own areas and phases. Everything on
+      this page is ${esc(project.code)}'s.</p>
+    </div>` + filingCard() + LABEL_LISTS.map(({ list, field, noun, title, blurb, example }) => {
+    const rows = (S.ref?.[list] || []).filter((row) => row.project_id === projectId);
     return `
     <div class="card">
-      <h2>${title}</h2>
-      <p class="muted" style="margin-bottom:8px">${blurb} Every item can be filed under one, from the
-      import file or its editor, and the Items list and Reports can be narrowed to it.</p>
+      <h2>${title} of ${esc(project.code)}</h2>
+      <p class="muted" style="margin-bottom:8px">${blurb} Every item of this project can be filed under
+      one, from the import file, its editor or the tool above, and the Items list and Reports can be
+      narrowed to it.</p>
       ${rows.map((row) => {
         const count = S.items.filter((item) => item[field] === row.id).length;
         return `
@@ -2417,7 +2675,11 @@ function officeAreas(body) {
             <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
               <button class="ghost" data-lb-save="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
               <button class="ghost" data-lb-toggle="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${row.is_active ? "Retire" : "Reactivate"}</button>
+              ${count ? "" : `<button class="ghost" data-lb-delete="${list}:${row.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn)" ${S.online ? "" : "disabled"}>Delete</button>`}
             </div>
+            <p class="muted" style="margin-top:6px">${count
+              ? "Retiring takes it off the pickers; the items filed under it stay there."
+              : "Nothing on the floor is filed under it, so it can be deleted outright."}</p>
           </div>
         </details>`;
       }).join("") || `<p class="muted">No ${noun}s yet.</p>`}
@@ -2429,6 +2691,13 @@ function officeAreas(body) {
       <p class="warn-text" data-lb-err="${list}" role="alert" hidden></p>
     </div>`;
   }).join("");
+
+  document.getElementById("lb-project").onchange = (e) => {
+    sessionStorage.setItem("lb-project", e.target.value);
+    dirtyFields.clear();
+    officeAreas(body);
+  };
+  bindFiling(body);
 
   const meta = (list) => LABEL_LISTS.find((entry) => entry.list === list);
   const refuse = (error, fallback) => alert(typeof error.body?.detail === "string" ? error.body.detail : fallback);
@@ -2463,6 +2732,22 @@ function officeAreas(body) {
         row.is_active ? `${row.name} retired` : `${row.name} is back on the list`);
     };
   });
+  body.querySelectorAll("[data-lb-delete]").forEach((button) => {
+    button.onclick = async () => {
+      const [list, id] = button.dataset.lbDelete.split(":");
+      const row = labelRow(list, id);
+      if (!confirm(`Delete ${row.name}? It is removed from ${project.code}'s ${list} for good.`)) return;
+      try {
+        await api(`/api/${list}/${id}`, { method: "DELETE" });
+        toast(`${row.name} deleted`);
+        await sync();
+        if (body.isConnected) officeAreas(body);
+      } catch (error) {
+        // The server counts archived items too, which this phone does not hold.
+        refuse(error, `Could not delete the ${meta(list).noun}.`);
+      }
+    };
+  });
   body.querySelectorAll("[data-lb-add]").forEach((button) => {
     button.onclick = async () => {
       const list = button.dataset.lbAdd;
@@ -2471,9 +2756,12 @@ function officeAreas(body) {
       const name = input.value.trim();
       err.hidden = true;
       if (!name) return;
-      const last = Math.max(0, ...(S.ref?.[list] || []).map((row) => row.sort_order));
+      const last = Math.max(0, ...(S.ref?.[list] || [])
+        .filter((row) => row.project_id === projectId).map((row) => row.sort_order));
       try {
-        await api(`/api/${list}`, { method: "POST", body: JSON.stringify({ name, sort_order: last + 10 }) });
+        await api(`/api/${list}`, {
+          method: "POST", body: JSON.stringify({ project_id: projectId, name, sort_order: last + 10 }),
+        });
         input.value = "";
         dirtyFields.clear();
         toast(`${name} added`);

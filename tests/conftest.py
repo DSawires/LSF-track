@@ -160,11 +160,15 @@ class Factory:
         self.db.flush()
         return stage
 
-    def label(self, model, name: str):
-        """An area or a phase by name, added the way the office would."""
-        row = self.db.scalars(sa.select(model).where(model.name == name)).first()
+    def label(self, model, name: str, project: Project | None = None):
+        """An area or a phase of a project (the fixture's own unless told
+        otherwise), by name, added the way the office would."""
+        project = project or self.project
+        row = self.db.scalars(
+            sa.select(model).where(model.name == name, model.project_id == project.id)
+        ).first()
         if row is None:
-            row = model(name=name)
+            row = model(name=name, project_id=project.id)
             self.db.add(row)
             self.db.flush()
         return row

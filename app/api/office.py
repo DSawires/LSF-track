@@ -152,44 +152,61 @@ def update_station(
 
 # -- areas and phases ---------------------------------------------------------
 #
-# Two lists of the same shape: a name, an order, and whether it is still on
-# offer. An item points at one of each (or neither). They are edited here and
-# can also be created by an import file that names a new one.
+# Two lists of the same shape, kept per project: a name, an order, and whether
+# it is still on offer. An item points at one of each from its own project (or
+# at neither). They are edited here and can also be created by an import file
+# that names a new one.
 
 
 def label_payload(row) -> dict:
     return {
         "id": str(row.id),
+        "project_id": str(row.project_id),
         "name": row.name,
         "sort_order": row.sort_order,
         "is_active": row.is_active,
     }
 
 
-def _name_taken(db: Session, model, name: str, exclude_id: uuid.UUID | None = None) -> bool:
-    # Case-insensitive: "Spa" and "spa" in one filter are the same place twice.
-    query = sa.select(model.id).where(sa.func.lower(model.name) == name.lower())
+def _name_taken(
+    db: Session, model, project_id: uuid.UUID, name: str, exclude_id: uuid.UUID | None = None
+) -> bool:
+    # Within the project, and case-insensitive: "Spa" and "spa" in one filter
+    # are the same place twice. Another project is free to have its own Spa.
+    query = sa.select(model.id).where(
+        model.project_id == project_id, sa.func.lower(model.name) == name.lower()
+    )
     if exclude_id is not None:
         query = query.where(model.id != exclude_id)
     return db.scalars(query.limit(1)).first() is not None
 
 
 def _create_label(db: Session, model, payload: LabelCreate, noun: str) -> dict:
+    project = db.get(Project, payload.project_id)
+    if project is None:
+        raise HTTPException(422, "unknown project")
     name = payload.name.strip()
     if not name:
         raise HTTPException(422, f"the {noun} needs a name")
-    if _name_taken(db, model, name):
-        raise HTTPException(status.HTTP_409_CONFLICT, f"{noun} '{name}' already exists")
-    row = model(name=name, sort_order=payload.sort_order)
+    if _name_taken(db, model, project.id, name):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"{project.code} already has {_a(noun)} {noun} called '{name}'"
+        )
+    row = model(project_id=project.id, name=name, sort_order=payload.sort_order)
     db.add(row)
     db.flush()
     return label_payload(row)
 
 
+def _a(noun: str) -> str:
+    return "an" if noun[0] in "aeiou" else "a"
+
+
 def _update_label(db: Session, model, row_id: uuid.UUID, payload: LabelUpdate, noun: str) -> dict:
     """Rename, reorder or retire. A rename re-labels every item that points at
     the row, which is the point: items reference it by id. Retiring one takes
-    it off the pickers; items already in it keep it."""
+    it off the pickers; items already in it keep it. The project is not
+    editable: an area is a place in one job."""
     row = db.get(model, row_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown {noun}")
@@ -198,8 +215,10 @@ def _update_label(db: Session, model, row_id: uuid.UUID, payload: LabelUpdate, n
         name = (fields["name"] or "").strip()
         if not name:
             raise HTTPException(422, f"the {noun} needs a name")
-        if _name_taken(db, model, name, exclude_id=row.id):
-            raise HTTPException(status.HTTP_409_CONFLICT, f"{noun} '{name}' already exists")
+        if _name_taken(db, model, row.project_id, name, exclude_id=row.id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, f"this project already has {_a(noun)} {noun} called '{name}'"
+            )
         row.name = name
     if fields.get("sort_order") is not None:
         row.sort_order = fields["sort_order"]
@@ -207,6 +226,25 @@ def _update_label(db: Session, model, row_id: uuid.UUID, payload: LabelUpdate, n
         row.is_active = fields["is_active"]
     db.flush()
     return label_payload(row)
+
+
+def _delete_label(db: Session, model, row_id: uuid.UUID, item_column, noun: str) -> dict:
+    """Remove one that nothing is filed under -- a typo, or a name that turned
+    out not to be needed. One that items use is retired instead: deleting it
+    would un-file them without anyone having decided that."""
+    row = db.get(model, row_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown {noun}")
+    in_use = db.scalar(sa.select(sa.func.count()).select_from(Item).where(item_column == row_id))
+    if in_use:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{in_use} item(s) are filed under '{row.name}', archived ones included; "
+            "move them first, or retire it instead",
+        )
+    db.delete(row)
+    db.flush()
+    return {"deleted": True}
 
 
 @router.post("/areas", status_code=status.HTTP_201_CREATED)
@@ -226,6 +264,13 @@ def update_area(
     return _update_label(db, Area, area_id, payload, "area")
 
 
+@router.delete("/areas/{area_id}")
+def delete_area(
+    area_id: uuid.UUID, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+) -> dict:
+    return _delete_label(db, Area, area_id, Item.area_id, "area")
+
+
 @router.post("/phases", status_code=status.HTTP_201_CREATED)
 def create_phase(
     payload: LabelCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
@@ -241,6 +286,13 @@ def update_phase(
     admin: User = Depends(require_admin),
 ) -> dict:
     return _update_label(db, Phase, phase_id, payload, "phase")
+
+
+@router.delete("/phases/{phase_id}")
+def delete_phase(
+    phase_id: uuid.UUID, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+) -> dict:
+    return _delete_label(db, Phase, phase_id, Item.phase_id, "phase")
 
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
