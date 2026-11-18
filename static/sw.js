@@ -110,6 +110,10 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== location.origin) return;
 
+  // A work order's PDF is re-issued under the same URL as its next revision,
+  // and it is a download, not something to show stale in a dead spot.
+  if (url.pathname.endsWith("/pdf")) return;
+
   if (url.pathname.startsWith("/api/images/")) {
     event.respondWith(imageCacheFirst(event.request));
   } else if (url.pathname.startsWith("/api/")) {

@@ -765,3 +765,25 @@ def test_item_editing_is_admin_only(client, factory):
 
     # the admin session still can
     assert client.patch(f"/api/items/{item.id}", json={"code": "RENAMED-1"}).status_code == 200
+
+
+def test_an_item_with_photos_can_be_deleted_for_good(world, client, tmp_path, monkeypatch):
+    """The photo rows must leave before the item does, or the foreign key
+    between them refuses the delete."""
+    monkeypatch.setenv("LSF_UPLOAD_DIR", str(tmp_path / "uploads"))
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    factory, _stages, item = world
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    for kind in ("icon", "snag"):
+        made = client.post(
+            f"/api/items/{item.id}/images", files={"file": ("p.png", png, "image/png")}, data={"kind": kind}
+        )
+        assert made.status_code == 201
+    stored = list((tmp_path / "uploads" / "images").iterdir())
+    assert len(stored) == 2
+
+    gone = client.delete(f"/api/items/{item.id}?purge=true")
+    assert gone.status_code == 200 and gone.json()["deleted"] is True
+    assert list((tmp_path / "uploads" / "images").iterdir()) == []

@@ -178,7 +178,8 @@ Names are indicative; Alembic migrations are authoritative.
   table-driven like stages: no enum, no literal names, nothing branches on
   one. An item can only be filed under its own project's. One that items use
   is retired, not deleted; one nothing is filed under can be deleted
-- `items` — a batch: code, project, area, phase, description, total qty (the
+- `items` — a batch: code, project, area, phase, description, dimensions (free
+  text, never parsed; what a work order prints), total qty (the
   production batch), sample qty, current drawing revision. **An item is
   project + code + area + phase.** The same code can be several items in one
   project — one per area and phase — each with its own quantity, sample and
@@ -192,6 +193,16 @@ Names are indicative; Alembic migrations are authoritative.
   or one at a time from Office → Items. An item has no stages of its own
 - `item_steps` — legacy only (see rule 3): the ordered sequence items used to
   carry. Never written; read to replay entries that point at a step
+- `work_orders`, `work_order_lines` — numbered documents (WO-0001, …)
+  releasing a set of one project's items to production, printed as a PDF.
+  **Paper, not state:** issuing one changes nothing about an item — it was
+  loggable before and is after, there is still no released/unreleased flag —
+  and no report reads these tables. A line keeps its own copy of everything it
+  prints (code, description, dimensions, quantity, area, phase, drawing
+  revision), so editing an item never rewrites a document already issued.
+  Editing a work order re-issues it as the next revision; earlier revisions
+  are not kept. A line outlives its item and its picture (`item_id` and
+  `image_id` go NULL)
 - `events` — the log. See below.
 - `event_types`, `reason_codes` — table-driven vocabularies
 - `event_states` — legacy only (see rule 6); no longer seeded, never written
@@ -313,6 +324,13 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   with its items — each archive is an event, and both can be reactivated.
   Finished jobs should be archived: every active item is replayed by every
   report. Deleting an item for good is rule 1's purge
+- Office → Work orders (any engineer; deleting one is admin-only): pick a
+  project, add its items by search, edit each line's picture, description,
+  dimensions and quantity, switch optional columns on or off, issue. The PDF
+  (`app/services/work_order_pdf.py`, reportlab) is one table with a row per
+  item under the company mark (`static/brand/`). Online-only, like the other
+  office screens. A picture chosen for a line is stored as an item image of
+  kind `document`, which is not the item's icon
 - Office → Status (admin only): per-account last sign-in, last logged entry and
   lifetime entry count, plus the green/yellow/red/neutral banner an admin
   publishes to every non-admin. The banner ships in the reference payload, so

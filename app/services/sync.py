@@ -45,6 +45,7 @@ def items_token(db: Session) -> str:
                 Item.area_id,
                 Item.phase_id,
                 Item.description,
+                Item.dimensions,
                 Item.is_active,
                 Item.total_qty,
                 Item.sample_qty,

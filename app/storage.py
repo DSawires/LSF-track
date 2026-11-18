@@ -37,6 +37,12 @@ class LocalStorage:
             return None
         return FileResponse(path, media_type=media_type)
 
+    def read(self, key: str) -> bytes | None:
+        """The whole object, for the few callers that need the bytes
+        themselves (drawing a picture into a PDF) rather than a response."""
+        path = self.root / key
+        return path.read_bytes() if path.is_file() else None
+
     def list(self, prefix: str) -> list[str]:
         base = self.root / prefix
         if not base.is_dir():
@@ -74,6 +80,13 @@ class S3Storage:
         except self.client.exceptions.NoSuchKey:
             return None
         return StreamingResponse(obj["Body"].iter_chunks(64 * 1024), media_type=media_type)
+
+    def read(self, key: str) -> bytes | None:
+        try:
+            obj = self.client.get_object(Bucket=self.bucket, Key=self._key(key))
+        except self.client.exceptions.NoSuchKey:
+            return None
+        return obj["Body"].read()
 
     def list(self, prefix: str) -> list[str]:
         keys: list[str] = []

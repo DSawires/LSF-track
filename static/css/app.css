@@ -547,3 +547,42 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   padding: 10px 14px 14px;
   border-radius: 0 0 var(--radius) var(--radius);
 }
+
+/* ---- work orders ---------------------------------------------------------- */
+
+/* One line of a work order being written: its picture on the left, what will
+   be printed about it on the right. Stacks on a narrow phone. */
+.wo-line {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 12px 0; border-bottom: 1px solid var(--line);
+}
+.wo-pic { flex: none; width: 96px; display: flex; flex-direction: column; gap: 6px; align-items: stretch; text-align: center; }
+.wo-pic img { width: 96px; height: 72px; object-fit: contain; background: #fff; border-radius: 8px; border: 1px solid var(--line); }
+.wo-pic .muted { font-size: 12px; }
+.wo-pic-btn { width: auto; padding: 6px 4px; font-size: 12px; min-height: 32px; }
+.wo-fields { flex: 1; min-width: 0; }
+.wo-move { width: 34px; min-height: 34px; padding: 0; font-size: 13px; }
+.wo-move:disabled { opacity: .35; }
+.check-row { display: flex; flex-wrap: wrap; }
+@media (max-width: 420px) {
+  .wo-line { flex-direction: column; }
+  .wo-pic { width: 100%; flex-direction: row; align-items: center; }
+}
+
+/* A link, or the label of a hidden file input, that should look and size like
+   a ghost button: a PDF download, "Change" on a picture. */
+a.button-link, label.button-link {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: auto; padding: 8px 16px; min-height: 44px; margin: 0;
+  background: transparent; border: 1px solid var(--line); border-radius: var(--radius);
+  color: var(--muted); font-size: 13px; text-decoration: none; cursor: pointer;
+}
+label.wo-pic-btn { padding: 6px 4px; min-height: 32px; font-size: 12px; }
+
+/* The app had no multi-line fields before work orders; they take the same
+   look as an input. */
+textarea {
+  width: 100%; padding: 13px; font: inherit; color: inherit;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+  resize: vertical;
+}

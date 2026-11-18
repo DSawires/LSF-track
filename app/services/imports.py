@@ -81,6 +81,7 @@ COLUMNS: dict[str, set[str]] = {
     "qty": {"qty", "quantity", "total qty", "batch qty", "production qty"},
     "sample_qty": {"sample", "sample qty", "samples", "sample quantity"},
     "revision": {"revision", "rev", "drawing revision", "drawing rev"},
+    "dimensions": {"dimensions", "dimension", "dims", "size"},
     "area": {"area", "zone", "location"},
     "phase": {"phase", "project phase", "delivery phase"},
 }
@@ -112,6 +113,7 @@ class PlannedItem:
     qty: int
     sample_qty: int
     revision: str
+    dimensions: str = ""
     # As they will be stored: the name on the list (existing spelling wins over
     # the file's), or the file's own spelling for one that is new. "" = none.
     area: str = ""
@@ -165,6 +167,7 @@ class ImportPlan:
                     "qty": i.qty,
                     "sample_qty": i.sample_qty,
                     "revision": i.revision,
+                    "dimensions": i.dimensions,
                     "area": i.area or None,
                     "phase": i.phase or None,
                     "has_picture": i.picture is not None,
@@ -520,6 +523,9 @@ def plan_import(
         description = get(values, "description")
         if len(description) > 255:
             problems.append("description longer than 255 characters")
+        dimensions = get(values, "dimensions")
+        if len(dimensions) > 255:
+            problems.append("dimensions longer than 255 characters")
 
         project = existing_projects.get(project_code) if project_code else None
         if project is not None and not project.is_active:
@@ -553,6 +559,7 @@ def plan_import(
                 qty=qty,
                 sample_qty=sample_qty,
                 revision=revision,
+                dimensions=dimensions,
                 area=area,
                 phase=phase,
                 picture=pictures.get(row),
@@ -679,6 +686,7 @@ def commit_import(db: Session, plan: ImportPlan, user: User) -> None:
                 area_id=area_id,
                 phase_id=phase_id,
                 description=planned.description,
+                dimensions=planned.dimensions or None,
                 total_qty=planned.qty,
                 sample_qty=planned.sample_qty,
                 drawing_revision=planned.revision,
@@ -720,10 +728,13 @@ def template_csv() -> str:
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(
-        ["project", "project name", "client", "item", "description", "qty", "sample qty", "revision",
-         "area", "phase", "picture"]
+        ["project", "project name", "client", "item", "description", "dimensions", "qty",
+         "sample qty", "revision", "area", "phase", "picture"]
     )
     # The last column is only a place to put a picture once the file is saved
     # as .xlsx; a CSV cannot carry one, and whatever is typed there is ignored.
-    writer.writerow(["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", 100, 1, "A", "", "", ""])
+    writer.writerow(
+        ["PRJ-01", "Project name", "Client name", "ITEM-001", "Description", "W 600 x D 450 x H 720 mm",
+         100, 1, "A", "", "", ""]
+    )
     return out.getvalue()

@@ -18,6 +18,7 @@ from app.models import (
     Phase,
     Project,
     User,
+    WorkOrderLine,
 )
 from app.schemas import ItemCreate, ItemsAssign, ItemUpdate, RevisionBumpRequest
 from app.services import reports
@@ -64,6 +65,7 @@ def _item_payload(item: Item, icon_url: str | None = None) -> dict:
         "area_id": str(item.area_id) if item.area_id else None,
         "phase_id": str(item.phase_id) if item.phase_id else None,
         "description": item.description,
+        "dimensions": item.dimensions or "",
         "total_qty": item.total_qty,
         "sample_qty": item.sample_qty,
         "drawing_revision": item.drawing_revision,
@@ -287,6 +289,7 @@ def create_item(
         area_id=payload.area_id,
         phase_id=payload.phase_id,
         description=payload.description.strip(),
+        dimensions=(payload.dimensions or "").strip() or None,
         total_qty=payload.total_qty,
         sample_qty=payload.sample_qty,
         drawing_revision=payload.drawing_revision.strip(),
@@ -448,6 +451,8 @@ def update_item(
 
     if "description" in fields:
         fields["description"] = (fields["description"] or "").strip()
+    if "dimensions" in fields:
+        fields["dimensions"] = (fields["dimensions"] or "").strip() or None
 
     # Project, code, area and phase are what the item is. Changing any of them
     # must not land it on top of another batch.
@@ -579,12 +584,24 @@ def _destroy_item(db: Session, item: Item) -> None:
     """Photos off storage, steps and the row out of the database."""
     from app.storage import get_storage
 
+    # A work order that listed this item keeps the line as it was written --
+    # code, description, quantity -- without the item or its picture behind it.
+    db.execute(
+        sa.update(WorkOrderLine)
+        .where(WorkOrderLine.item_id == item.id)
+        .values(item_id=None, image_id=None)
+        .execution_options(synchronize_session=False)
+    )
     storage = get_storage()
     for image in db.scalars(sa.select(ItemImage).where(ItemImage.item_id == item.id)):
         storage.delete(f"images/{image.id}")
         db.delete(image)
     for step in db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item.id)):
         db.delete(step)
+    # The photo rows go to the database before the item does. Nothing tells the
+    # session that a photo depends on its item, so in one flush it is free to
+    # delete the item first -- and the foreign key refuses that.
+    db.flush()
     db.delete(item)
     db.flush()
 

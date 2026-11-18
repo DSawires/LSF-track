@@ -232,6 +232,9 @@ class Item(Base):
         sa.ForeignKey("phases.id"), nullable=True, index=True
     )
     description: Mapped[str] = mapped_column(sa.String(255))
+    # As the drawing gives them, free text ("W 600 x D 450 x H 720 mm"). Never
+    # parsed. It is what a work order prints in its dimensions column.
+    dimensions: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     # Archived items keep their history but disappear from lists and reports,
     # and can be reactivated. Deleting one for good (an admin purge) takes its
     # events with it.
@@ -280,7 +283,8 @@ class ItemImage(Base):
 
     id: Mapped[uuid.UUID] = _pk()
     item_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("items.id"), index=True)
-    # "snag" (a defect photo) or "icon" (the item's thumbnail; latest wins).
+    # "snag" (a defect photo), "icon" (the item's thumbnail; latest wins), or
+    # "document" (a picture put on a work order in place of the icon).
     kind: Mapped[str] = mapped_column(sa.String(16), default="snag", server_default="snag")
     filename: Mapped[str] = mapped_column(sa.String(255))
     content_type: Mapped[str] = mapped_column(sa.String(64))
@@ -288,6 +292,74 @@ class ItemImage(Base):
     uploaded_by_user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"))
     uploaded_at: Mapped[datetime] = mapped_column(default=utcnow)
     note: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+
+
+class WorkOrder(Base):
+    """A numbered document releasing a set of one project's items to production.
+
+    A document, not a state. Issuing one changes nothing about an item: it is
+    loggable the moment it exists, with or without a work order, and no report
+    reads this table. What it holds is what was put on paper -- so its lines
+    carry their own copy of each item's text (see `WorkOrderLine`), and editing
+    an item afterwards never rewrites a work order already on the floor.
+
+    Editing a work order re-issues it: `revision` goes up and `issued_at` /
+    `issued_by_user_id` are stamped again. Earlier revisions are not kept here;
+    the printed PDF carries its revision number.
+    """
+
+    __tablename__ = "work_orders"
+
+    id: Mapped[uuid.UUID] = _pk()
+    # WO-0001, WO-0002, ... across the factory.
+    number: Mapped[int] = mapped_column(sa.Integer, unique=True, index=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("projects.id"), index=True)
+    title: Mapped[str] = mapped_column(sa.String(160), default="")
+    notes: Mapped[str] = mapped_column(sa.Text, default="")
+    revision: Mapped[int] = mapped_column(sa.Integer, default=1)
+    # Which optional columns the document prints.
+    show_picture: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    show_description: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    show_dimensions: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    show_location: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    issued_at: Mapped[datetime] = mapped_column(default=utcnow)
+    issued_by_user_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+    lines: Mapped[list[WorkOrderLine]] = relationship(
+        order_by="WorkOrderLine.seq", cascade="all, delete-orphan"
+    )
+
+
+class WorkOrderLine(Base):
+    """One item on a work order, as it was written there.
+
+    Everything printed is copied onto the line when it is saved -- code, area,
+    phase, drawing revision -- or typed for it: description, dimensions and
+    quantity start from the item's and can be changed for this document alone.
+    `item_id` and `image_id` are kept so the line can be reopened against its
+    item and its picture, and both may go: an item deleted for good, or a
+    photo removed, leaves the line with its text and no link.
+    """
+
+    __tablename__ = "work_order_lines"
+
+    id: Mapped[uuid.UUID] = _pk()
+    work_order_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("work_orders.id"), index=True)
+    seq: Mapped[int] = mapped_column(sa.Integer)
+    item_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("items.id"), nullable=True, index=True
+    )
+    image_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("item_images.id"), nullable=True, index=True
+    )
+    code: Mapped[str] = mapped_column(sa.String(64))
+    description: Mapped[str] = mapped_column(sa.Text, default="")
+    dimensions: Mapped[str] = mapped_column(sa.String(255), default="")
+    qty: Mapped[int] = mapped_column(sa.Integer)
+    area: Mapped[str] = mapped_column(sa.String(120), default="")
+    phase: Mapped[str] = mapped_column(sa.String(120), default="")
+    drawing_revision: Mapped[str] = mapped_column(sa.String(32), default="")
 
 
 class Event(Base):

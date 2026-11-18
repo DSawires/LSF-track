@@ -1670,6 +1670,7 @@ const OFFICE_SECTIONS = [
   { key: "items", label: "Items" },
   { key: "projects", label: "Projects" },
   { key: "stages", label: "Stages", admin: true },
+  { key: "workorders", label: "Work orders" },
   { key: "areas", label: "Areas & phases", admin: true },
   { key: "users", label: "Users", admin: true },
   { key: "status", label: "Status", admin: true },
@@ -1692,6 +1693,7 @@ function viewOffice(section) {
     items: officeItems,
     projects: officeProjects,
     stages: officeStages,
+    workorders: officeWorkOrders,
     areas: officeAreas,
     users: officeUsers,
     status: officeStatus,
@@ -1754,6 +1756,7 @@ function officeImport(body) {
           <tr><td>area, phase</td><td>Optional. Which part of the job, and which phase of it, the batch is
             for. Each project has its own; a name it does not have yet is added to it.</td></tr>
           <tr><td>description</td><td>Optional.</td></tr>
+          <tr><td>dimensions</td><td>Optional, as the drawing gives them. Printed on work orders.</td></tr>
           <tr><td><strong>qty</strong></td><td>The production batch.</td></tr>
           <tr><td>sample qty</td><td>Optional, default 1. Built first; 0 for no sample.</td></tr>
           <tr><td>revision</td><td>Optional drawing revision, default A.</td></tr>
@@ -1892,6 +1895,8 @@ function officeItems(body) {
         </div>
         <label for="ni-desc">Description</label>
         <input id="ni-desc" maxlength="255" autocomplete="off">
+        <label for="ni-dims">Dimensions</label>
+        <input id="ni-dims" maxlength="255" autocomplete="off" placeholder="e.g. W 600 x D 450 x H 720 mm">
         <div class="field-grid" id="ni-labels">${newItemLabels(projects.some((p) => p.id === remembered) ? remembered : projects[0].id)}</div>
         <p class="muted" style="margin-top:6px">Optional, and from the project's own lists. The same code can
         be added again for another area or phase — each is its own batch.</p>
@@ -1950,6 +1955,7 @@ function officeItems(body) {
             project_id: value("ni-project"),
             code,
             description: value("ni-desc"),
+            dimensions: value("ni-dims"),
             area_id: value("ni-area") || null,
             phase_id: value("ni-phase") || null,
             total_qty: qty,
@@ -1960,7 +1966,7 @@ function officeItems(body) {
         toast(`${itemName(created)} added — it is on the Items list now`);
         // Clear what was typed, but not the project: the next one is usually
         // for the same job.
-        for (const id of ["ni-code", "ni-desc", "ni-qty", "ni-sample", "ni-rev"]) {
+        for (const id of ["ni-code", "ni-desc", "ni-dims", "ni-qty", "ni-sample", "ni-rev"]) {
           document.getElementById(id).value = "";
         }
         dirtyFields.clear();
@@ -2126,6 +2132,9 @@ async function loadItemEditors() {
         </div>
         <label>Description</label>
         <input data-it-desc="${item.id}" value="${esc(item.description)}" ${isAdmin ? "" : "disabled"}>
+        <label>Dimensions</label>
+        <input data-it-dims="${item.id}" maxlength="255" value="${esc(item.dimensions || "")}"
+               placeholder="e.g. W 600 x D 450 x H 720 mm" ${isAdmin ? "" : "disabled"}>
         ${projectField(item)}
         <div class="field-grid" data-it-labels="${item.id}">${editorLabels(item, item.project_id)}</div>
         ${isAdmin ? `
@@ -2197,6 +2206,7 @@ async function loadItemEditors() {
       const body = {
         code,
         description: field("data-it-desc", id).value.trim(),
+        dimensions: field("data-it-dims", id).value.trim(),
         total_qty: Number(field("data-it-qty", id).value) || byId.get(id).total_qty,
         area_id: field("data-it-area", id).value || null,
         phase_id: field("data-it-phase", id).value || null,
@@ -2772,6 +2782,435 @@ function officeAreas(body) {
       }
     };
   });
+}
+
+/* ---------------------------------------------------- office: work orders -- */
+
+/* A work order is a numbered document releasing a set of one project's items
+   to production, printed as a PDF: one table, a row per item. It is paper, not
+   state -- issuing one changes nothing about its items.
+
+   The draft being written lives here, not in the DOM: it is a long form, and a
+   background sync re-renders the Office view every thirty seconds. Every
+   keystroke lands in this object, and the screen is always drawn from it. */
+const workOrders = {
+  project: "",          // whose work orders the page is showing
+  list: null,           // the saved ones for that project, or null while loading
+  listFor: null,
+  draft: null,          // the one being written, or null for the list
+  q: "", inArea: "", inPhase: "",   // the "add items" search
+  issued: null,         // the one just saved, to offer its PDF
+};
+let workOrderKey = 0;
+
+/* The column switches, in the order the PDF prints them. */
+const WO_COLUMNS = [
+  ["show_picture", "Pictures"],
+  ["show_description", "Description"],
+  ["show_dimensions", "Dimensions"],
+  ["show_location", "Area & phase"],
+];
+
+/* An item's picture, as an image id: its icon URL ends in one. */
+const iconId = (item) => (item?.icon_url ? item.icon_url.split("/").pop() : null);
+
+/* A new line starts as a copy of the item. From here on it is the work
+   order's own text: changing it does not touch the item, and changing the item
+   later does not touch a work order already issued. */
+function workOrderLine(item) {
+  return {
+    key: `new${++workOrderKey}`, id: null, item_id: item.id,
+    code: item.code, area: areaName(item), phase: phaseName(item), drawing_revision: item.drawing_revision,
+    description: item.description || "", dimensions: item.dimensions || "", qty: item.total_qty,
+    image_id: iconId(item), image_url: item.icon_url || null,
+  };
+}
+
+function workOrderDraft(saved, projectId) {
+  if (!saved) {
+    return { id: null, label: null, revision: 0, project_id: projectId, title: "", notes: "",
+      show_picture: true, show_description: true, show_dimensions: true, show_location: true, lines: [] };
+  }
+  return { ...saved, lines: saved.lines.map((line) => ({ ...line, key: line.id })) };
+}
+
+/* The project's items that are not on the draft yet and match the search. */
+function workOrderCandidates() {
+  const taken = new Set(workOrders.draft.lines.map((line) => line.item_id));
+  const matches = filingMatcher(workOrders.q);
+  return S.items.filter((item) =>
+    item.project_id === workOrders.draft.project_id
+    && !taken.has(item.id)
+    && matchesLabel(item, "area_id", workOrders.inArea)
+    && matchesLabel(item, "phase_id", workOrders.inPhase)
+    && matches(item));
+}
+
+function officeWorkOrders(body) {
+  const projects = (S.ref?.projects || []).filter((pr) => pr.is_active !== false);
+  if (!projects.length) {
+    body.innerHTML = `
+    <div class="card">
+      <h2>Work orders</h2>
+      <p class="muted">A work order releases a project's items to production, and there is no active
+      project yet. Projects arrive through <a href="#/office/import">Import</a>.</p>
+    </div>`;
+    return;
+  }
+  if (workOrders.draft) { workOrderEditor(body, projects); return; }
+
+  const stored = sessionStorage.getItem("wo-project");
+  if (!projects.some((pr) => pr.id === workOrders.project)) {
+    workOrders.project = projects.some((pr) => pr.id === stored) ? stored : projects[0].id;
+  }
+  const project = projects.find((pr) => pr.id === workOrders.project);
+  const issued = workOrders.issued;
+
+  body.innerHTML = `
+    <div class="card">
+      <h2>Work orders</h2>
+      <p class="muted" style="margin-bottom:8px">A numbered document releasing a set of a project's items
+      to production, as a PDF with one row per item. It is a record of what was released: issuing one
+      changes nothing about the items themselves.</p>
+      <label for="wo-project">Project</label>
+      <select id="wo-project">
+        ${projects.map((pr) => `<option value="${pr.id}" ${pr.id === workOrders.project ? "selected" : ""}>${esc(pr.code)} — ${esc(pr.name)}</option>`).join("")}
+      </select>
+      <div style="height:10px"></div>
+      <button class="primary" id="wo-new" ${S.online ? "" : "disabled"}>${S.online ? `New work order for ${esc(project.code)}` : "Work orders need a connection"}</button>
+      ${issued ? `
+      <p style="margin-top:10px"><strong>${esc(issued.label)} Rev ${issued.revision}</strong> is issued.
+        <a href="${issued.pdf_url}" download>Download the PDF</a></p>` : ""}
+    </div>
+    <div class="card">
+      <h2>Issued for ${esc(project.code)}</h2>
+      <div id="wo-list" class="muted">Loading…</div>
+    </div>`;
+
+  document.getElementById("wo-project").onchange = (e) => {
+    workOrders.project = e.target.value;
+    workOrders.issued = null;
+    sessionStorage.setItem("wo-project", e.target.value);
+    officeWorkOrders(body);
+  };
+  document.getElementById("wo-new").onclick = () => {
+    Object.assign(workOrders, { draft: workOrderDraft(null, workOrders.project), q: "", inArea: "", inPhase: "", issued: null });
+    dirtyFields.clear();
+    officeWorkOrders(body);
+  };
+
+  const paint = () => {
+    const target = document.getElementById("wo-list");
+    if (!target || workOrders.listFor !== workOrders.project || !workOrders.list) return;
+    target.classList.remove("muted");
+    target.innerHTML = workOrders.list.map((row) => `
+      <div style="padding:8px 0;border-bottom:1px solid var(--line)">
+        <div class="spread">
+          <strong>${esc(row.label)} · Rev ${row.revision}</strong>
+          <span class="muted">${new Date(row.issued_at).toLocaleDateString()}</span>
+        </div>
+        ${row.title ? `<div>${esc(row.title)}</div>` : ""}
+        <div class="muted">${row.line_count} item${row.line_count === 1 ? "" : "s"} · ${row.total_qty} pcs · issued by ${esc(row.issued_by || "?")}</div>
+        <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+          <a class="ghost button-link" href="${row.pdf_url}" download>Download PDF</a>
+          <button class="ghost" data-wo-open="${row.id}" style="width:auto;padding:8px 16px" ${S.online ? "" : "disabled"}>Open</button>
+        </div>
+      </div>`).join("") || `<span class="muted">No work orders issued for this project yet.</span>`;
+    target.querySelectorAll("[data-wo-open]").forEach((button) => {
+      button.onclick = async () => {
+        try {
+          const saved = await api(`/api/work-orders/${button.dataset.woOpen}`);
+          Object.assign(workOrders, { draft: workOrderDraft(saved), q: "", inArea: "", inPhase: "", issued: null });
+          dirtyFields.clear();
+          if (body.isConnected) officeWorkOrders(body);
+        } catch (error) {
+          alert(error.body?.detail || "Could not open the work order.");
+        }
+      };
+    });
+  };
+  paint(); // what is already known, at once; then the server's word on it
+  const asked = workOrders.project;
+  api(`/api/work-orders?project_id=${asked}`).then(({ work_orders }) => {
+    if (workOrders.project !== asked) return;
+    workOrders.list = work_orders;
+    workOrders.listFor = asked;
+    paint();
+  }).catch(() => {
+    const target = document.getElementById("wo-list");
+    if (target && !(workOrders.listFor === asked && workOrders.list)) {
+      target.textContent = "Work orders need a connection.";
+    }
+  });
+}
+
+function workOrderEditor(body, projects) {
+  const draft = workOrders.draft;
+  const project = (S.ref?.projects || []).find((pr) => pr.id === draft.project_id);
+  const isAdmin = !!S.user?.is_admin;
+  const own = (list) => (S.ref?.[list] || []).filter((row) => row.project_id === draft.project_id);
+  const inPicker = (list, picked, any, none) => `
+        <option value="">${any}</option>
+        <option value="${NONE}" ${picked === NONE ? "selected" : ""}>${none}</option>
+        ${own(list).map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}</option>`).join("")}`;
+
+  body.innerHTML = `
+    <div class="card">
+      <div class="spread">
+        <h2>${draft.id ? `${esc(draft.label)} · Rev ${draft.revision}` : "New work order"}</h2>
+        <span class="badge">${esc(project?.code || "")}</span>
+      </div>
+      <p class="muted" style="margin-bottom:8px">${draft.id
+        ? `Saving re-issues it as Rev ${draft.revision + 1}, with today's date and your name.`
+        : "It gets its number when it is issued."} What is written here is the work order's own:
+        it does not change the items, and later changes to the items do not change it.</p>
+      <label for="wo-title">Title</label>
+      <input id="wo-title" maxlength="160" value="${esc(draft.title)}" placeholder="e.g. Guest rooms — first release">
+      <label for="wo-notes">Notes</label>
+      <textarea id="wo-notes" maxlength="4000" rows="3" placeholder="Finishes, packing, anything production should read first">${esc(draft.notes)}</textarea>
+      <label>Columns on the PDF</label>
+      <div class="check-row">
+        ${WO_COLUMNS.map(([key, name]) => `
+        <label class="pick-row" style="border:0;min-height:0;padding:4px 14px 4px 0">
+          <input type="checkbox" data-wo-col="${key}" ${draft[key] ? "checked" : ""}><span>${name}</span>
+        </label>`).join("")}
+      </div>
+      <p class="muted">Code, drawing revision and quantity are always printed.</p>
+    </div>
+
+    <div class="card">
+      <h2>Items on it <span class="muted" id="wo-count"></span></h2>
+      <div id="wo-lines"></div>
+    </div>
+
+    <div class="card">
+      <h2>Add items</h2>
+      <input id="wo-q" type="search" value="${esc(workOrders.q)}" style="margin-bottom:8px"
+             placeholder="Search — several at once with commas: bed base, LF-03">
+      <div class="filters">
+        <select id="wo-in-area" aria-label="In area">${inPicker("areas", workOrders.inArea, "In any area", "In no area")}</select>
+        <select id="wo-in-phase" aria-label="In phase">${inPicker("phases", workOrders.inPhase, "In any phase", "In no phase")}</select>
+      </div>
+      <div class="spread" style="margin-bottom:6px;flex-wrap:wrap;gap:8px">
+        <span class="muted" id="wo-found"></span>
+        <button class="ghost" id="wo-add-all" style="width:auto;padding:8px 14px">Add all found</button>
+      </div>
+      <div id="wo-results" class="pick-list"></div>
+    </div>
+
+    <div class="card">
+      <div class="action-sticky">
+        <button class="primary" id="wo-save"></button>
+      </div>
+      <p class="warn-text" id="wo-err" role="alert" hidden></p>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="ghost" id="wo-cancel" style="width:auto;padding:10px 16px">${draft.id ? "Close without saving" : "Discard"}</button>
+        ${draft.id ? `<a class="ghost button-link" href="/api/work-orders/${draft.id}/pdf" download>Download Rev ${draft.revision} PDF</a>` : ""}
+        ${draft.id && isAdmin ? `<button class="ghost" id="wo-delete" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn)" ${S.online ? "" : "disabled"}>Delete work order</button>` : ""}
+      </div>
+    </div>`;
+
+  const $lines = document.getElementById("wo-lines");
+  const $results = document.getElementById("wo-results");
+  const projectCode = project?.code || "";
+
+  const saveLabel = () => {
+    const n = draft.lines.length;
+    const pieces = draft.lines.reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
+    document.getElementById("wo-count").textContent = n ? `(${n} · ${pieces} pcs)` : "";
+    const go = document.getElementById("wo-save");
+    go.textContent = !S.online ? "Issuing needs a connection"
+      : !n ? "Add the items to release"
+      : draft.id ? `Re-issue as Rev ${draft.revision + 1}` : `Issue work order (${n} item${n === 1 ? "" : "s"})`;
+    go.disabled = !S.online || !n;
+  };
+
+  const paintLines = () => {
+    $lines.innerHTML = draft.lines.map((line, index) => `
+      <div class="wo-line" data-wo-line="${line.key}">
+        <div class="wo-pic">
+          ${line.image_url ? `<img src="${line.image_url}" alt="">` : `<span class="muted">No picture</span>`}
+          ${line.item_id ? `
+          <label class="ghost button-link wo-pic-btn">Change
+            <input type="file" accept="image/*" data-wo-pic="${line.key}" hidden ${S.online ? "" : "disabled"}>
+          </label>` : ""}
+          ${line.image_id ? `<button class="ghost wo-pic-btn" data-wo-nopic="${line.key}">Remove</button>` : ""}
+          <span class="muted" data-wo-picmsg="${line.key}" hidden></span>
+        </div>
+        <div class="wo-fields">
+          <div class="spread">
+            <span><strong>${esc(line.code)}</strong> ${[line.area, line.phase].filter(Boolean).map((t) => `<span class="badge tag">${esc(t)}</span>`).join(" ")}
+              <span class="muted">rev ${esc(line.drawing_revision)}</span>${line.item_id ? "" : ` <span class="badge">item deleted</span>`}</span>
+            <span style="white-space:nowrap">
+              <button class="ghost wo-move" data-wo-up="${line.key}" aria-label="Move up" ${index ? "" : "disabled"}>▲</button>
+              <button class="ghost wo-move" data-wo-down="${line.key}" aria-label="Move down" ${index < draft.lines.length - 1 ? "" : "disabled"}>▼</button>
+              <button class="ghost wo-move" data-wo-drop="${line.key}" aria-label="Take off the work order">✕</button>
+            </span>
+          </div>
+          <label>Description</label>
+          <textarea data-wo-desc="${line.key}" maxlength="2000" rows="2">${esc(line.description)}</textarea>
+          <div class="field-grid">
+            <div><label>Dimensions</label><input data-wo-dims="${line.key}" maxlength="255" value="${esc(line.dimensions)}"></div>
+            <div><label>Quantity</label><input data-wo-qty="${line.key}" type="number" inputmode="numeric" min="1" value="${esc(line.qty)}"></div>
+          </div>
+        </div>
+      </div>`).join("") || `<p class="muted">Nothing on it yet. Find the items below and add them.</p>`;
+    saveLabel();
+  };
+
+  const paintResults = () => {
+    const found = workOrderCandidates();
+    const shown = found.slice(0, 100);
+    document.getElementById("wo-found").textContent = `${found.length} found`;
+    document.getElementById("wo-add-all").disabled = !found.length;
+    $results.innerHTML = shown.map((item) => `
+      <div class="pick-row" style="cursor:default">
+        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
+        <span style="min-width:0;flex:1">
+          <strong>${esc(item.code)}</strong> ${itemTags(item)}
+          <br><span class="muted">${item.total_qty} pcs${item.description ? ` · ${esc(item.description)}` : ""}</span>
+        </span>
+        <button class="ghost" data-wo-add="${item.id}" style="width:auto;padding:8px 14px;flex:none">Add</button>
+      </div>`).join("")
+      + (found.length > shown.length ? `<p class="muted" style="padding:8px 0">Showing the first ${shown.length} of ${found.length}. "Add all found" takes all ${found.length}.</p>` : "")
+      || `<p class="muted" style="padding:8px 0">${S.items.some((i) => i.project_id === draft.project_id) ? "Nothing more to add matches." : `${esc(projectCode)} has no items yet.`}</p>`;
+  };
+
+  const line = (key) => draft.lines.find((entry) => entry.key === key);
+
+  // One listener each for the whole list of lines: it is repainted whenever
+  // its shape changes, and typing must never cause that.
+  $lines.oninput = (e) => {
+    const data = e.target.dataset || {};
+    if (data.woDesc) line(data.woDesc).description = e.target.value;
+    else if (data.woDims) line(data.woDims).dimensions = e.target.value;
+    else if (data.woQty) { line(data.woQty).qty = e.target.value; saveLabel(); }
+  };
+  $lines.onclick = (e) => {
+    const data = e.target.dataset || {};
+    const key = data.woUp || data.woDown || data.woDrop || data.woNopic;
+    if (!key) return;
+    const at = draft.lines.findIndex((entry) => entry.key === key);
+    if (data.woNopic) Object.assign(draft.lines[at], { image_id: null, image_url: null });
+    else if (data.woDrop) draft.lines.splice(at, 1);
+    else {
+      const to = at + (data.woUp ? -1 : 1);
+      if (to < 0 || to >= draft.lines.length) return;
+      [draft.lines[at], draft.lines[to]] = [draft.lines[to], draft.lines[at]];
+    }
+    paintLines();
+    if (data.woDrop) paintResults(); // it is available to add again
+  };
+  // A picture chosen here is for the document: stored with the item, but not
+  // as its icon, so the item list keeps the picture it had.
+  $lines.onchange = async (e) => {
+    const key = e.target.dataset?.woPic;
+    const file = e.target.files?.[0];
+    if (!key || !file) return;
+    const target = line(key);
+    const message = $lines.querySelector(`[data-wo-picmsg="${key}"]`);
+    const say = (text, warn) => { if (message) { message.hidden = false; message.className = warn ? "warn-text" : "muted"; message.textContent = text; } };
+    say("Uploading…");
+    try {
+      const image = await uploadImage(target.item_id, file, {
+        kind: "document",
+        onProgress: (fraction) => say(`Uploading… ${Math.round(fraction * 100)}%`),
+      });
+      Object.assign(target, { image_id: image.id, image_url: image.url });
+      paintLines();
+    } catch (error) {
+      say(error.detail || "Upload failed.", true);
+    }
+  };
+
+  $results.onclick = (e) => {
+    const id = e.target.dataset?.woAdd;
+    const item = id && S.items.find((entry) => entry.id === id);
+    if (!item) return;
+    draft.lines.push(workOrderLine(item));
+    paintLines();
+    paintResults();
+  };
+  document.getElementById("wo-add-all").onclick = () => {
+    for (const item of workOrderCandidates()) draft.lines.push(workOrderLine(item));
+    paintLines();
+    paintResults();
+  };
+  document.getElementById("wo-q").oninput = (e) => { workOrders.q = e.target.value; paintResults(); };
+  document.getElementById("wo-in-area").onchange = (e) => { workOrders.inArea = e.target.value; paintResults(); };
+  document.getElementById("wo-in-phase").onchange = (e) => { workOrders.inPhase = e.target.value; paintResults(); };
+  document.getElementById("wo-title").oninput = (e) => { draft.title = e.target.value; };
+  document.getElementById("wo-notes").oninput = (e) => { draft.notes = e.target.value; };
+  body.querySelectorAll("[data-wo-col]").forEach((box) => {
+    box.onchange = () => { draft[box.dataset.woCol] = box.checked; };
+  });
+
+  const leave = () => {
+    workOrders.draft = null;
+    workOrders.list = null; // ask again: it has just changed
+    dirtyFields.clear();
+    if (body.isConnected) officeWorkOrders(body);
+  };
+  document.getElementById("wo-cancel").onclick = () => {
+    const touched = draft.lines.length || draft.title || draft.notes;
+    if (touched && !confirm(draft.id ? "Close without saving your changes?" : "Discard this work order?")) return;
+    leave();
+  };
+  const remove = document.getElementById("wo-delete");
+  if (remove) remove.onclick = async () => {
+    if (!confirm(`Delete ${draft.label}? The record goes for good. Its items are not touched.`)) return;
+    try {
+      await api(`/api/work-orders/${draft.id}`, { method: "DELETE" });
+      toast(`${draft.label} deleted`);
+      leave();
+    } catch (error) {
+      alert(error.body?.detail || "Could not delete the work order.");
+    }
+  };
+
+  document.getElementById("wo-save").onclick = async () => {
+    const err = document.getElementById("wo-err");
+    const fail = (text) => { err.textContent = text; err.hidden = false; };
+    err.hidden = true;
+    if (!draft.lines.length) return;
+    const bad = draft.lines.find((entry) => !Number.isInteger(Number(entry.qty)) || Number(entry.qty) < 1 || String(entry.qty).trim() === "");
+    if (bad) return fail(`${bad.code}: the quantity must be a whole number, 1 or more.`);
+    const payload = {
+      project_id: draft.project_id,
+      title: draft.title.trim(),
+      notes: draft.notes.trim(),
+      ...Object.fromEntries(WO_COLUMNS.map(([key]) => [key, !!draft[key]])),
+      lines: draft.lines.map((entry) => ({
+        ...(entry.id ? { id: entry.id } : {}),
+        item_id: entry.item_id,
+        image_id: entry.image_id,
+        description: entry.description.trim(),
+        dimensions: entry.dimensions.trim(),
+        qty: Number(entry.qty),
+      })),
+    };
+    const go = document.getElementById("wo-save");
+    go.disabled = true;
+    try {
+      const saved = await api(draft.id ? `/api/work-orders/${draft.id}` : "/api/work-orders", {
+        method: draft.id ? "PUT" : "POST", body: JSON.stringify(payload),
+      });
+      toast(`${saved.label} Rev ${saved.revision} issued`);
+      workOrders.issued = saved;
+      workOrders.project = saved.project_id;
+      leave();
+    } catch (error) {
+      const detail = error.body?.detail;
+      fail(typeof detail === "string" ? detail
+        : Array.isArray(detail) ? rejectReason(error)
+        : isNetworkError(error) ? "No connection — the work order was not issued."
+        : "Could not issue the work order.");
+      saveLabel();
+    }
+  };
+
+  paintLines();
+  paintResults();
 }
 
 /* --------------------------------------------------------- office: stages -- */

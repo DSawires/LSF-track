@@ -72,6 +72,8 @@ class ItemCreate(BaseModel):
     # Units built first, before the batch is released. 0 = no sample.
     sample_qty: int = Field(default=1, ge=0, le=1_000)
     drawing_revision: str = Field(default="A", min_length=1, max_length=32)
+    # Free text, as the drawing gives them. Printed on work orders.
+    dimensions: str | None = Field(default=None, max_length=255)
     # Which part of the job, and which phase of it, this batch is for. Both
     # optional. With project and code they are what the item is: the same code
     # can be created again for another area or phase.
@@ -91,11 +93,38 @@ class ItemUpdate(BaseModel):
     project_id: uuid.UUID | None = None
     description: str | None = Field(default=None, max_length=255)
     total_qty: int | None = Field(default=None, gt=0, le=1_000_000)
+    dimensions: str | None = Field(default=None, max_length=255)
     # Sent as null to clear; left out to leave alone.
     area_id: uuid.UUID | None = None
     phase_id: uuid.UUID | None = None
     # `true` brings an archived item back. Archiving is DELETE, not this.
     is_active: bool | None = None
+
+
+class WorkOrderLineIn(BaseModel):
+    """One row of a work order as the office wrote it."""
+
+    # The existing line being kept, when re-issuing. Lets a line whose item has
+    # since been deleted stay on the document.
+    id: uuid.UUID | None = None
+    item_id: uuid.UUID | None = None
+    # One of that item's pictures, or null for none.
+    image_id: uuid.UUID | None = None
+    description: str = Field(default="", max_length=2000)
+    dimensions: str = Field(default="", max_length=255)
+    qty: int = Field(ge=1, le=1_000_000)
+
+
+class WorkOrderSave(BaseModel):
+    project_id: uuid.UUID
+    title: str = Field(default="", max_length=160)
+    notes: str = Field(default="", max_length=4000)
+    # Which optional columns the PDF prints.
+    show_picture: bool = True
+    show_description: bool = True
+    show_dimensions: bool = True
+    show_location: bool = True
+    lines: list[WorkOrderLineIn] = Field(min_length=1, max_length=500)
 
 
 class ItemsAssign(BaseModel):

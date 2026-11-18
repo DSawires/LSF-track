@@ -203,7 +203,8 @@ UI survive restarts.
 | HOTEL-B | Grand Hotel | Acme | BST-1 | Bedside table | 120 | 1 | A | Guest rooms | Phase 1 |
 | HOTEL-B | | | BST-1 | Bedside table | 60 | 1 | A | Guest rooms | Phase 2 |
 
-`project`, `item` and `qty` are required. `area` and `phase` are optional:
+`project`, `item` and `qty` are required. `dimensions` is optional free text
+(it is what a work order prints). `area` and `phase` are optional:
 which part of the job, and which phase of it, the batch is for. The same item
 code may appear on several rows as long as each has a different area or phase
 — those are separate batches. Each project has its own areas and phases: a
@@ -260,6 +261,30 @@ per phase.
   progress / finished); **Reports** narrow WIP and aging to an area and a
   phase. Wherever an item is shown, its area and phase are shown with its
   code.
+
+## Work orders
+
+**Office → Work orders.** A work order is a numbered document (WO-0001, …)
+releasing a set of one project's items to production, downloaded as a PDF: the
+company mark, the project and client, then one table with a row per item —
+picture, code, description, dimensions, area and phase, drawing revision,
+quantity — followed by notes and signature lines.
+
+- Pick the project, find its items by search and add them. Each line starts
+  as a copy of the item and can be changed for this document: the picture
+  (swap or leave off), the description, the dimensions, the quantity, the
+  order. The picture, description, dimensions and area/phase columns can each
+  be switched off.
+- What is written on a work order is its own. It does not change the items,
+  and later edits to an item do not change a work order already issued.
+- Opening one and saving it re-issues it as the next revision, with the date
+  and your name. Earlier revisions are not kept in the tracker; the PDF
+  carries its revision number.
+- It is a record, not a gate: an item can be logged with or without one.
+- Dimensions are a field on the item (import column `dimensions`, or the item
+  editor), so they are typed once and prefill every work order.
+- The PDF uses the standard fonts, which cover Western European text only;
+  anything else (Arabic, for instance) prints as `?`.
 
 ## Logging
 

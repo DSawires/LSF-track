@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import get_db
 from app.deps import current_user, require_admin
-from app.models import Item, ItemImage, User
+from app.models import Item, ItemImage, User, WorkOrderLine
 from app.schemas import ImageNoteUpdate
 from app.services.images import image_key as _image_key
 from app.services.images import sniff as _sniff
@@ -31,7 +31,9 @@ from app.storage import get_storage
 
 router = APIRouter(prefix="/api", tags=["images"])
 
-_KINDS = {"snag", "icon"}
+# snag: a defect photo. icon: the item's thumbnail (latest wins). document: a
+# picture chosen for a work order instead of the icon -- it does not replace it.
+_KINDS = {"snag", "icon", "document"}
 
 
 def _image_payload(image: ItemImage) -> dict:
@@ -160,6 +162,13 @@ def delete_image(
     image = db.get(ItemImage, image_id)
     if image is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown image")
+    # A work order that printed this picture keeps its line and loses the picture.
+    db.execute(
+        sa.update(WorkOrderLine)
+        .where(WorkOrderLine.image_id == image.id)
+        .values(image_id=None)
+        .execution_options(synchronize_session=False)
+    )
     get_storage().delete(_image_key(image.id))
     db.delete(image)
     db.flush()

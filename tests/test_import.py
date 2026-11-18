@@ -148,7 +148,8 @@ def test_template_is_a_header_and_an_example_that_imports(client, factory):
     assert response.status_code == 200
     header = response.text.splitlines()[0]
     assert header == (
-        "project,project name,client,item,description,qty,sample qty,revision,area,phase,picture"
+        "project,project name,client,item,description,dimensions,qty,sample qty,revision,"
+        "area,phase,picture"
     )
     # The template parses cleanly as an import, with nothing skipped.
     body = _post(client, response.text).json()
