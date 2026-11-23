@@ -261,7 +261,12 @@ per phase.
   progress / finished); **Reports** narrow WIP and aging to an area and a
   phase. Wherever an item is shown, its area and phase are shown with its
   code.
-- **Splitting a batch across phases.** In an item's editor (Office → Items,
+- **Splitting across phases as you add the item.** In Office → Items → New
+  item, *+ Split across another phase* adds a row: pick each phase and its
+  quantity (150 in Phase 1, 66 in Phase 2). Each phase becomes its own batch
+  under the same code. One sample serves them all: the first phase builds it,
+  and every phase's batch is released when it is done.
+- **Splitting a batch across phases later.** In an item's editor (Office → Items,
   admin), *Move some into another phase* re-files part of the batch: 150 of
   the 216 for phase 1, 66 for phase 2. The other phase's batch is the same
   code under that phase, made if it does not exist yet.

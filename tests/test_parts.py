@@ -361,3 +361,39 @@ def test_items_with_parts_move_between_phases_whole(client, bed):
         "phase_id": str(two.id), "take": {"unstarted": 1},
     })
     assert refused.status_code == 409
+
+
+def test_a_new_item_can_be_split_across_phases_as_it_is_added(client, factory):
+    from app.models import Phase
+
+    one, two = factory.label(Phase, "Phase 1"), factory.label(Phase, "Phase 2")
+    factory.db.commit()
+    body = {"project_id": str(factory.project.id), "code": "LF-09", "total_qty": 216, "sample_qty": 1,
+            "phase_quantities": [{"phase_id": str(one.id), "qty": 150}, {"phase_id": str(two.id), "qty": 66}]}
+    made = client.post("/api/items", json=body)
+    assert made.status_code == 201, made.text
+    first, second = made.json()["phases"]
+    assert (first["phase_id"], first["total_qty"], first["sample_qty"]) == (str(one.id), 150, 1)
+    assert (second["phase_id"], second["total_qty"], second["sample_qty"], second["sample_item_id"]) == (
+        str(two.id), 66, 0, first["id"],
+    )
+    # One sample for both: phase 2 waits until phase 1's sample is done.
+    assert _state(factory, second["id"])["waits_on_sample"] is True
+    factory.move(factory.db.get(Item, uuid.UUID(first["id"])), None, 1)
+    factory.db.commit()
+    assert _at(_state(factory, second["id"])) == {"unstarted": 66}
+
+    # Nothing is made when one phase clashes, or the numbers do not add up.
+    again = client.post("/api/items", json={**body, "code": "LF-10", "phase_quantities": [
+        {"phase_id": str(one.id), "qty": 100}, {"phase_id": None, "qty": 116}]})
+    assert again.status_code == 201
+    clash = client.post("/api/items", json={**body, "code": "LF-10", "total_qty": 10, "phase_quantities": [
+        {"phase_id": str(two.id), "qty": 5}, {"phase_id": str(one.id), "qty": 5}]})
+    assert clash.status_code == 409
+    codes = [row for row in client.get("/api/items").json()["items"] if row["code"] == "LF-10"]
+    assert len(codes) == 2
+    wrong_sum = client.post("/api/items", json={**body, "code": "LF-11", "total_qty": 200})
+    assert wrong_sum.status_code == 422 and "add up to 216" in wrong_sum.text
+    twice = client.post("/api/items", json={**body, "code": "LF-12", "total_qty": 2, "phase_quantities": [
+        {"phase_id": str(one.id), "qty": 1}, {"phase_id": str(one.id), "qty": 1}]})
+    assert twice.status_code == 422

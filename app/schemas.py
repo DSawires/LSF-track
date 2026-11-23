@@ -65,6 +65,11 @@ class EventBatch(BaseModel):
 # test suite can never catch, so keep the two in sync by hand.
 
 
+class PhaseQuantity(BaseModel):
+    phase_id: uuid.UUID | None = None
+    qty: int = Field(gt=0, le=1_000_000)
+
+
 class ItemCreate(BaseModel):
     """A new item, live on the floor the moment it is created.
 
@@ -89,6 +94,11 @@ class ItemCreate(BaseModel):
     # item that is mid-production when it reaches the system. Anything not
     # distributed starts as "not started". 200 stages bounds the request.
     initial_quantities: dict[uuid.UUID, int] = Field(default_factory=dict, max_length=200)
+    # The batch split across phases from the start: one item per phase, each
+    # with its own quantity, adding up to `total_qty`. One sample serves them
+    # all -- the first phase's batch builds it, and every phase's batch is
+    # released when it is done. Replaces `phase_id`.
+    phase_quantities: list[PhaseQuantity] = Field(default_factory=list, max_length=50)
 
 
 class ItemUpdate(BaseModel):

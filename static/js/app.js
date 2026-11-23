@@ -2111,8 +2111,26 @@ function officeImport(body) {
 /* The area and phase pickers of the New item form, for one project. */
 function newItemLabels(projectId) {
   return `
-          <div><label for="ni-area">Area</label>${labelSelect("areas", sessionStorage.getItem("ni-area"), `id="ni-area"`, projectId)}</div>
-          <div><label for="ni-phase">Phase</label>${labelSelect("phases", sessionStorage.getItem("ni-phase"), `id="ni-phase"`, projectId)}</div>`;
+          <div><label for="ni-area">Area</label>${labelSelect("areas", sessionStorage.getItem("ni-area"), `id="ni-area"`, projectId)}</div>`;
+}
+
+/* The New item form's phases: one row is one batch. Kept here, not in the
+   DOM, so the background re-render redraws added rows instead of losing them. */
+let niPhases = [{ phase: sessionStorage.getItem("ni-phase") || "", qty: "" }];
+
+function newItemPhaseRows(projectId) {
+  const many = niPhases.length > 1;
+  return niPhases.map((row, index) => `
+        <div class="field-grid" style="align-items:end">
+          <div><label>${index ? "Another phase" : "Phase"}</label>${labelSelect("phases", row.phase, `data-ni-phase="${index}"`, projectId)}</div>
+          <div><label>${many ? "Qty in this phase" : "Batch qty"}</label>
+            <div style="display:flex;gap:6px">
+              <input data-ni-pqty="${index}" type="number" inputmode="numeric" min="1" value="${esc(row.qty)}">
+              ${index ? `<button class="ghost" data-ni-drop="${index}" aria-label="Remove this phase" style="width:auto;padding:8px 12px">✕</button>` : ""}
+            </div>
+          </div>
+        </div>`).join("") + (many ? `
+        <p class="muted" id="ni-total" style="margin-top:6px"></p>` : "");
 }
 
 /* One item, added by hand: the extra wardrobe the client asked for after the
@@ -2143,14 +2161,16 @@ function officeItems(body) {
         <label for="ni-dims">Dimensions</label>
         <input id="ni-dims" maxlength="255" autocomplete="off" placeholder="e.g. W 600 x D 450 x H 720 mm">
         <div class="field-grid" id="ni-labels">${newItemLabels(projects.some((p) => p.id === remembered) ? remembered : projects[0].id)}</div>
-        <p class="muted" style="margin-top:6px">Optional, and from the project's own lists. The same code can
-        be added again for another area or phase — each is its own batch.</p>
+        <div id="ni-phases">${newItemPhaseRows(projects.some((p) => p.id === remembered) ? remembered : projects[0].id)}</div>
+        <button class="ghost" id="ni-add-phase" style="width:auto;padding:8px 14px;margin-top:8px">+ Split across another phase</button>
+        <p class="muted" style="margin-top:6px">Area and phase are optional, from the project's own lists. Each
+        phase is its own batch with its own quantity, under the same code.</p>
         <div class="field-grid">
-          <div><label for="ni-qty">Batch qty</label><input id="ni-qty" type="number" inputmode="numeric" min="1"></div>
           <div><label for="ni-sample">Sample qty</label><input id="ni-sample" type="number" inputmode="numeric" min="0" placeholder="1"></div>
         </div>
         <p class="muted" style="margin-top:6px">The sample is built first; the batch is released when the
-        sample is logged Done. Sample 0 puts the whole batch on the floor at once.</p>
+        sample is logged Done. Sample 0 puts the whole batch on the floor at once. Split across phases,
+        one sample serves them all: the first phase builds it, and every phase is released when it is done.</p>
         <div style="height:8px"></div>
         <button class="primary" id="ni-go" ${S.online ? "" : "disabled"}>${S.online ? "Add item" : "Adding an item needs a connection"}</button>
         <p class="warn-text" id="ni-err" role="alert" hidden></p>`
@@ -2169,16 +2189,49 @@ function officeItems(body) {
   const go = document.getElementById("ni-go");
   if (go) {
     const value = (id) => document.getElementById(id).value.trim();
-    // The next one is usually for the same job, area and phase.
+    const $phases = document.getElementById("ni-phases");
+    const total = () => {
+      const line = document.getElementById("ni-total");
+      if (!line) return;
+      const sum = niPhases.reduce((a, row) => a + (Number(row.qty) || 0), 0);
+      line.textContent = `${sum} pcs across ${niPhases.length} phases`;
+    };
+    const paintPhases = () => { $phases.innerHTML = newItemPhaseRows(value("ni-project")); total(); };
+    // One listener each for every row: rows come and go, the container stays.
+    $phases.onchange = (e) => {
+      const index = e.target.dataset?.niPhase;
+      if (index === undefined) return;
+      niPhases[Number(index)].phase = e.target.value;
+      // The next one is usually for the same phase.
+      if (index === "0") sessionStorage.setItem("ni-phase", e.target.value);
+    };
+    $phases.oninput = (e) => {
+      const index = e.target.dataset?.niPqty;
+      if (index === undefined) return;
+      niPhases[Number(index)].qty = e.target.value;
+      total();
+    };
+    $phases.onclick = (e) => {
+      const index = e.target.dataset?.niDrop;
+      if (index === undefined) return;
+      niPhases.splice(Number(index), 1);
+      paintPhases();
+    };
+    document.getElementById("ni-add-phase").onclick = () => {
+      niPhases.push({ phase: "", qty: "" });
+      paintPhases();
+    };
+    total();
+    // The next one is usually for the same job and area.
     const remember = () => {
-      for (const id of ["ni-area", "ni-phase"]) {
-        document.getElementById(id).onchange = (e) => { sessionStorage.setItem(id, e.target.value); };
-      }
+      document.getElementById("ni-area").onchange = (e) => { sessionStorage.setItem("ni-area", e.target.value); };
     };
     document.getElementById("ni-project").onchange = (e) => {
       sessionStorage.setItem("ni-project", e.target.value);
-      // Another project, another pair of lists.
+      // Another project, other lists: the phases picked no longer exist there.
       document.getElementById("ni-labels").innerHTML = newItemLabels(e.target.value);
+      niPhases = niPhases.map((row) => ({ ...row, phase: "" }));
+      paintPhases();
       remember();
     };
     remember();
@@ -2187,10 +2240,17 @@ function officeItems(body) {
       const fail = (message) => { err.textContent = message; err.hidden = false; };
       err.hidden = true;
       const code = value("ni-code");
-      const qty = Number(value("ni-qty"));
+      const qtys = niPhases.map((row) => Number(row.qty));
+      const qty = qtys.reduce((a, b) => a + b, 0);
       const sample = value("ni-sample") === "" ? 1 : Number(value("ni-sample"));
+      const split = niPhases.length > 1;
       if (!code) return fail("The item needs a code.");
-      if (!Number.isInteger(qty) || qty < 1) return fail("Batch qty must be a whole number, 1 or more.");
+      if (qtys.some((n) => !Number.isInteger(n) || n < 1)) {
+        return fail(split ? "Each phase needs a quantity: a whole number, 1 or more." : "Batch qty must be a whole number, 1 or more.");
+      }
+      if (split && new Set(niPhases.map((row) => row.phase)).size !== niPhases.length) {
+        return fail("Each phase once: two rows name the same phase.");
+      }
       if (!Number.isInteger(sample) || sample < 0) return fail("Sample qty must be a whole number, 0 or more.");
       go.disabled = true;
       try {
@@ -2202,18 +2262,24 @@ function officeItems(body) {
             description: value("ni-desc"),
             dimensions: value("ni-dims"),
             area_id: value("ni-area") || null,
-            phase_id: value("ni-phase") || null,
+            ...(split
+              ? { phase_quantities: niPhases.map((row) => ({ phase_id: row.phase || null, qty: Number(row.qty) })) }
+              : { phase_id: niPhases[0].phase || null }),
             total_qty: qty,
             sample_qty: sample,
             drawing_revision: value("ni-rev") || "A",
           }),
         });
-        toast(`${itemName(created)} added — it is on the Items list now`);
-        // Clear what was typed, but not the project: the next one is usually
-        // for the same job.
-        for (const id of ["ni-code", "ni-desc", "ni-dims", "ni-qty", "ni-sample", "ni-rev"]) {
+        toast(split
+          ? `${created.code} added in ${created.phases.length} phases — they are on the Items list now`
+          : `${itemName(created)} added — it is on the Items list now`);
+        // Clear what was typed, but not the project or the first phase: the
+        // next one is usually for the same job.
+        for (const id of ["ni-code", "ni-desc", "ni-dims", "ni-sample", "ni-rev"]) {
           document.getElementById(id).value = "";
         }
+        niPhases = [{ phase: niPhases[0].phase, qty: "" }];
+        paintPhases();
         dirtyFields.clear();
         await sync();
         loadItemEditors();

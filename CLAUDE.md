@@ -341,7 +341,10 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   Online-only like every other photo: the bytes never enter the sync queue
 - Office → Items → New item: one item added to a project by hand, without an
   import, by any engineer. It posts `POST /api/items`, which also takes an
-  optional mid-production distribution by stage (with `sample_qty` 0)
+  optional mid-production distribution by stage (with `sample_qty` 0), or a
+  quantity per phase (`phase_quantities`): one batch per phase, all made or
+  none, the first building the sample and the rest waiting on it
+  (`sample_item_id`)
 - Office tab: projects, item editing, and admin management of stages/stations
 - Office → Areas & phases (admin): pick a project, then add, rename, reorder,
   retire or delete its areas and phases. An import file that names an area or

@@ -291,34 +291,66 @@ def create_item(
             f"project {project.code} is archived; reactivate it first",
         )
     code = payload.code.strip()
-    area, phase = _area_and_phase(db, payload.area_id, payload.phase_id, project.id)
-    if identity_taken(db, project.id, code, payload.area_id, payload.phase_id):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"{identity_label(code, area, phase)} already exists in {project.code}",
-        )
+    # One phase, or the batch split across several from the start.
+    split = payload.phase_quantities
+    if split:
+        if payload.phase_id is not None:
+            raise HTTPException(422, "give the phase either once, or per phase with its quantity")
+        if payload.initial_quantities:
+            raise HTTPException(
+                422, "a part-built batch is entered one phase at a time; split it afterwards"
+            )
+        if len({row.phase_id for row in split}) != len(split):
+            raise HTTPException(422, "each phase once")
+        if sum(row.qty for row in split) != payload.total_qty:
+            raise HTTPException(
+                422, f"the phases add up to {sum(row.qty for row in split)}, not {payload.total_qty}"
+            )
+        wanted = [(row.phase_id, row.qty) for row in split]
+    else:
+        wanted = [(payload.phase_id, payload.total_qty)]
 
-    item = Item(
-        code=code,
-        project_id=payload.project_id,
-        area_id=payload.area_id,
-        phase_id=payload.phase_id,
-        description=payload.description.strip(),
-        dimensions=(payload.dimensions or "").strip() or None,
-        total_qty=payload.total_qty,
-        sample_qty=payload.sample_qty,
-        drawing_revision=payload.drawing_revision.strip(),
-    )
-    db.add(item)
-    db.flush()
+    labels = []
+    for phase_id, _qty in wanted:
+        area, phase = _area_and_phase(db, payload.area_id, phase_id, project.id)
+        if identity_taken(db, project.id, code, payload.area_id, phase_id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{identity_label(code, area, phase)} already exists in {project.code}",
+            )
+        labels.append(phase)
+
+    made: list[Item] = []
+    for position, (phase_id, qty) in enumerate(wanted):
+        first = made[0] if made else None
+        made.append(Item(
+            code=code,
+            project_id=payload.project_id,
+            area_id=payload.area_id,
+            phase_id=phase_id,
+            description=payload.description.strip(),
+            dimensions=(payload.dimensions or "").strip() or None,
+            total_qty=qty,
+            # The first phase builds the sample; the others wait on it.
+            sample_qty=payload.sample_qty if first is None else 0,
+            sample_item_id=first.id if first is not None and payload.sample_qty else None,
+            drawing_revision=payload.drawing_revision.strip(),
+        ))
+        db.add(made[-1])
+        db.flush()
+    item = made[0]
 
     if payload.initial_quantities:
         try:
             place_initial_quantities(db, item, payload.initial_quantities, user, utcnow())
         except ItemSetupError as exc:
             raise HTTPException(422, str(exc))
-    db.refresh(item)
-    return _item_payload(item)
+    for row in made:
+        db.refresh(row)
+    body = _item_payload(item)
+    if split:
+        body["phases"] = [_item_payload(row) for row in made]
+    return body
 
 
 @router.post("/assign")
