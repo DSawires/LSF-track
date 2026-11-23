@@ -49,6 +49,50 @@ def load_vocabulary(db: Session) -> Vocabulary:
     )
 
 
+def parts_linked(db: Session, items) -> set[uuid.UUID]:
+    """The items whose linked entries are splits and assemblies: those that
+    are parts, and those that have parts."""
+    ids = [item.id for item in items]
+    if not ids:
+        return set()
+    parents = set(
+        db.scalars(
+            sa.select(Item.parent_item_id).where(Item.parent_item_id.in_(ids)).distinct()
+        )
+    )
+    return {item.id for item in items if item.parent_item_id is not None or item.id in parents}
+
+
+def replay_item(db: Session, item: Item, vocab: Vocabulary, extra: list | None = None,
+                known_release: dict | None = None) -> ItemLedger:
+    """One item's ledger, from its whole log (plus `extra` rows not stored yet),
+    built exactly as a report would build it."""
+    steps = list(db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item.id).order_by(ItemStep.seq)))
+    events = list(db.scalars(sa.select(Event).where(Event.item_id == item.id)))
+    kept, _anomalies = effective_events(events + list(extra or []))
+    ledger = ItemLedger(
+        item, steps, vocab,
+        parts_link=item.id in parts_linked(db, [item]),
+        release_at=shared_release(db, item, vocab, known_release),
+    )
+    ledger.apply_all(kept)
+    return ledger
+
+
+def shared_release(db: Session, item: Item, vocab: Vocabulary, known: dict | None = None):
+    """For a batch released by another item's sample, when that sample was
+    done (None while it is not). None for every other item."""
+    root_id = item.sample_item_id
+    if root_id is None:
+        return None
+    if known is not None and root_id in known:
+        return known[root_id]
+    root = db.get(Item, root_id)
+    if root is None:
+        return None
+    return replay_item(db, root, vocab).released_at
+
+
 class Derivation:
     """The replayed state of a set of items, plus everything that did not add up."""
 
@@ -114,12 +158,21 @@ def derive(
         recent, settings.max_device_ahead_seconds, settings.max_sync_lag_days
     )
 
+    linked = parts_linked(db, list(items.values()))
     ledgers: dict[uuid.UUID, ItemLedger] = {}
-    for item_id, item in items.items():
+    released: dict[uuid.UUID, object] = {}
+    # Batches that share another item's sample go last: their release is read
+    # off that item's replay.
+    for item_id, item in sorted(items.items(), key=lambda pair: pair[1].sample_item_id is not None):
         kept, correction_anomalies = effective_events(events_by_item[item_id])
         anomalies.extend(correction_anomalies)
-        ledger = ItemLedger(item, steps_by_item[item_id], vocab)
+        ledger = ItemLedger(
+            item, steps_by_item[item_id], vocab,
+            parts_link=item_id in linked,
+            release_at=shared_release(db, item, vocab, released),
+        )
         ledger.apply_all(kept)
+        released[item_id] = ledger.released_at
         anomalies.extend(ledger.anomalies)
         ledgers[item_id] = ledger
 

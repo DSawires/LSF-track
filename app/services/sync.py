@@ -50,6 +50,9 @@ def items_token(db: Session) -> str:
                 Item.total_qty,
                 Item.sample_qty,
                 Item.drawing_revision,
+                Item.parent_item_id,
+                Item.per_unit,
+                Item.sample_item_id,
             ).order_by(Item.id)
         ),
     )

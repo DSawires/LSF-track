@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -69,7 +69,7 @@ class EventWrite:
     divergent: bool = False
 
 
-def record_event(db: Session, payload, session_user: User) -> EventWrite:
+def record_event(db: Session, payload, session_user: User, in_group: bool = False) -> EventWrite:
     existing = db.get(Event, payload.id)
     if existing is not None:
         divergent = _differs(existing, payload)
@@ -116,15 +116,33 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
         if item_step.item_id != item.id:
             raise EventRejected("item step belongs to a different item", "item_step_id")
         stage = db.get(Stage, item_step.stage_id)
-    elif event_type.requires_item_step:
+    elif event_type.requires_item_step and not (payload.from_link or payload.to_link):
+        # A linked row names no stage when its units leave this item, or
+        # arrive not started.
         raise EventRejected("this entry needs a stage", "stage_id")
 
-    # Where the units came from: a stage, "not started", or Done.
+    # Linked rows belong to a group, and the group is the unit of writing.
+    if (payload.from_link or payload.to_link) and payload.link_id is None:
+        raise EventRejected("a linked entry carries the link_id of its group", "link_id")
+    if payload.link_id is not None and not (payload.from_link or payload.to_link):
+        raise EventRejected("only a linked entry carries a link_id", "link_id")
+    if payload.link_id is not None and not in_group:
+        raise EventRejected(
+            "a split, an assembly or a move into another phase is posted as one batch, all its entries together",
+            "link_id",
+        )
+    if payload.to_link and (payload.stage_id is not None or event_type.is_finish):
+        raise EventRejected("units leaving for another item name no stage here", "stage_id")
+    if (payload.from_link or payload.to_link) and (event_type.is_rework or event_type.is_correction):
+        raise EventRejected("a linked entry is a plain move, not rework or a correction", "event_type_id")
+
+    # Where the units came from: a stage, "not started", Done, or another item.
     sources = [
         payload.from_stage_id is not None,
         payload.from_unstarted,
         payload.from_done,
         payload.from_item_step_id is not None,
+        payload.from_link,
     ]
     if sum(sources) > 1:
         raise EventRejected("an entry takes its units from one place only", "from_stage_id")
@@ -140,10 +158,16 @@ def record_event(db: Session, payload, session_user: User) -> EventWrite:
             raise EventRejected("unknown source step", "from_item_step_id")
         if from_step.item_id != item.id:
             raise EventRejected("source step belongs to a different item", "from_item_step_id")
-    if payload.from_done and not event_type.is_rework:
+    if payload.from_done and not event_type.is_rework and not payload.to_link:
         # Taking a finished unit back out of Done is rework, and has a reason.
+        # Finished parts going into an assembly are not coming back: they are
+        # used up.
         raise EventRejected("only rework takes units back out of Done", "from_done")
     legacy_shape = payload.item_step_id is not None or payload.from_item_step_id is not None
+    if (payload.from_link or payload.to_link) and not event_type.moves_quantity:
+        raise EventRejected("a linked entry moves units", "event_type_id")
+    if payload.to_link and not any(sources):
+        raise EventRejected("say where these units are coming from", "from_stage_id")
     if event_type.moves_quantity and not legacy_shape:
         if payload.stage_id is not None and not any(sources):
             raise EventRejected("say where these units are coming from", "from_stage_id")
@@ -248,6 +272,9 @@ _MOVEMENT_FIELDS = (
     "from_unstarted",
     "from_done",
     "from_item_step_id",
+    "link_id",
+    "from_link",
+    "to_link",
 )
 
 
@@ -294,6 +321,7 @@ def _validate_availability(
         payload.from_stage_id is not None
         or payload.from_unstarted
         or payload.from_done
+        or payload.from_link
         or payload.from_item_step_id is not None
     )
     if unsourced and not steps:
@@ -311,15 +339,22 @@ def _validate_availability(
         supersedes_event_id=payload.supersedes_event_id,
     )
 
+    from app.services.derivation import parts_linked, shared_release
+
+    options = {
+        "parts_link": item.id in parts_linked(db, [item]),
+        "release_at": shared_release(db, item, vocab),
+    }
+
     def replay(rows: list) -> ItemLedger:
         kept, _anomalies = effective_events(rows)
-        ledger = ItemLedger(item, steps, vocab)
+        ledger = ItemLedger(item, steps, vocab, **options)
         ledger.apply_all(kept)
         return ledger
 
     # The same question the replay will ask of the stored row, asked first:
     # does this entry describe a move at all?
-    move, problem = ItemLedger(item, steps, vocab).resolve(candidate, event_type)
+    move, problem = ItemLedger(item, steps, vocab, **options).resolve(candidate, event_type)
     if move is None:
         # Point at the field the engineer would have to change.
         field = "from_item_step_id" if payload.from_item_step_id is not None else "stage_id"
@@ -335,6 +370,8 @@ def _validate_availability(
     # allows_partial_qty=False: this stage takes whole lots, never a split.
     # Enforced as "nothing may be left behind": after the replay with this
     # event included, the place it drew from must be empty.
+    if move.target < 0 or move.inflow:
+        return
     target_stage = vocab.stages.get(with_candidate.positions[move.target].stage_id)
     if (
         target_stage is not None
@@ -392,11 +429,12 @@ def _differs(existing: Event, payload) -> bool:
         "reason_code_id",
         "supersedes_event_id",
         "note",
+        "link_id",
     )
     for field in fields:
         if getattr(existing, field) != getattr(payload, field, None):
             return True
-    for flag in ("from_unstarted", "from_done"):
+    for flag in ("from_unstarted", "from_done", "from_link", "to_link"):
         if bool(getattr(existing, flag)) != bool(getattr(payload, flag, False)):
             return True
     payload_occurred = getattr(payload, "occurred_at", None)
@@ -410,3 +448,87 @@ def _differs(existing: Event, payload) -> bool:
     if claimed is not None and existing.user_id != claimed:
         return True
     return False
+
+
+# -- linked entries -----------------------------------------------------------
+
+
+def parts_of(db: Session, item_id: uuid.UUID) -> list[Item]:
+    """An item's parts, in the order they were added."""
+    return list(
+        db.scalars(
+            sa.select(Item)
+            .where(Item.parent_item_id == item_id, Item.is_active.is_(True))
+            .order_by(Item.created_at, Item.code)
+        )
+    )
+
+
+def link_kind(db: Session, rows) -> str:
+    """What a group of linked rows is -- "split", "assembly" or "transfer" -- or
+    an EventRejected saying why it is none of them.
+
+    The quantities have to agree, by the per-piece counts the parts have now:
+    a split of 10 beds is 10 frames, 10 headboards and 40 legs, or it is not
+    stored at all.
+    """
+    if len({row.item_id for row in rows}) != len(rows):
+        raise EventRejected("a split or an assembly names each item once", "item_id")
+    if len({_aware(row.occurred_at) for row in rows}) != 1:
+        raise EventRejected("the entries of one split or assembly happen at one moment", "occurred_at")
+    items = {row.item_id: db.get(Item, row.item_id) for row in rows}
+    if any(item is None for item in items.values()):
+        raise EventRejected("unknown item", "item_id")
+    if len({item.project_id for item in items.values()}) != 1:
+        raise EventRejected("a split or an assembly stays within one project", "item_id")
+    outs = [row for row in rows if row.to_link]
+    ins = [row for row in rows if row.from_link]
+    if not outs or not ins or len(outs) + len(ins) != len(rows):
+        raise EventRejected("units leave one side of a link and arrive on the other", "link_id")
+
+    def matches(whole_row, part_rows) -> bool:
+        parts = parts_of(db, whole_row.item_id)
+        if not parts or {part.id for part in parts} != {row.item_id for row in part_rows}:
+            return False
+        per = {part.id: part.per_unit for part in parts}
+        return all(row.qty == whole_row.qty * per[row.item_id] for row in part_rows)
+
+    if len(outs) == 1 and matches(outs[0], ins):
+        return "split"
+    if len(ins) == 1 and matches(ins[0], outs):
+        return "assembly"
+    if len(outs) == 1 and len(ins) == 1:
+        a, b = items[outs[0].item_id], items[ins[0].item_id]
+        plain = all(
+            item.parent_item_id is None and not parts_of(db, item.id) for item in (a, b)
+        )
+        if plain and a.code == b.code and outs[0].qty == ins[0].qty:
+            return "transfer"
+    raise EventRejected(
+        "these entries do not add up to a split into parts, an assembly or a move into "
+        "another phase: every part, at its count per piece, or nothing",
+        "qty",
+    )
+
+
+def record_group(db: Session, rows, session_user: User) -> list[EventWrite]:
+    """Store a split, an assembly or a phase move: every row, or none.
+
+    A row already stored makes this a retry; the stored rows are returned as
+    they are. Rows are written outgoing first, so the units an assembly uses
+    up are checked before the finished pieces appear.
+    """
+    stored = [db.get(Event, row.id) for row in rows]
+    if all(event is not None for event in stored):
+        return [EventWrite(event=event, created=False) for event in stored]
+    link_kind(db, rows)
+    ordered = sorted(rows, key=lambda row: (not row.to_link, str(row.item_id)))
+    written: dict[uuid.UUID, EventWrite] = {}
+    with db.begin_nested():
+        for row in ordered:
+            written[row.id] = record_event(db, row, session_user, in_group=True)
+    return [written[row.id] for row in rows]
+
+
+def _aware(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)

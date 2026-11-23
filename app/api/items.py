@@ -20,7 +20,16 @@ from app.models import (
     User,
     WorkOrderLine,
 )
-from app.schemas import ItemCreate, ItemsAssign, ItemUpdate, RevisionBumpRequest
+from app.schemas import (
+    ItemCreate,
+    ItemsAssign,
+    ItemUpdate,
+    PartCreate,
+    PartUpdate,
+    PhaseSplit,
+    RevisionBumpRequest,
+)
+from app.services import parts as parts_service
 from app.services import reports
 from app.services.items import (
     ItemSetupError,
@@ -70,6 +79,12 @@ def _item_payload(item: Item, icon_url: str | None = None) -> dict:
         "sample_qty": item.sample_qty,
         "drawing_revision": item.drawing_revision,
         "created_at": item.created_at.isoformat() if item.created_at else None,
+        # A part: what it is part of, and how many go into one piece of it.
+        "parent_item_id": str(item.parent_item_id) if item.parent_item_id else None,
+        "per_unit": item.per_unit,
+        # A batch split into another phase before its sample was done: the
+        # item whose sample releases it.
+        "sample_item_id": str(item.sample_item_id) if item.sample_item_id else None,
     }
 
 
@@ -332,6 +347,14 @@ def assign_items(
         )
     # An area or a phase belongs to one project, so a selection that is given
     # one must all be in that project. (Clearing has no such limit.)
+    loose = [item.code for item in items if item.parent_item_id is not None]
+    if loose:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"nothing was changed: {', '.join(sorted(set(loose))[:8])} "
+            f"{'is a part' if len(loose) == 1 else 'are parts'}, filed with the piece "
+            "they belong to. Untick them; they follow it.",
+        )
     projects = {item.project_id for item in items}
     naming = ("area_id" in sent and payload.area_id) or ("phase_id" in sent and payload.phase_id)
     if naming and len(projects) > 1:
@@ -389,6 +412,12 @@ def assign_items(
     for item in items:
         _project, _code, item.area_id, item.phase_id = target(item)
     db.flush()
+    try:
+        for item in items:
+            parts_service.follow_parent(db, item)
+    except parts_service.PartsError as exc:
+        db.rollback()
+        raise HTTPException(exc.status, f"nothing was changed: {exc}")
     log.info(
         "%d item(s) filed by %s: %s",
         len(items),
@@ -456,6 +485,15 @@ def update_item(
 
     # Project, code, area and phase are what the item is. Changing any of them
     # must not land it on top of another batch.
+    moving = {
+        key for key in ("project_id", "area_id", "phase_id")
+        if key in fields and fields[key] != getattr(item, key)
+    }
+    if moving and item.parent_item_id is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "a part is filed where the piece it belongs to is; move that piece instead",
+        )
     if {"code", "project_id", "area_id", "phase_id"} & fields.keys():
         target_project = fields.get("project_id") or item.project_id
         target_code = fields.get("code", item.code)
@@ -492,6 +530,8 @@ def update_item(
                     f"project {project.code} is archived; reactivate it first",
                 )
             log.info("item %s reactivated by %s", item.code, admin.username)
+            for part in parts_service.descendants(db, item):
+                part.is_active = True
 
     if "total_qty" in fields:
         state = reports.item_state(db, [item.id]).get(str(item.id))
@@ -507,6 +547,11 @@ def update_item(
     for field, value in fields.items():
         setattr(item, field, value)
     db.flush()
+    if moving:
+        try:
+            parts_service.follow_parent(db, item)
+        except parts_service.PartsError as exc:
+            raise HTTPException(exc.status, f"nothing was changed: {exc}")
     return _item_payload(item, _icon_urls(db, [item.id]).get(item.id))
 
 
@@ -531,6 +576,10 @@ def remove_item(
     item = db.get(Item, item_id)
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
+    try:
+        parts_service.guard_removal(db, item, purge)
+    except parts_service.PartsError as exc:
+        raise HTTPException(exc.status, str(exc))
 
     has_events = (
         db.scalar(
@@ -572,7 +621,13 @@ def remove_item(
 
     if has_events:
         archive_item(db, item, admin)
+        # Its parts go off the floor with it, and come back with it.
+        for part in parts_service.descendants(db, item):
+            if part.is_active:
+                archive_item(db, part, admin)
         return {"archived": True, "deleted": False}
+    if parts_service.descendants(db, item):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"{item.code} has parts; delete them first")
 
     code = item.code
     _destroy_item(db, item)
@@ -604,6 +659,76 @@ def _destroy_item(db: Session, item: Item) -> None:
     db.flush()
     db.delete(item)
     db.flush()
+
+
+def _known(db: Session, item_id: uuid.UUID) -> Item:
+    item = db.get(Item, item_id)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown item")
+    return item
+
+
+@router.post("/{item_id}/parts", status_code=status.HTTP_201_CREATED)
+def add_part(
+    item_id: uuid.UUID,
+    payload: PartCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Give an item a part. Any engineer, like adding an item: a part is an
+    item the floor tracks on its own until it is assembled back in."""
+    try:
+        part = parts_service.add_part(
+            db, _known(db, item_id), payload.code, payload.description, payload.per_unit,
+            payload.dimensions,
+        )
+    except parts_service.PartsError as exc:
+        raise HTTPException(exc.status, str(exc))
+    log.info("part %s added to %s by %s", part.code, item_id, user.username)
+    return _item_payload(part)
+
+
+@router.patch("/{item_id}/part")
+def change_part(
+    item_id: uuid.UUID,
+    payload: PartUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """How many of a part go into one piece, and what it is called. Refused
+    while pieces are out in parts: they were split by the old count."""
+    try:
+        part = parts_service.change_part(
+            db, _known(db, item_id), payload.per_unit, payload.description
+        )
+    except parts_service.PartsError as exc:
+        raise HTTPException(exc.status, str(exc))
+    return _item_payload(part)
+
+
+@router.post("/{item_id}/split-phase")
+def split_phase(
+    item_id: uuid.UUID,
+    payload: PhaseSplit,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Move some of a batch into another phase of its project. Admin, like
+    the rest of filing: what phase a batch is in is part of what it is."""
+    item = _known(db, item_id)
+    try:
+        target = parts_service.split_phase(db, item, payload.phase_id, payload.take, admin)
+    except parts_service.PartsError as exc:
+        raise HTTPException(exc.status, str(exc))
+    log.info(
+        "%s: %d unit(s) moved into another phase by %s",
+        item.code, sum(payload.take.values()), admin.username,
+    )
+    icons = _icon_urls(db, [item.id, target.id])
+    return {
+        "from": _item_payload(item, icons.get(item.id)),
+        "to": _item_payload(target, icons.get(target.id)),
+    }
 
 
 @router.post("/{item_id}/revision")

@@ -67,7 +67,9 @@ const BATCH_CHUNK = 100; // the server caps a batch at 500; stay well under it
 
 // occurred_at is always toISOString() -- UTC, fixed width -- so it sorts as text.
 const byOccurredAt = (a, b) =>
-  (a.occurred_at < b.occurred_at ? -1 : a.occurred_at > b.occurred_at ? 1 : 0);
+  (a.occurred_at < b.occurred_at ? -1 : a.occurred_at > b.occurred_at ? 1
+    // The entries of one split or assembly share a moment; keep them together.
+    : (a.link_id || "") < (b.link_id || "") ? -1 : (a.link_id || "") > (b.link_id || "") ? 1 : 0);
 
 /* A GET that only counts if the server itself answered. The service worker
    serves /api/ GETs from its cache when the network is down, marked with
@@ -101,9 +103,12 @@ async function drainQueue() {
       .filter((q) => q._status === "pending")
       .sort(byOccurredAt);
     if (!queue.length) return;
-    const events = queue
-      .slice(0, BATCH_CHUNK)
-      .map(({ _queued_at, _status, _reason, ...event }) => event);
+    // A split or an assembly is several entries stored all together or not
+    // at all, so a chunk never ends in the middle of one.
+    let chunk = queue.slice(0, BATCH_CHUNK);
+    const links = new Set(chunk.map((q) => q.link_id).filter(Boolean));
+    if (links.size) chunk = chunk.concat(queue.slice(BATCH_CHUNK).filter((q) => links.has(q.link_id)));
+    const events = chunk.map(({ _queued_at, _status, _reason, ...event }) => event);
     let results;
     try {
       ({ results } = await api("/api/events/batch", {
@@ -141,7 +146,21 @@ async function drainQueue() {
 
 async function drainOneByOne(events) {
   const results = [];
+  // Linked entries go together even here: one alone is always refused.
+  const groups = new Map();
   for (const event of events) {
+    if (event.link_id) groups.set(event.link_id, [...(groups.get(event.link_id) || []), event]);
+  }
+  for (const group of groups.values()) {
+    try {
+      const answer = await api("/api/events/batch", { method: "POST", body: JSON.stringify({ events: group }) });
+      results.push(...answer.results);
+    } catch (error) {
+      if (!(error.status >= 400 && error.status < 500)) throw error;
+      for (const event of group) results.push({ id: event.id, status: "rejected", reason: rejectReason(error) });
+    }
+  }
+  for (const event of events.filter((e) => !e.link_id)) {
     try {
       const { divergent } = await api("/api/events", {
         method: "POST",
@@ -302,8 +321,14 @@ function requestBackgroundSync() {
 }
 
 async function logEvent(event) {
+  return logEvents([event]);
+}
+
+/* Several entries that belong together -- a split, an assembly -- queued
+   at once. */
+async function logEvents(events) {
   try {
-    await LSF_DB.enqueue(event);
+    for (const event of events) await LSF_DB.enqueue(event);
   } catch {
     // IndexedDB refused the write (quota, private browsing, corruption). The
     // one thing worse than an error is pretending the entry was recorded.
@@ -344,6 +369,25 @@ const activeStages = () =>
    completed inside a stage. */
 const UNSTARTED = "unstarted";
 const DONE = "done";
+// The other side of a linked entry: another item (a split, an assembly, or
+// another phase's batch of the same code).
+const LINK = "link";
+
+/* Parts. A part is an item of its own, tracked until it is assembled back
+   into the piece it belongs to. */
+const partsOf = (item) => S.items.filter((i) => i.parent_item_id === item.id && i.is_active !== false);
+const pieceOf = (item) => (item?.parent_item_id ? S.items.find((i) => i.id === item.parent_item_id) || null : null);
+const partName = (part) => part.description || part.code;
+
+/* "216 pcs" for a batch -- units moved between phases included -- and for a
+   part, how many go into each piece of what it belongs to. */
+function batchLabel(item) {
+  if (item.parent_item_id) {
+    const piece = pieceOf(item);
+    return `×${item.per_unit} per ${piece ? piece.code : "piece"}`;
+  }
+  return `${item.state?.batch_qty ?? item.total_qty} pcs`;
+}
 
 function placeName(key) {
   if (key === UNSTARTED) return "Not started";
@@ -432,10 +476,11 @@ function validFilter(key, options) {
    null for an entry in the old sequence shape (a step, no source): only the
    server can place those. */
 function queuedSource(q) {
-  return q.from_unstarted ? UNSTARTED : q.from_done ? DONE : q.from_stage_id || null;
+  return q.from_link ? LINK : q.from_unstarted ? UNSTARTED : q.from_done ? DONE : q.from_stage_id || null;
 }
 function queuedTarget(q) {
-  return eventType(q.event_type_id)?.is_finish ? DONE : q.stage_id || null;
+  if (q.to_link) return LINK;
+  return eventType(q.event_type_id)?.is_finish ? DONE : q.stage_id || (q.from_link ? UNSTARTED : null);
 }
 
 /* Where an item's units are *as this phone knows it*: the server's last answer
@@ -467,6 +512,9 @@ function localPlaces(item) {
   }
   let done = state?.done_qty || 0;
   let inSample = state?.phase === "sample";
+  let inParts = state?.in_parts_qty || 0;
+  // Released by another item's sample: nothing logged here releases it.
+  const waits = !!state?.waits_on_sample;
   const sampleQty = state?.sample_qty || 0;
 
   const queue = S.pending
@@ -478,21 +526,30 @@ function localPlaces(item) {
     const from = queuedSource(q);
     const to = queuedTarget(q);
     if (!from || !to) continue;
-    const source = from === DONE ? null : at.get(from);
-    // Never more than is there: an over-quantity entry was warned about when
-    // it was logged and the server will refuse it, so it must not invent units.
-    const moved = Math.min(q.qty, from === DONE ? done : source?.qty || 0);
-    if (!moved) continue;
+    let moved;
     let movedSample = 0;
-    if (from === DONE) {
-      done -= moved;
+    if (from === LINK) {
+      // Arriving from another item: split off the piece, or assembled.
+      moved = q.qty;
+      inParts = Math.max(0, inParts - moved);
     } else {
-      source.qty -= moved;
-      movedSample = Math.min(moved, source.sample_qty);
-      source.sample_qty -= movedSample;
-      source.queued = true;
+      const source = from === DONE ? null : at.get(from);
+      // Never more than is there: an over-quantity entry was warned about when
+      // it was logged and the server will refuse it, so it must not invent units.
+      moved = Math.min(q.qty, from === DONE ? done : source?.qty || 0);
+      if (!moved) continue;
+      if (from === DONE) {
+        done -= moved;
+      } else {
+        source.qty -= moved;
+        movedSample = Math.min(moved, source.sample_qty);
+        source.sample_qty -= movedSample;
+        source.queued = true;
+      }
     }
-    if (to === DONE) {
+    if (to === LINK) {
+      inParts += moved;
+    } else if (to === DONE) {
       done += moved;
     } else {
       const target = place(to);
@@ -503,7 +560,7 @@ function localPlaces(item) {
     }
     // A sample finished offline releases the batch on the server the moment
     // it syncs; show it here already, so the batch can be started now.
-    if (inSample && done >= sampleQty) {
+    if (inSample && !waits && done >= sampleQty) {
       inSample = false;
       const unstarted = place(UNSTARTED);
       unstarted.qty += item.total_qty;
@@ -516,7 +573,7 @@ function localPlaces(item) {
     .filter((p) => p.qty > 0)
     .sort((x, y) => order(x.key) - order(y.key))
     .map((p) => ({ ...p, name: placeName(p.key) }));
-  return { places, done, inSample };
+  return { places, done, inSample, inParts };
 }
 
 function pendingCountFor(itemId) {
@@ -799,9 +856,15 @@ function viewSyncStatus() {
       ${rejected.map((q) => entryRow(q, true)).join("")}
     </div>` : ""}`;
 
+  // A split or an assembly was refused as a group, and goes back (or goes)
+  // as one: a single row of it on its own is never stored.
+  const groupOf = (id) => {
+    const entry = S.pending.find((q) => q.id === id);
+    return entry?.link_id ? S.pending.filter((q) => q.link_id === entry.link_id).map((q) => q.id) : [id];
+  };
   $view.querySelectorAll("[data-retry]").forEach((button) => {
     button.onclick = async () => {
-      await LSF_DB.markPending(button.dataset.retry);
+      for (const id of groupOf(button.dataset.retry)) await LSF_DB.markPending(id);
       S.pending = await LSF_DB.queueAll();
       renderPill();
       render();
@@ -810,8 +873,11 @@ function viewSyncStatus() {
   });
   $view.querySelectorAll("[data-discard]").forEach((button) => {
     button.onclick = async () => {
-      if (!confirm("Discard this entry? It was never stored on the server and will be gone for good.")) return;
-      await LSF_DB.dropRejected(button.dataset.discard);
+      const ids = groupOf(button.dataset.discard);
+      if (!confirm(ids.length > 1
+        ? `Discard this split or assembly (${ids.length} entries together)? It was never stored on the server and will be gone for good.`
+        : "Discard this entry? It was never stored on the server and will be gone for good.")) return;
+      for (const id of ids) await LSF_DB.dropRejected(id);
       S.pending = await LSF_DB.queueAll();
       renderPill();
       render();
@@ -926,8 +992,11 @@ function itemRow(item) {
   // line is its own tap target: tapping the 40 pcs at carpentry opens the log
   // screen aimed at moving THOSE 40, independent of the 50 sitting at paint.
   // This is the whole workflow: tap a batch, say where it went.
-  const { places, done, inSample } = localPlaces(item);
+  const { places, done, inSample, inParts } = localPlaces(item);
   const pending = pendingCountFor(item.id);
+  const piece = pieceOf(item);
+  const waits = !!item.state?.waits_on_sample;
+  const sampler = waits ? S.items.find((i) => i.id === item.sample_item_id) : null;
 
   const lines = places.map((p) => `
     <a class="pos-row" href="#/items/${item.id}/${p.key}"
@@ -949,16 +1018,24 @@ function itemRow(item) {
           <div style="flex:1;min-width:0">
             <div class="spread">
               <strong>${esc(item.code)}</strong>
-              <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+              <span class="muted">${esc(batchLabel(item))} · rev ${esc(item.drawing_revision)}</span>
             </div>
             ${itemTags(item) ? `<div style="margin-top:3px">${itemTags(item)}</div>` : ""}
             <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
-            ${inSample ? `<div style="margin-bottom:6px"><span class="badge sample">Sample</span>
+            ${piece ? `<div style="margin-bottom:6px"><span class="badge tag">part of ${esc(piece.code)}</span></div>` : ""}
+            ${waits ? `<div style="margin-bottom:6px"><span class="badge sample">Waiting</span>
+              <span class="muted">released when the sample of ${esc(sampler ? itemName(sampler) : "the other phase")} is done</span></div>`
+            : inSample ? `<div style="margin-bottom:6px"><span class="badge sample">Sample</span>
               <span class="muted">batch of ${item.total_qty} follows once the sample is done</span></div>` : ""}
           </div>
         </div>
       </a>
       ${lines}
+      ${inParts ? `
+      <div class="pos-row" style="border-left:2px dashed var(--line)">
+        <span class="muted">In parts — assemble to bring back</span>
+        <span class="badge qty">${inParts}</span>
+      </div>` : ""}
       ${done ? `
       <a class="pos-row" href="#/items/${item.id}/${DONE}" style="border-left:2px solid var(--good)"
          aria-label="${done} pcs done">
@@ -979,7 +1056,31 @@ function itemRow(item) {
 const logSel = {
   from: null, to: null, typeId: null, stationId: null, reasonId: null,
   qty: null, note: "", _arrival: null,
+  // "move", or "split": the units at `from` become their parts at `to`.
+  mode: "move",
 };
+
+/* The assembly form on an item with parts: which place each part is taken
+   from, where the finished pieces go, how many. */
+const assembleSel = { itemId: null, qty: null, from: {}, to: null, stationId: null };
+
+/* The entries of one split or assembly: same moment, same link, one row per
+   item. Every row names where its own units come from or go. */
+function linkedRow(fields, link, at) {
+  return {
+    id: newId(), stage_id: null, station_id: null, qty: 0,
+    from_stage_id: null, from_unstarted: false, from_done: false,
+    from_link: false, to_link: false, link_id: link,
+    reason_code_id: null, occurred_at: at, note: null,
+    supersedes_event_id: null, user_id: S.user?.id || null,
+    ...fields,
+  };
+}
+const sourceFields = (key) => ({
+  from_stage_id: key !== UNSTARTED && key !== DONE ? key : null,
+  from_unstarted: key === UNSTARTED,
+  from_done: key === DONE,
+});
 
 /* Where units last went from a given place, on this phone. There is no
    sequence to say what comes after carpentry, but the floor has habits: the
@@ -994,6 +1095,8 @@ function viewLogScreen(itemId, fromKey) {
 
   const { places, done, inSample } = localPlaces(item);
   const finish = finishType();
+  const parts = partsOf(item);
+  if (!parts.length) logSel.mode = "move";
   // Finishing is not a type the engineer picks: it is what "Done" writes.
   const types = (S.ref.event_types || []).filter(
     (t) => t.is_active && t.moves_quantity && !t.is_finish);
@@ -1017,6 +1120,12 @@ function viewLogScreen(itemId, fromKey) {
     logSel.stationId = null;
     logSel.qty = null;
   }
+  // Splitting takes pieces that are still pieces: never finished ones.
+  const splitting = logSel.mode === "split";
+  if (splitting) {
+    const at = sources.findIndex((s) => s.key === DONE);
+    if (at >= 0) sources.splice(at, 1);
+  }
   if (!sources.some((s) => s.key === logSel.from)) logSel.from = sources[0]?.key || null;
   const source = sources.find((s) => s.key === logSel.from) || null;
 
@@ -1028,16 +1137,19 @@ function viewLogScreen(itemId, fromKey) {
   // Anywhere: every stage in the factory, and Done. The stage the units are
   // already at is only offered when it has stations -- then it is a move to
   // another booth, not a move to nowhere.
-  const targets = activeStages()
-    .filter((st) => st.id !== logSel.from || st.requires_station)
-    .map((st) => ({ key: st.id, label: st.name }));
-  if (finish && !type?.is_rework && logSel.from !== DONE) targets.push({ key: DONE, label: "Done ✓" });
+  const targets = splitting
+    // The parts start wherever they start: not started, or at a stage.
+    ? [{ key: UNSTARTED, label: "Not started" }, ...activeStages().map((st) => ({ key: st.id, label: st.name }))]
+    : activeStages()
+      .filter((st) => st.id !== logSel.from || st.requires_station)
+      .map((st) => ({ key: st.id, label: st.name }));
+  if (!splitting && finish && !type?.is_rework && logSel.from !== DONE) targets.push({ key: DONE, label: "Done ✓" });
   if (!targets.some((t) => t.key === logSel.to)) {
-    const usual = logSel.from ? usualDestination(logSel.from) : null;
+    const usual = logSel.from && !splitting ? usualDestination(logSel.from) : null;
     logSel.to = targets.some((t) => t.key === usual) ? usual : null;
   }
   const toDone = logSel.to === DONE;
-  const stage = !toDone && logSel.to ? stageById(logSel.to) : null;
+  const stage = !toDone && logSel.to && logSel.to !== UNSTARTED ? stageById(logSel.to) : null;
   const sameStage = !!stage && logSel.to === logSel.from;
 
   const stations = stage
@@ -1083,16 +1195,18 @@ function viewLogScreen(itemId, fromKey) {
     <div class="card">
       ${!source ? `
       <p class="muted">Nothing here to move — every unit of ${esc(item.code)} is Done.</p>` : `
+      ${parts.length ? seg("mode", "What happened", [{ key: "move", label: "Moved" }, { key: "split", label: "Split into parts" }], logSel.mode) : ""}
+
       ${seg("from", "From", sources.map((s) => ({ key: s.key, label: `${s.label} · ${s.qty}` })), logSel.from)}
 
-      ${shownTypes.length > 1 ? seg("type", "Entry type", shownTypes.map((t) => ({ key: t.id, label: t.name })), logSel.typeId) : ""}
+      ${!splitting && shownTypes.length > 1 ? seg("type", "Entry type", shownTypes.map((t) => ({ key: t.id, label: t.name })), logSel.typeId) : ""}
       ${logSel.from === DONE ? `<p class="muted" style="margin-top:6px">Taking a finished piece back out of Done is rework, and needs its reason.</p>` : ""}
 
-      ${seg("to", type?.is_rework ? "Send back to" : "Now at", targets, logSel.to)}
+      ${seg("to", splitting ? "The parts go to" : type?.is_rework ? "Send back to" : "Now at", targets, logSel.to)}
 
       ${stage?.requires_station ? seg("station", "Station", stations.map((st) => ({ key: st.id, label: st.name })), logSel.stationId) : ""}
 
-      ${type?.requires_reason_code ? `
+      ${!splitting && type?.requires_reason_code ? `
       <label for="sel-reason">Reason</label>
       <select id="sel-reason">
         ${reasons.map((r) => `<option value="${r.id}" ${r.id === logSel.reasonId ? "selected" : ""}>${esc(r.name)}</option>`).join("")}
@@ -1106,6 +1220,7 @@ function viewLogScreen(itemId, fromKey) {
         <button id="qty-plus" aria-label="One more">+</button>
       </div>
       <p class="muted" style="margin-top:5px">${available} at ${esc(source.label)}</p>
+      ${splitting ? `<p class="muted" id="split-preview"></p>` : ""}
       ${sameStage ? `<p class="muted">Same stage — this moves them to another station. Their age keeps counting.</p>` : ""}
       ${stage?.requires_external_po ? `<p class="muted">External supplier stage — time in state is supplier lead time.</p>` : ""}
       ${stage && !stage.allows_partial_qty ? `<p class="muted">Whole-lot stage — the move must take everything from where it comes.</p>` : ""}
@@ -1119,9 +1234,12 @@ function viewLogScreen(itemId, fromKey) {
 
       <div style="height:12px" aria-hidden="true"></div>
       <div class="action-sticky">
-        <button class="primary" id="log-go" ${logSel.to ? "" : "disabled"}>${logSel.to ? "Log entry" : "Pick where it went"}</button>
+        <button class="primary" id="log-go" ${logSel.to ? "" : "disabled"}>${!logSel.to ? (splitting ? "Pick where the parts go" : "Pick where it went") : splitting ? "Split into parts" : "Log entry"}</button>
       </div>`}
     </div>
+    ${parts.length ? assembleCard(item, parts) : ""}
+    ${pieceOf(item) ? `<div class="card"><p class="muted">Part of <strong>${esc(itemName(pieceOf(item)))}</strong>,
+      ${item.per_unit} per piece. It is split off that item and assembled back into it from that item's screen.</p></div>` : ""}
 
     <div class="card">
       <h2>Photos <span class="muted" id="photo-count"></span></h2>
@@ -1148,6 +1266,7 @@ function viewLogScreen(itemId, fromKey) {
     rerender();
   });
   wireSeg("seg-type", (id) => { logSel.typeId = id; rerender(); });
+  wireSeg("seg-mode", (key) => { Object.assign(logSel, { mode: key, to: null, stationId: null }); rerender(); });
   wireSeg("seg-to", (key) => { logSel.to = key; logSel.stationId = null; rerender(); });
   wireSeg("seg-station", (id) => {
     logSel.stationId = id;
@@ -1163,10 +1282,18 @@ function viewLogScreen(itemId, fromKey) {
 
   const $qty = source ? document.getElementById("qty") : null;
   if ($qty) {
+    const preview = () => {
+      const target = document.getElementById("split-preview");
+      if (!target) return;
+      const n = Number($qty.value) || 0;
+      target.textContent = `${n} piece${n === 1 ? "" : "s"} become ` + parts.map((part) => `${n * part.per_unit} × ${partName(part)}`).join(", ");
+    };
     const warn = () => {
       logSel.qty = $qty.value;
       document.getElementById("qty-warn").hidden = Number($qty.value) <= available;
+      preview();
     };
+    preview();
     $qty.oninput = warn;
     document.getElementById("qty-minus").onclick = () => { $qty.value = Math.max(1, Number($qty.value) - 1); warn(); };
     document.getElementById("qty-plus").onclick = () => { $qty.value = Number($qty.value) + 1; warn(); };
@@ -1183,7 +1310,17 @@ function viewLogScreen(itemId, fromKey) {
         $qty.focus();
         return;
       }
-      const logged = await logEvent({
+      const at = new Date().toISOString();
+      const station = stage?.requires_station ? logSel.stationId : null;
+      const logged = splitting ? await logEvents(((link) => [
+        // The pieces leave this item from where they were...
+        linkedRow({ item_id: item.id, event_type_id: plainType.id, qty, to_link: true, ...sourceFields(logSel.from) }, link, at),
+        // ...and each part arrives, as many per piece as go into one.
+        ...parts.map((part) => linkedRow({
+          item_id: part.id, event_type_id: plainType.id, qty: qty * part.per_unit, from_link: true,
+          stage_id: logSel.to === UNSTARTED ? null : logSel.to, station_id: station,
+        }, link, at)),
+      ])(newId())) : await logEvent({
         id: newId(),
         item_id: item.id,
         // Where the units are now. Done is not a stage: a finish entry names
@@ -1205,8 +1342,8 @@ function viewLogScreen(itemId, fromKey) {
       });
       if (!logged) return;
       // Remember the habit, not rework: sending work back is the exception.
-      if (!type?.is_rework) localStorage.setItem(`next:${logSel.from}`, logSel.to);
-      Object.assign(logSel, { note: "", qty: null, _arrival: null });
+      if (!type?.is_rework && !splitting) localStorage.setItem(`next:${logSel.from}`, logSel.to);
+      Object.assign(logSel, { note: "", qty: null, _arrival: null, mode: "move" });
       if (fromKey) {
         // The batch has moved on; drop its key from the URL without a reload,
         // so going Back here later lands on the item rather than on a place it
@@ -1259,8 +1396,108 @@ function viewLogScreen(itemId, fromKey) {
   // Snags only. The item's icon is set in its editor: Office → Items.
   wireUpload("snag", "snag", "Snag photo added", "photo-note");
 
+  if (parts.length) bindAssemble(item, parts, rerender);
   loadRecent(item);
   loadPhotos(item);
+}
+
+/* Where each part can be taken from for an assembly: wherever its units
+   rest, finished parts included. */
+function partSources(part) {
+  const { places, done } = localPlaces(part);
+  const out = places.map((p) => ({ key: p.key, label: p.name, qty: p.qty }));
+  if (done > 0) out.push({ key: DONE, label: "Done", qty: done });
+  return out;
+}
+
+function assembleCard(item, parts) {
+  const sel = assembleSel;
+  if (sel.itemId !== item.id) Object.assign(sel, { itemId: item.id, qty: null, from: {}, to: null, stationId: null });
+  const rows = parts.map((part) => {
+    const options = partSources(part);
+    if (!options.some((o) => o.key === sel.from[part.id])) {
+      // Wherever most of it is: usually where the parts have gathered.
+      sel.from[part.id] = options.slice().sort((a, b) => b.qty - a.qty)[0]?.key || null;
+    }
+    const picked = options.find((o) => o.key === sel.from[part.id]);
+    return { part, options, sets: picked ? Math.floor(picked.qty / part.per_unit) : 0 };
+  });
+  const most = Math.min(...rows.map((r) => r.sets));
+  const targets = activeStages().map((st) => ({ key: st.id, label: st.name }));
+  if (finishType()) targets.push({ key: DONE, label: "Done ✓" });
+  if (!targets.some((t) => t.key === sel.to)) sel.to = null;
+  const stage = sel.to && sel.to !== DONE ? stageById(sel.to) : null;
+  const stations = stage ? S.ref.stations.filter((st) => st.stage_id === stage.id && st.is_active) : [];
+  if (stage?.requires_station && !stations.some((st) => st.id === sel.stationId)) sel.stationId = stations[0]?.id || null;
+  const qty = sel.qty ?? Math.max(most, 1);
+  const seg = (id, label, options, picked) => `
+      <label id="lbl-${id}">${label}</label>
+      <div class="seg" id="seg-${id}" role="group" aria-labelledby="lbl-${id}">
+        ${options.map((o) => `<button data-id="${o.key}" class="${o.key === picked ? "on" : ""}" aria-pressed="${o.key === picked}">${esc(o.label)}</button>`).join("")}
+      </div>`;
+  return `
+    <div class="card">
+      <h2>Assemble from parts</h2>
+      <p class="muted">Each piece takes ${parts.map((part) => `${part.per_unit} × ${esc(partName(part))}`).join(", ")}.
+        Say where each part is taken from.</p>
+      ${rows.map(({ part, options, sets }) => `
+      <label for="asm-from-${part.id}">${esc(partName(part))} <span class="muted">(${esc(part.code)})</span></label>
+      ${options.length ? `
+      <select id="asm-from-${part.id}" data-asm-from="${part.id}">
+        ${options.map((o) => `<option value="${o.key}" ${o.key === sel.from[part.id] ? "selected" : ""}>${esc(o.label)} · ${o.qty}</option>`).join("")}
+      </select>
+      <p class="muted" style="margin:2px 0 0">enough for ${sets} piece${sets === 1 ? "" : "s"}</p>`
+      : `<p class="warn-text" style="margin:2px 0 0">None on the floor — split some ${esc(item.code)} first.</p>`}`).join("")}
+      ${seg("asm-to", "The assembled pieces are now at", targets, sel.to)}
+      ${stage?.requires_station ? seg("asm-station", "Station", stations.map((st) => ({ key: st.id, label: st.name })), sel.stationId) : ""}
+      <label for="asm-qty">Pieces assembled</label>
+      <input id="asm-qty" type="number" inputmode="numeric" min="1" value="${esc(qty)}">
+      <p class="muted" style="margin-top:5px">The parts on hand make ${most} piece${most === 1 ? "" : "s"}.</p>
+      <p class="warn-text" id="asm-warn" ${Number(qty) > most ? "" : "hidden"}>More than the parts on hand make — the server will refuse it until they are there.</p>
+      <div style="height:12px" aria-hidden="true"></div>
+      <button class="primary" id="asm-go" ${sel.to && rows.every((r) => r.options.length) ? "" : "disabled"}>${sel.to ? "Assemble" : "Pick where the pieces go"}</button>
+    </div>`;
+}
+
+function bindAssemble(item, parts, rerender) {
+  const sel = assembleSel;
+  document.querySelectorAll("[data-asm-from]").forEach((select) => {
+    select.onchange = (e) => { sel.from[select.dataset.asmFrom] = e.target.value; rerender(); };
+  });
+  wireSeg("seg-asm-to", (key) => { sel.to = key; sel.stationId = null; rerender(); });
+  wireSeg("seg-asm-station", (id) => { sel.stationId = id; rerender(); });
+  const $qty = document.getElementById("asm-qty");
+  if (!$qty) return;
+  $qty.oninput = () => { sel.qty = $qty.value; };
+  const go = document.getElementById("asm-go");
+  if (!go) return;
+  go.onclick = async () => {
+    const qty = Number($qty.value);
+    if (!Number.isInteger(qty) || qty < 1) { toast("Enter a whole quantity of 1 or more"); return; }
+    if (!sel.to || parts.some((part) => !sel.from[part.id])) return;
+    const plain = (S.ref.event_types || []).find((t) => t.is_active && t.moves_quantity && !t.is_finish && !t.is_rework && !t.is_correction);
+    const finish = finishType();
+    const toDone = sel.to === DONE;
+    const stage = !toDone ? stageById(sel.to) : null;
+    const link = newId();
+    const at = new Date().toISOString();
+    const logged = await logEvents([
+      // Each part gives up what goes into this many pieces, from where it is...
+      ...parts.map((part) => linkedRow({
+        item_id: part.id, event_type_id: plain.id, qty: qty * part.per_unit, to_link: true,
+        ...sourceFields(sel.from[part.id]),
+      }, link, at)),
+      // ...and the pieces appear, assembled.
+      linkedRow({
+        item_id: item.id, event_type_id: toDone ? finish.id : plain.id, qty, from_link: true,
+        stage_id: toDone ? null : sel.to, station_id: stage?.requires_station ? sel.stationId : null,
+      }, link, at),
+    ]);
+    if (!logged) return;
+    Object.assign(sel, { itemId: null });
+    logScreenCache.fetchedAt = 0;
+    navigate("#/items");
+  };
 }
 
 function wireSeg(id, onPick) {
@@ -1473,8 +1710,14 @@ async function loadRecent(item) {
       const type = eventType(e.event_type_id);
       // The server resolves a sequence-era row's step to its stage, so every
       // entry reads the same way here. Those rows have no "from".
-      const to = type?.is_finish ? "Done" : e.to_stage_id ? placeName(e.to_stage_id) : "";
-      const from = e.from_unstarted ? "Not started" : e.from_done ? "Done"
+      // A linked entry's other side is another item: its parts, the piece it
+      // belongs to, or the same code in another phase.
+      const hasParts = partsOf(item).length > 0;
+      const other = hasParts ? "parts" : item.parent_item_id ? "assembly" : "another phase";
+      const to = e.to_link ? `into ${other}` : type?.is_finish ? "Done"
+        : e.to_stage_id ? placeName(e.to_stage_id) : e.from_link ? "Not started" : "";
+      const from = e.from_link ? `from ${hasParts ? "parts" : item.parent_item_id ? `split of ${pieceOf(item)?.code || "its piece"}` : "another phase"}`
+        : e.from_unstarted ? "Not started" : e.from_done ? "Done"
         : e.from_stage_id ? placeName(e.from_stage_id) : "";
       const label = [
         type?.name || "event",
@@ -1483,7 +1726,9 @@ async function loadRecent(item) {
         e.state_name || "", // rows logged before states were removed
       ].filter(Boolean).join(" · ");
       const voided = !!e.superseded || queuedVoids.has(e.id);
-      const canVoid = correctionType && type?.moves_quantity && !voided;
+      // One row of a split or an assembly cannot be voided alone: the other
+      // items would keep their half. The opposite move undoes it.
+      const canVoid = correctionType && type?.moves_quantity && !voided && !e.link_id;
       return `
         <div class="spread" style="padding:6px 0;border-bottom:1px solid var(--line)">
           <span><span${voided ? ` style="text-decoration:line-through;opacity:.6"` : ""}>${esc(label)}</span>${voided ? ` <span class="badge">voided</span>` : ""}<br><span class="muted">${new Date(e.occurred_at).toLocaleString()}</span>${e.note ? `<br><span class="muted">“${esc(e.note)}”</span>` : ""}</span>
@@ -2121,14 +2366,18 @@ async function loadItemEditors() {
         <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
         ${itemTags(item)}
         ${item.is_active ? "" : `<span class="badge">archived</span>`}
-        <br><span class="muted">${esc(item.description)} · ${item.total_qty} pcs${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
+        <br><span class="muted">${esc(item.description)} · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
       </summary>
       <div style="padding:8px 0 12px">
         <!-- Readable by anyone, editable by admins: a code or a batch size is
              what the rest of the floor reads the work by. -->
         <div class="field-grid">
           <div><label>Code</label><input data-it-code="${item.id}" value="${esc(item.code)}" ${isAdmin ? "" : "disabled"}></div>
-          <div><label>Batch qty</label><input data-it-qty="${item.id}" type="number" inputmode="numeric" min="1" value="${item.total_qty}" ${isAdmin ? "" : "disabled"}></div>
+          ${item.parent_item_id
+            // A part has no batch of its own: its units come from splitting
+            // the piece it belongs to. Its count per piece is under that piece's Parts.
+            ? `<div><label>Per piece</label><p class="muted" style="margin:10px 0 0">${esc(batchLabel(item))}</p></div>`
+            : `<div><label>Batch qty</label><input data-it-qty="${item.id}" type="number" inputmode="numeric" min="1" value="${item.total_qty}" ${isAdmin ? "" : "disabled"}></div>`}
         </div>
         <label>Description</label>
         <input data-it-desc="${item.id}" value="${esc(item.description)}" ${isAdmin ? "" : "disabled"}>
@@ -2143,6 +2392,9 @@ async function loadItemEditors() {
         </div>`
         : `<p class="muted" style="margin-top:10px">Changing these is an admin job. Creating
         items, logging entries and bumping the revision are not.</p>`}
+
+        ${item.is_active ? partsEditor(item, items) : ""}
+        ${item.is_active && isAdmin ? phaseMover(item, items) : ""}
 
         <label style="margin-top:12px">Item icon</label>
         <div style="display:flex;gap:10px;align-items:center">
@@ -2207,10 +2459,11 @@ async function loadItemEditors() {
         code,
         description: field("data-it-desc", id).value.trim(),
         dimensions: field("data-it-dims", id).value.trim(),
-        total_qty: Number(field("data-it-qty", id).value) || byId.get(id).total_qty,
         area_id: field("data-it-area", id).value || null,
         phase_id: field("data-it-phase", id).value || null,
       };
+      const qtyField = field("data-it-qty", id);
+      if (qtyField) body.total_qty = Number(qtyField.value) || byId.get(id).total_qty;
       // Empty means "leave it where it is": the item's project is archived and
       // nothing was picked to move it to.
       const projectId = field("data-it-project", id).value;
@@ -2255,6 +2508,9 @@ async function loadItemEditors() {
     panel.ontoggle = load;
     load(); // a background re-render lands with the panel already open
   });
+
+  bindPartsEditor(target, byId);
+  bindPhaseMover(target, byId);
 
   target.querySelectorAll("[data-it-bump]").forEach((button) => {
     button.onclick = async () => {
@@ -2331,6 +2587,138 @@ async function loadItemEditors() {
         loadItemEditors();
       } catch (error) {
         alert(error.body?.detail || "Could not delete the item.");
+      }
+    };
+  });
+}
+
+/* Parts, in an item's editor. A part is an item of its own (its code, its
+   log) that is split off the piece on the floor and assembled back into it.
+   How many go into one piece can only change while no pieces are out in
+   parts: they were split by the old count. */
+function partsEditor(item, items) {
+  const parts = items.filter((i) => i.parent_item_id === item.id && i.is_active);
+  const busy = !S.online ? "disabled" : "";
+  return `
+        <label style="margin-top:12px">Parts</label>
+        ${parts.length ? parts.map((part) => `
+        <div class="spread" style="gap:8px;padding:4px 0">
+          <span style="min-width:0"><strong>${esc(part.code)}</strong> <span class="muted">${esc(part.description)}</span></span>
+          <span style="display:flex;gap:6px;align-items:center;flex:none">
+            <input data-pt-per="${part.id}" type="number" inputmode="numeric" min="1" value="${part.per_unit}"
+                   aria-label="How many per piece" style="width:70px;padding:8px">
+            <span class="muted">per piece</span>
+            <button class="ghost" data-pt-save="${part.id}" style="width:auto;padding:8px 12px" ${busy}>Save</button>
+          </span>
+        </div>`).join("") : `<p class="muted">None — it goes through the factory as one piece.</p>`}
+        <div class="field-grid">
+          <div><label>New part's code</label><input data-pt-code="${item.id}" maxlength="64" value="${esc(item.code)}-"></div>
+          <div><label>Name</label><input data-pt-desc="${item.id}" maxlength="255" placeholder="e.g. Headboard"></div>
+        </div>
+        <div class="field-grid">
+          <div><label>How many per piece</label><input data-pt-n="${item.id}" type="number" inputmode="numeric" min="1" value="1"></div>
+          <div style="align-self:end"><button class="ghost" data-pt-add="${item.id}" style="padding:10px 16px" ${busy}>Add part</button></div>
+        </div>
+        ${item.state?.in_parts_qty ? `<p class="muted">${item.state.in_parts_qty} piece(s) are out in parts. Parts cannot be added or recounted until they are assembled back.</p>` : ""}`;
+}
+
+function bindPartsEditor(target, byId) {
+  const value = (attr, id) => target.querySelector(`[${attr}="${id}"]`)?.value ?? "";
+  target.querySelectorAll("[data-pt-add]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.ptAdd;
+      const code = value("data-pt-code", id).trim();
+      const perUnit = Number(value("data-pt-n", id));
+      if (!code || code === `${byId.get(id).code}-`) { alert("Give the part a code."); return; }
+      if (!Number.isInteger(perUnit) || perUnit < 1) { alert("How many per piece: a whole number, 1 or more."); return; }
+      try {
+        await api(`/api/items/${id}/parts`, {
+          method: "POST",
+          body: JSON.stringify({ code, description: value("data-pt-desc", id).trim(), per_unit: perUnit }),
+        });
+        toast(`${code} added as a part of ${byId.get(id).code}`);
+        await sync();
+        loadItemEditors();
+      } catch (error) {
+        alert(error.body?.detail || "Could not add the part.");
+      }
+    };
+  });
+  target.querySelectorAll("[data-pt-save]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.ptSave;
+      const perUnit = Number(value("data-pt-per", id));
+      if (!Number.isInteger(perUnit) || perUnit < 1) { alert("How many per piece: a whole number, 1 or more."); return; }
+      try {
+        await api(`/api/items/${id}/part`, { method: "PATCH", body: JSON.stringify({ per_unit: perUnit }) });
+        toast("Part updated");
+        await sync();
+        loadItemEditors();
+      } catch (error) {
+        alert(error.body?.detail || "Could not change the part.");
+      }
+    };
+  });
+}
+
+/* Some of a batch into another phase of its project. Before the batch is
+   released it is planning -- quantity moves from one batch's total to the
+   other's, and the other waits on this one's sample. After, it is real units,
+   taken from where they are and arriving at the same place. */
+function phaseMover(item, items) {
+  if (item.parent_item_id || items.some((i) => i.parent_item_id === item.id)) return "";
+  const phases = (S.ref?.phases || []).filter((ph) => ph.project_id === item.project_id && ph.is_active && ph.id !== item.phase_id);
+  const options = [
+    ...phases.map((ph) => `<option value="${ph.id}">${esc(ph.name)}</option>`),
+    ...(item.phase_id ? [`<option value="">No phase</option>`] : []),
+  ];
+  if (!options.length) return "";
+  const planned = item.state?.phase !== "production";
+  const places = planned ? [] : (item.state?.positions || [])
+    .map((p) => ({ key: p.is_unstarted ? UNSTARTED : p.stage_id, name: p.stage_name, qty: p.qty - (p.sample_qty || 0) }))
+    .filter((p) => p.qty > 0);
+  if (!planned && !places.length) return "";
+  return `
+        <label style="margin-top:12px">Move some into another phase</label>
+        <select data-ph-to="${item.id}">${options.join("")}</select>
+        ${planned ? `
+        <label>How many of the planned ${item.total_qty}</label>
+        <input data-ph-take="${item.id}" data-ph-key="${UNSTARTED}" type="number" inputmode="numeric" min="0" max="${item.total_qty}" placeholder="0">
+        <p class="muted" style="margin-top:4px">Nothing is on the floor yet. The other phase's batch is released by this item's sample.</p>`
+        : places.map((p) => `
+        <div class="spread" style="gap:8px;padding:3px 0">
+          <span class="muted">${esc(p.name)} · ${p.qty}</span>
+          <input data-ph-take="${item.id}" data-ph-key="${p.key}" type="number" inputmode="numeric" min="0" max="${p.qty}"
+                 placeholder="0" aria-label="How many from ${esc(p.name)}" style="width:90px;padding:8px">
+        </div>`).join("")}
+        <button class="ghost" data-ph-go="${item.id}" style="width:auto;padding:10px 16px;margin-top:6px" ${S.online ? "" : "disabled"}>Move</button>`;
+}
+
+function bindPhaseMover(target, byId) {
+  target.querySelectorAll("[data-ph-go]").forEach((button) => {
+    button.onclick = async () => {
+      const id = button.dataset.phGo;
+      const item = byId.get(id);
+      const take = {};
+      for (const input of target.querySelectorAll(`[data-ph-take="${id}"]`)) {
+        const qty = Number(input.value || 0);
+        if (!Number.isInteger(qty) || qty < 0) { alert("Quantities are whole numbers."); return; }
+        if (qty) take[input.dataset.phKey] = qty;
+      }
+      const total = Object.values(take).reduce((a, b) => a + b, 0);
+      if (!total) { alert("Say how many to move."); return; }
+      const select = target.querySelector(`[data-ph-to="${id}"]`);
+      const phaseName = select.options[select.selectedIndex]?.text || "";
+      if (!confirm(`Move ${total} of ${item.code} into ${phaseName}?`)) return;
+      try {
+        const moved = await api(`/api/items/${id}/split-phase`, {
+          method: "POST", body: JSON.stringify({ phase_id: select.value || null, take }),
+        });
+        toast(`${total} moved into ${phaseName} (${itemName(moved.to)})`);
+        await sync();
+        loadItemEditors();
+      } catch (error) {
+        alert(error.body?.detail || "Could not move them.");
       }
     };
   });

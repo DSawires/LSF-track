@@ -300,6 +300,12 @@ def item_state(db: Session, item_ids: list[uuid.UUID], now: datetime | None = No
             "done_qty": ledger.done_qty,
             "unstarted_qty": ledger.unstarted_qty,
             "production_unstarted_qty": ledger.production_unstarted_qty,
+            # The batch as it stands, units moved between phases included.
+            "batch_qty": ledger.batch_qty,
+            # Pieces out in parts right now, not yet assembled back.
+            "in_parts_qty": ledger.in_parts_qty,
+            # Released by another item's sample, which is not done yet.
+            "waits_on_sample": ledger.shares_sample and ledger.released_at is None,
             "event_count": ledger.applied_count,
             "last_event_at": (
                 ledger.last_event_at.isoformat() if ledger.last_event_at else None

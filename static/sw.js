@@ -135,13 +135,21 @@ self.addEventListener("sync", (event) => {
 async function drainFromWorker() {
   // Oldest first, as the page's drain does: the queue comes back in UUID order,
   // and an entry must not go a chunk ahead of the earlier one it depends on.
+  // The entries of one split or assembly share a moment and a link_id: sorted
+  // together, and never cut apart between two requests.
+  const key = (q) => `${q.occurred_at}|${q.link_id || ""}`;
   const queue = (await LSF_DB.queueAll())
     .filter((q) => q._status === "pending")
-    .sort((a, b) => (a.occurred_at < b.occurred_at ? -1 : a.occurred_at > b.occurred_at ? 1 : 0));
-  for (let start = 0; start < queue.length; start += 100) {
-    const events = queue
-      .slice(start, start + 100)
-      .map(({ _queued_at, _status, _reason, ...event }) => event);
+    .sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+  const chunks = [];
+  for (const entry of queue) {
+    const last = chunks[chunks.length - 1];
+    const sameGroup = last && entry.link_id && last[last.length - 1].link_id === entry.link_id;
+    if (!last || (last.length >= 100 && !sameGroup)) chunks.push([entry]);
+    else last.push(entry);
+  }
+  for (const chunk of chunks) {
+    const events = chunk.map(({ _queued_at, _status, _reason, ...event }) => event);
     const response = await fetch("/api/events/batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

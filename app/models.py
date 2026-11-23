@@ -218,6 +218,18 @@ class Item(Base):
     `total_qty` -- the production batch, on top of the sample -- is released
     into "not started". The release is derived from the log by the ledger, never
     stored. `sample_qty` 0 means no sample (items that predate the sample flow).
+
+    Parts. An item can be split into parts that go through the factory on
+    their own -- a bed into its frame, headboard and four legs -- and come back
+    together at assembly. A part is an item in its own right (its own code, its
+    own log), with `parent_item_id` naming what it is part of and `per_unit`
+    saying how many of it go into one piece. Parts can have parts. Units only
+    ever reach a part through a split, and leave it through an assembly: see
+    the linked entries on `Event`.
+
+    `sample_item_id` is set on a batch split off into another phase before its
+    sample was done: that batch has no sample of its own, and is released the
+    moment the other item's sample is.
     """
 
     __tablename__ = "items"
@@ -242,6 +254,13 @@ class Item(Base):
     total_qty: Mapped[int] = mapped_column(sa.Integer)
     sample_qty: Mapped[int] = mapped_column(sa.Integer, default=1)
     drawing_revision: Mapped[str] = mapped_column(sa.String(32))
+    parent_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("items.id"), nullable=True, index=True
+    )
+    per_unit: Mapped[int] = mapped_column(sa.Integer, default=1, server_default="1")
+    sample_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("items.id"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
@@ -425,6 +444,15 @@ class Event(Base):
     from_item_step_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("item_steps.id"), nullable=True
     )
+    # Linked entries: units leaving this item for another, or arriving from
+    # one. A split into parts, an assembly, or units re-filed into another
+    # phase is a group of rows sharing `link_id` -- one per item it touches,
+    # each naming its own place and quantity, stored all together or not at
+    # all. `to_link` is a destination (the units leave this item);
+    # `from_link` is a source (they arrive from the other side of the group).
+    link_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True, index=True)
+    from_link: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
+    to_link: Mapped[bool] = mapped_column(sa.Boolean, default=False, server_default=sa.false())
     reason_code_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.ForeignKey("reason_codes.id"), nullable=True
     )

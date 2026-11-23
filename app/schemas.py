@@ -35,6 +35,12 @@ class EventCreate(BaseModel):
     from_stage_id: uuid.UUID | None = None
     from_unstarted: bool = False
     from_done: bool = False
+    # A linked entry: part of a split into parts, an assembly, or a move into
+    # another phase. Every row of the group carries the same link_id and is
+    # posted in one batch.
+    link_id: uuid.UUID | None = None
+    from_link: bool = False
+    to_link: bool = False
     # Sequence-era shape, accepted so queues filled before items lost their
     # sequences still drain: a step instead of a stage, and an optional source
     # step (or none at all).
@@ -151,6 +157,34 @@ class TranslateRequest(BaseModel):
             if len(text) > 4000:
                 raise ValueError("one of the texts is longer than 4000 characters")
         return texts
+
+
+class PartCreate(BaseModel):
+    """A part an item is split into. It inherits the item's project, area,
+    phase and drawing revision."""
+
+    code: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=255)
+    dimensions: str | None = Field(default=None, max_length=255)
+    # How many of this part go into one piece: a chair has four legs.
+    per_unit: int = Field(default=1, ge=1, le=10_000)
+
+
+class PartUpdate(BaseModel):
+    per_unit: int | None = Field(default=None, ge=1, le=10_000)
+    description: str | None = Field(default=None, max_length=255)
+
+
+class PhaseSplit(BaseModel):
+    """Re-file some of a batch into another phase (null: no phase).
+
+    `take` is how many from each place: "unstarted", or a stage id. Before the
+    batch is released only "unstarted" means anything: it is the planned
+    quantity.
+    """
+
+    phase_id: uuid.UUID | None = None
+    take: dict[str, int] = Field(min_length=1, max_length=200)
 
 
 class ItemsAssign(BaseModel):

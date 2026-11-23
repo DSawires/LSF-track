@@ -88,6 +88,13 @@ optional and is never inferred. With no sequence to consult, the row is the
 only record of the path a batch actually took, and it is kept so the real
 routes can be read back out of the log later.
 
+Units can also leave an item for another, or arrive from one: a split into
+parts, an assembly of parts, or units re-filed into another phase's batch.
+Those are **linked entries** — a group of rows sharing `link_id`, one per item,
+each naming its own place and quantity (`to_link` as its destination,
+`from_link` as its source). The group is checked and stored whole or not at
+all (`services.events.record_group`), and every row replays on its own item.
+
 Do not reintroduce an order between stages: no "next stage", no "upstream", no
 picker that hides stages an item is not expected to reach, no report that
 assumes a direction. `stages.sort_order` is the order stages are *listed* in,
@@ -127,6 +134,11 @@ The release is computed by the ledger on every replay, timestamped by the event
 that finished the sample. It is never a column, never a stored flag, never an
 event the server writes: void the finishing entry and the batch goes back to not
 existing. `sample_qty` 0 means no sample (items that predate the flow).
+
+A sample split into parts is still the sample when it is assembled back: the
+first units to return fill the sample units that left. A batch split into
+another phase before its sample was done (`items.sample_item_id`) has no sample
+of its own: it is released, on replay, the moment that item's sample is.
 
 ### 6. A unit is at a stage or it is not
 
@@ -190,7 +202,15 @@ Names are indicative; Alembic migrations are authoritative.
   Creating one **is** the handoff
   to the floor: there is no released/unreleased state, and `created_at` is when
   the sample started counting. Items arrive through the project import file,
-  or one at a time from Office → Items. An item has no stages of its own
+  or one at a time from Office → Items. An item has no stages of its own.
+  **Parts:** an item can have parts (`parent_item_id`, `per_unit` = how many
+  go into one piece), each an item of its own, filed with its piece (same
+  project, area, phase; they follow it). A part's `total_qty` is 0: its units
+  only arrive by splitting the piece and leave by assembling it. The parts of
+  an item do not change while pieces are out in parts. An item with parts, or
+  a part, never moves between phases; an item that has moved units between
+  phases cannot be given parts — the ledger tells the two kinds of linked
+  entry apart by that, never by a flag on the row
 - `item_steps` — legacy only (see rule 3): the ordered sequence items used to
   carry. Never written; read to replay entries that point at a step
 - `work_orders`, `work_order_lines` — numbered documents (WO-0001, …)
@@ -233,6 +253,9 @@ Names are indicative; Alembic migrations are authoritative.
 | `from_stage_id` | where the units came from, if that was a stage |
 | `from_unstarted` | they came from "not started" |
 | `from_done` | they came back out of Done; rework only |
+| `link_id` | the group a linked entry belongs to (a split, an assembly, a move between phases) |
+| `to_link` | the units leave this item for the other side of the group (a destination; no stage) |
+| `from_link` | the units arrive from the other side of the group (a source); no stage = not started |
 | `item_step_id`, `from_item_step_id` | legacy only (rule 3): sequence-era rows name steps |
 | `state_id` | legacy only, NULL on every new row (see rule 6) |
 | `reason_code_id` | nullable |
@@ -243,8 +266,9 @@ Names are indicative; Alembic migrations are authoritative.
 | `note` | nullable, free text, never parsed |
 | `supersedes_event_id` | nullable, for corrections |
 
-Exactly one of `from_stage_id` / `from_unstarted` / `from_done` is set on every
-new entry that moves units.
+Exactly one of `from_stage_id` / `from_unstarted` / `from_done` / `from_link`
+is set on every new entry that moves units. `from_done` outside rework is only
+for a linked row taking finished parts into an assembly.
 
 Index for the queries that matter: `(item_id, occurred_at)`,
 `(station_id, occurred_at)`, `(received_at)`, `(stage_id)`.
@@ -271,6 +295,10 @@ connection.
 - A response the service worker served from its cache is not a sync. `sync()`
   only counts answers that came from the server, or "last synced" would read
   "just now" in a dead spot.
+- The entries of one split or assembly are queued together and drained
+  together: a chunk is never cut inside a `link_id` group (page and service
+  worker), a refused group is quarantined, retried and discarded as one, and
+  `POST /events` refuses a linked row posted on its own.
 - Reports run on `occurred_at`. `received_at` exists to detect late syncs and wrong
   device clocks — flag events where the gap is implausible rather than trusting
   device time silently.
@@ -337,6 +365,14 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   item under the company mark (`static/brand/`). Online-only, like the other
   office screens. A picture chosen for a line is stored as an item image of
   kind `document`, which is not the item's icon
+- Parts and assembly: Office → Items → an item's editor → Parts (any
+  engineer); on the floor, the item's screen offers "Split into parts" and
+  "Assemble from parts" (where each part comes from, where the pieces go, how
+  many). Offline like every entry. The card shows pieces out "In parts"
+- Splitting a batch across phases (admin, the item's editor,
+  `POST /api/items/{id}/split-phase`): before release, planned quantity moves
+  and the new batch waits on the original's sample; after, units move place
+  by place as linked pairs. Online-only, an office action
 - Work orders in Arabic: the PDF prints in English, Arabic (mirrored, right to
   left) or both. Arabic is shaped and ordered in `app/services/arabic.py`
   before reportlab sees it, so it must be wrapped there too — never hand a

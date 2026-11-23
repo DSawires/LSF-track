@@ -21,6 +21,20 @@ released into "not started", timestamped by the event that finished the sample.
 The release is derived on every replay, never stored: void the finishing entry
 and the batch goes back to not existing.
 
+Linked entries. Units can also leave an item for another one, or arrive
+from one: a split into parts, an assembly of parts, or units re-filed into
+another phase. Such a row has `to_link` as its destination (the units leave
+this item's places altogether) or `from_link` as its source (they appear at
+the place the row names, which may be "not started"). Each row is replayed on
+its own item like any other; the group they form is checked when it is
+written (services.events). A sample sent into parts is still the sample when
+it comes back assembled: the first units to return fill the sample units that
+left, so finishing them still releases the batch.
+
+A batch split off into another phase before its sample was done has no
+sample of its own (`sample_item_id`): it is released when that other item's
+sample is, and the replay is told when that was (`release_at`).
+
 Legacy rows. Items used to carry an ordered sequence of steps (`item_steps`),
 and an entry named a step and no source: it took its units from the nearest
 step before it (or, for rework, after it), so a skipped log resolved itself.
@@ -77,7 +91,8 @@ class Position:
 
 @dataclass(frozen=True)
 class Move:
-    """What one event does: which place it fills, and which it drains, in order."""
+    """What one event does: which place it fills, and which it drains, in order.
+    `target` is -1 for a row whose units leave the item."""
 
     target: int
     sources: list[int]
@@ -86,6 +101,10 @@ class Move:
     named: bool
     # Free movement between stages, as opposed to a sequence-era row.
     free: bool
+    # A linked row: units arriving from another item (no source here), or
+    # leaving for one (no target here).
+    inflow: bool = False
+    outflow: bool = False
 
 
 @dataclass
@@ -201,8 +220,26 @@ def _sort_key(event: Event) -> tuple:
 class ItemLedger:
     """Replays one item's events into places holding FIFO lots."""
 
-    def __init__(self, item: Item, steps: list[ItemStep], vocab: Vocabulary) -> None:
+    def __init__(
+        self,
+        item: Item,
+        steps: list[ItemStep],
+        vocab: Vocabulary,
+        parts_link: bool = False,
+        release_at: datetime | None = None,
+    ) -> None:
+        """`parts_link`: this item has parts or is one, so its linked rows are
+        splits and assemblies rather than moves between phases. `release_at`:
+        for a batch released by another item's sample, when that happened
+        (None while it has not)."""
         self.item = item
+        self.parts_link = parts_link
+        # Units out in parts and not back yet, and how many of them are sample.
+        self.in_parts_qty = 0
+        self._sample_in_parts = 0
+        # Units re-filed into, or out of, this batch from another phase.
+        self.transferred_in = 0
+        self.transferred_out = 0
         self.vocab = vocab
         self.anomalies: list[Anomaly] = []
         self.applied_count = 0
@@ -262,7 +299,14 @@ class ItemLedger:
         start = item.created_at
         self.sample_qty = max(item.sample_qty or 0, 0)
         self.released_at: datetime | None = None
-        if self.sample_qty > 0:
+        self.shares_sample = getattr(item, "sample_item_id", None) is not None
+        if self.shares_sample:
+            # Another item's sample releases this batch. Released or not, it
+            # has no sample of its own to finish.
+            self.sample_qty = 0
+            if release_at is not None:
+                self._release(max(release_at, start))
+        elif self.sample_qty > 0:
             self.buckets[UNSTARTED_INDEX].append(
                 Lot(qty=self.sample_qty, arrived_at=start, is_sample=True)
             )
@@ -301,13 +345,26 @@ class ItemLedger:
             event.stage_id is not None
             or event.from_stage_id is not None
             or bool(event.from_unstarted)
+            or bool(getattr(event, "from_link", False))
+            or bool(getattr(event, "to_link", False))
         )
         if free:
             return self._resolve_free(event, event_type)
         return self._resolve_legacy(event, event_type)
 
     def _resolve_free(self, event: Event, event_type: EventType) -> tuple[Move | None, str | None]:
-        if event_type.is_finish:
+        from_link = bool(getattr(event, "from_link", False))
+        to_link = bool(getattr(event, "to_link", False))
+        if from_link and to_link:
+            return None, "an entry either takes units out of this item or brings them in, not both"
+        if to_link:
+            if event.stage_id is not None or event_type.is_finish:
+                return None, "units leaving for another item name no stage here"
+            target = -1
+        elif from_link and event.stage_id is None and not event_type.is_finish:
+            # Arriving from another item: they may arrive not started.
+            target = UNSTARTED_INDEX
+        elif event_type.is_finish:
             if event.stage_id is not None:
                 return None, "a finish entry moves units to Done and names no stage"
             target = self.done_index
@@ -321,9 +378,12 @@ class ItemLedger:
             event.from_stage_id is not None,
             bool(event.from_unstarted),
             bool(event.from_done),
+            from_link,
         ]
         if sum(named) != 1:
             return None, "event must name exactly one place its units come from"
+        if from_link:
+            return Move(target=target, sources=[], named=True, free=True, inflow=True), None
         if event.from_unstarted:
             sources = [UNSTARTED_INDEX]
         elif event.from_done:
@@ -332,9 +392,9 @@ class ItemLedger:
             sources = list(self._stage_slots.get(event.from_stage_id, []))
             if not sources:
                 return None, "event takes units from a stage that does not exist"
-        if sources == [target] and self.positions[target].is_done:
+        if target >= 0 and sources == [target] and self.positions[target].is_done:
             return None, "event moves units from Done to Done"
-        return Move(target=target, sources=sources, named=True, free=True), None
+        return Move(target=target, sources=sources, named=True, free=True, outflow=to_link), None
 
     def _resolve_legacy(
         self, event: Event, event_type: EventType
@@ -395,6 +455,9 @@ class ItemLedger:
             and event.station_id is None
             and event_type.moves_quantity
             and not (event.state_id is not None and event.state_id == self._legacy_entry_state_id)
+            # Units re-filed into this batch are already at that stage; the
+            # row moving them says nothing about a station.
+            and not getattr(event, "from_link", False)
         ):
             self._flag(
                 event,
@@ -414,6 +477,10 @@ class ItemLedger:
         if event.qty <= 0:
             return
 
+        if move.inflow:
+            self._arrive(event, move)
+            return
+
         taken, shortfall = self._take(move.sources, event.qty)
         if shortfall:
             if move.named:
@@ -428,6 +495,15 @@ class ItemLedger:
                     f"were available {where}; {shortfall} unaccounted for"
                 ),
             )
+
+        if move.outflow:
+            moved = sum(lot.qty for _index, lot in taken)
+            if self.parts_link:
+                self.in_parts_qty += moved
+                self._sample_in_parts += sum(lot.qty for _i, lot in taken if lot.is_sample)
+            else:
+                self.transferred_out += moved
+            return
 
         destination = self.buckets[move.target]
         target = self.positions[move.target]
@@ -453,7 +529,31 @@ class ItemLedger:
                 )
             )
 
-        if self.released_at is None and self.done_qty >= self.sample_qty:
+        if self.released_at is None and self.done_qty >= self.sample_qty and not self.shares_sample:
+            self._release(event.occurred_at)
+
+    def _arrive(self, event: Event, move: Move) -> None:
+        """Units coming in from another item: assembled from parts, split off
+        a parent, or re-filed from another phase."""
+        qty = event.qty
+        lots: list[Lot] = []
+        if self.parts_link:
+            # Assembled back together. Whatever left as sample returns as the
+            # sample: those are the first units back.
+            back = min(qty, self.in_parts_qty)
+            self.in_parts_qty -= back
+            sample = min(qty, self._sample_in_parts)
+            self._sample_in_parts -= sample
+            if sample:
+                lots.append(Lot(qty=sample, arrived_at=event.occurred_at,
+                                station_id=event.station_id, is_sample=True))
+            qty -= sample
+        else:
+            self.transferred_in += qty
+        if qty:
+            lots.append(Lot(qty=qty, arrived_at=event.occurred_at, station_id=event.station_id))
+        self.buckets[move.target].extend(lots)
+        if self.released_at is None and self.done_qty >= self.sample_qty and not self.shares_sample:
             self._release(event.occurred_at)
 
     def _take(self, source_indexes, qty: int) -> tuple[list[tuple[int, Lot]], int]:
@@ -563,6 +663,12 @@ class ItemLedger:
     @property
     def unstarted_qty(self) -> int:
         return sum(lot.qty for lot in self.buckets[UNSTARTED_INDEX])
+
+    @property
+    def batch_qty(self) -> int:
+        """The production batch as it stands: what it was planned at, plus
+        units re-filed into it from another phase, less those re-filed out."""
+        return self.item.total_qty + self.transferred_in - self.transferred_out
 
     @property
     def production_unstarted_qty(self) -> int:

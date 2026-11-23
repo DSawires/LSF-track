@@ -11,7 +11,7 @@ from app.db import get_db
 from app.deps import current_user
 from app.models import Event, Item, User
 from app.schemas import EventBatch, EventCreate
-from app.services.events import EventRejected, record_event
+from app.services.events import EventRejected, record_event, record_group
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,9 @@ def _event_payload(event: Event) -> dict:
         "supersedes_event_id": (
             str(event.supersedes_event_id) if event.supersedes_event_id else None
         ),
+        "link_id": str(event.link_id) if event.link_id else None,
+        "from_link": bool(event.from_link),
+        "to_link": bool(event.to_link),
     }
 
 
@@ -113,7 +116,18 @@ def post_batch(
         ).all()
 
     results = []
+    # A split, an assembly or a phase move is a group of rows sharing a
+    # link_id. It is stored whole or not at all, at the place of its first row.
+    groups: dict = {}
+    for entry in payload.events:
+        if entry.link_id is not None:
+            groups.setdefault(entry.link_id, []).append(entry)
     for entry in sorted(payload.events, key=_occurred_sort_key):
+        if entry.link_id is not None:
+            group = groups.pop(entry.link_id, None)
+            if group is not None:
+                results.extend(_store_group(db, group, user))
+            continue
         try:
             # A SAVEPOINT per entry: an unexpected failure on one event must
             # neither 500 the whole drain (rolling back events the client is
@@ -149,3 +163,28 @@ def post_batch(
                 }
             )
     return {"results": results}
+
+
+def _store_group(db: Session, group: list[EventCreate], user: User) -> list[dict]:
+    try:
+        with db.begin_nested():
+            written = record_group(db, group, user)
+        return [
+            {"id": str(row.id), "status": "stored" if result.created else "duplicate",
+             "divergent": result.divergent}
+            for row, result in zip(group, written)
+        ]
+    except EventRejected as exc:
+        # Every row of the group carries the reason: the phone quarantines
+        # them together, and a retry sends them together.
+        return [
+            {"id": str(row.id), "status": "rejected", "reason": exc.reason, "field": exc.field}
+            for row in group
+        ]
+    except Exception:
+        log.exception("unexpected failure storing linked entries %s", group[0].link_id)
+        return [
+            {"id": str(row.id), "status": "error",
+             "reason": "server error storing this entry; it will be retried"}
+            for row in group
+        ]

@@ -261,6 +261,47 @@ per phase.
   progress / finished); **Reports** narrow WIP and aging to an area and a
   phase. Wherever an item is shown, its area and phase are shown with its
   code.
+- **Splitting a batch across phases.** In an item's editor (Office → Items,
+  admin), *Move some into another phase* re-files part of the batch: 150 of
+  the 216 for phase 1, 66 for phase 2. The other phase's batch is the same
+  code under that phase, made if it does not exist yet.
+  - Before the batch is released (its sample is not done) this is planning:
+    the quantity moves from one batch to the other, and the new batch has no
+    sample of its own — it is released the moment this item's sample is done.
+  - After, it moves real units, place by place (so many not started, so many
+    at carpentry…). They arrive in the other phase at the same place, with
+    two linked entries in the log. Finished units stay where they are.
+
+## Parts and assembly
+
+A piece can be split into the parts it is built from — a bed into a frame, a
+headboard and four legs — which go through the factory on their own and come
+back together at assembly.
+
+- **Giving an item parts:** Office → Items → its editor → *Parts*. Each part
+  has its own code and says how many go into one piece. A part is an item in
+  its own right: it appears in the list, in the reports and at its stages, and
+  is filed in the same area and phase as its piece (it follows if the piece is
+  re-filed). Parts can have parts.
+- **Splitting, on the floor:** on the item's screen, *What happened → Split
+  into parts*. Pick the pieces (the batch you tapped), where the parts go
+  (not started, or any stage) and how many pieces. 3 beds become 3 frames,
+  3 headboards and 12 legs. The card then shows the 3 as *In parts*.
+- **Moving the parts:** each part's card works like any other item's.
+- **Assembling:** on the piece's screen, *Assemble from parts*. Say where
+  each part is taken from (where most of it is, by default — finished parts
+  included), where the assembled pieces now are, and how many. It works out
+  how many the parts on hand make.
+- Splitting and assembling work offline, like every entry. The entries of one
+  split or assembly are stored together or not at all; if one is refused, all
+  of them wait under the sync pill and Retry sends them back together.
+- The sample stays the sample: split it into parts, assemble it, finish it,
+  and the batch is released as usual.
+- While pieces are out in parts, the parts cannot be added to, recounted or
+  removed — they were split by the old count. Assemble them first. A split or
+  an assembly done by mistake is undone by the opposite one, not by Void.
+- An item split across phases cannot have parts, and an item with parts moves
+  between phases whole: re-file the batch first, then give it parts.
 
 ## Work orders
 
