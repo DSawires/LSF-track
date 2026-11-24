@@ -4405,7 +4405,10 @@ function officeUsers(body) {
           <div><label for="nu-display">${t("Display name")}</label><input id="nu-display" autocomplete="off" dir="auto"></div>
         </div>
         <label for="nu-pass">${t("Password (min 8 characters)")}</label>
-        <input id="nu-pass" type="password" autocomplete="new-password">
+        <div class="qty-row">
+          <input id="nu-pass" type="password" autocomplete="new-password" style="flex:1;text-align:start;padding:10px">
+          <button class="ghost" type="button" data-gen-pass="#nu-pass" style="width:auto;padding:10px 16px">${t("Generate")}</button>
+        </div>
         <label style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:14px;color:var(--text)">
           <input type="checkbox" id="nu-admin" style="width:22px;height:22px;flex:none">
           ${t("Admin — can manage stages, users, and removals")}
@@ -4415,6 +4418,7 @@ function officeUsers(body) {
         <p class="warn-text" id="nu-err" hidden></p>
       </details>
     </div>`;
+  wirePasswordGenerators(body);
   loadUsers();
 }
 
@@ -4824,6 +4828,38 @@ function renderStageAdmin() {
 
 /* ---------------------------------------------------------- user admin -- */
 
+/* A password an admin can read out to an engineer and the engineer can type
+   on a phone: lowercase letters and digits with the look-alikes left out
+   (0/o, 1/l/i), in three groups of four. 31 symbols x 12 is ~59 bits. */
+const PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+
+function generatePassword() {
+  const picks = crypto.getRandomValues(new Uint32Array(12));
+  const chars = [...picks].map((n) => PASSWORD_ALPHABET[n % PASSWORD_ALPHABET.length]);
+  return [0, 4, 8].map((at) => chars.slice(at, at + 4).join("")).join("-");
+}
+
+/* Fills a password box and shows what is in it: the point is to hand it on.
+   Nothing is saved until Create user or Reset is pressed. */
+function wirePasswordGenerators(root) {
+  root.querySelectorAll("[data-gen-pass]").forEach((button) => {
+    button.onclick = async () => {
+      const input = root.querySelector(button.dataset.genPass);
+      if (!input) return;
+      input.type = "text";
+      input.value = generatePassword();
+      // As if typed, so a background refresh carries it across.
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      try {
+        await navigator.clipboard.writeText(input.value);
+        toast(t("Password generated and copied"));
+      } catch {
+        toast(t("Password generated — it is shown in the box"));
+      }
+    };
+  });
+}
+
 async function loadUsers() {
   const target = document.getElementById("mg-users");
   if (!target) return;
@@ -4852,6 +4888,7 @@ async function loadUsers() {
         <div class="qty-row">
           <input data-user-pass="${u.id}" type="password" autocomplete="new-password"
                  placeholder="${esc(t("min 8 characters"))}" style="flex:1;text-align:start;padding:10px">
+          <button class="ghost" type="button" data-gen-pass="[data-user-pass='${u.id}']" style="width:auto;padding:10px 16px">${t("Generate")}</button>
           <button class="ghost" data-user-reset="${u.id}" style="width:auto;padding:10px 16px">${t("Reset")}</button>
         </div>
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
@@ -4876,6 +4913,7 @@ async function loadUsers() {
   // This list lands after render() has already restored the view, so it has to
   // put the user's open panels and half-typed names back itself.
   restoreView(lastSnapshot);
+  wirePasswordGenerators(target);
 
   target.querySelectorAll("[data-user-save]").forEach((b) => {
     b.onclick = () => patchUser(b.dataset.userSave, {
