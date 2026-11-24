@@ -378,6 +378,8 @@ const LINK = "link";
 const partsOf = (item) => S.items.filter((i) => i.parent_item_id === item.id && i.is_active !== false);
 const pieceOf = (item) => (item?.parent_item_id ? S.items.find((i) => i.id === item.parent_item_id) || null : null);
 const partName = (part) => part.description || part.code;
+// An item with every part under it, and theirs: what one card shows.
+const familyOf = (item) => [item, ...partsOf(item).flatMap(familyOf)];
 
 /* "216 pcs" for a batch -- units moved between phases included -- and for a
    part, how many go into each piece of what it belongs to. */
@@ -447,9 +449,11 @@ const matchesLabel = (item, field, filter) =>
      finished:  every unit is Done
      progress:  anything in between */
 function progressOf(item) {
-  const { places, done } = localPlaces(item);
-  const started = done > 0 || places.some((p) => p.key !== UNSTARTED);
+  const { places, done, inParts } = localPlaces(item);
+  // Pieces out in parts are being worked on, wherever the parts are.
+  const started = done > 0 || inParts > 0 || places.some((p) => p.key !== UNSTARTED);
   if (!started) return "unstarted";
+  if (inParts > 0) return "progress";
   return places.length ? "progress" : "finished";
 }
 const PROGRESS = [
@@ -733,7 +737,7 @@ function render(background = false) {
   else if (route === "sync") viewSyncStatus();
   else if (route === "items" && arg) viewLogScreen(arg, arg2);
   else if (route === "reports") viewReports();
-  else if (route === "office") viewOffice(arg);
+  else if (route === "office") viewOffice(arg, arg2);
   else viewItems();
 
   restoreView(lastSnapshot);
@@ -929,12 +933,16 @@ function viewItems() {
     if (!matchesLabel(item, "area_id", filterArea)) return false;
     if (!matchesLabel(item, "phase_id", filterPhase)) return false;
     if (filterProgress && progressOf(item) !== filterProgress) return false;
-    // "At paint" means some of it rests at paint right now, queued moves included.
-    if (filterStage && !localPlaces(item).places.some((p) => p.key === filterStage)) return false;
-    return !text || `${itemName(item)} ${item.description}`.toLowerCase().includes(text);
+    // Its parts are on its card, so a card matches by any of them: "at paint"
+    // means the piece or one of its parts rests at paint right now, queued
+    // moves included, and a search finds a piece by a part's name.
+    const family = familyOf(item);
+    if (filterStage && !family.some((member) => localPlaces(member).places.some((p) => p.key === filterStage))) return false;
+    return !text || family.some((member) => `${itemName(member)} ${member.description}`.toLowerCase().includes(text));
   };
+  // A part has no card of its own: it is listed under the piece it belongs to.
   const list = (text) =>
-    S.items.filter((item) => matches(item, text)).map(itemRow).join("")
+    S.items.filter((item) => !pieceOf(item) && matches(item, text)).map(itemRow).join("")
     || `<p class="muted">No items match.</p>`;
 
   $view.innerHTML = `
@@ -987,20 +995,11 @@ function viewItems() {
   };
 }
 
-function itemRow(item) {
-  // One line per place holding units, mirroring the aging report -- and each
-  // line is its own tap target: tapping the 40 pcs at carpentry opens the log
-  // screen aimed at moving THOSE 40, independent of the 50 sitting at paint.
-  // This is the whole workflow: tap a batch, say where it went.
-  const { places, done, inSample, inParts } = localPlaces(item);
-  const pending = pendingCountFor(item.id);
-  const piece = pieceOf(item);
-  const waits = !!item.state?.waits_on_sample;
-  const sampler = waits ? S.items.find((i) => i.id === item.sample_item_id) : null;
-
-  const lines = places.map((p) => `
+/* The rows of one item's units: a tap target per place holding some, and Done. */
+function placeRows(item, places, done) {
+  return places.map((p) => `
     <a class="pos-row" href="#/items/${item.id}/${p.key}"
-       aria-label="Move ${p.qty} pcs from ${esc(whereLabel(p))}">
+       aria-label="Move ${p.qty} pcs of ${esc(item.code)} from ${esc(whereLabel(p))}">
       <span class="muted" style="min-width:0">${esc(whereLabel(p))}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
       <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
         <span class="badge qty">${p.qty}</span>${p.key === UNSTARTED ? "" : p.days_in_state == null ? `
@@ -1008,7 +1007,54 @@ function itemRow(item) {
         <span class="badge${p.overdue ? " age-hot" : ""}">${p.days_in_state.toFixed(1)}d</span>`}
         <span class="chev" aria-hidden="true">›</span>
       </span>
-    </a>`).join("");
+    </a>`).join("") + (done ? `
+      <a class="pos-row" href="#/items/${item.id}/${DONE}" style="border-left:2px solid var(--good)"
+         aria-label="${done} pcs of ${esc(item.code)} done">
+        <span class="muted">Done</span>
+        <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
+          <span class="badge qty" style="color:var(--good)">${done}</span>
+          <span class="chev" aria-hidden="true">›</span>
+        </span>
+      </a>` : "");
+}
+
+/* An item's parts, under it on its own card: each part with the places its
+   units are at, tapped and moved exactly like the piece's own. Parts of parts
+   nest one step further in. */
+function partBlocks(item) {
+  return partsOf(item).map((part) => {
+    const { places, done } = localPlaces(part);
+    return `
+      <div class="part-block">
+        <a class="part-head" href="#/items/${part.id}">
+          <span><strong>${esc(partName(part))}</strong> <span class="muted">×${part.per_unit} per piece</span></span>
+          <span class="muted">${esc(part.code)}</span>
+        </a>
+        ${placeRows(part, places, done) || `<div class="muted part-empty">None on the floor</div>`}
+        ${partBlocks(part)}
+      </div>`;
+  }).join("");
+}
+
+function itemRow(item) {
+  // One line per place holding units, mirroring the aging report -- and each
+  // line is its own tap target: tapping the 40 pcs at carpentry opens the log
+  // screen aimed at moving THOSE 40, independent of the 50 sitting at paint.
+  // This is the whole workflow: tap a batch, say where it went.
+  const { places, done, inSample, inParts } = localPlaces(item);
+  // The card speaks for the piece and every part under it.
+  const family = familyOf(item);
+  const pending = family.reduce((sum, member) => sum + pendingCountFor(member.id), 0);
+  const piece = pieceOf(item);
+  const waits = !!item.state?.waits_on_sample;
+  const sampler = waits ? S.items.find((i) => i.id === item.sample_item_id) : null;
+  const parts = partsOf(item);
+  const partsOnFloor = family.slice(1).some((member) => {
+    const local = localPlaces(member);
+    return local.places.length > 0 || local.done > 0;
+  });
+
+  const lines = placeRows(item, places, 0);
 
   return `
     <div>
@@ -1031,20 +1077,18 @@ function itemRow(item) {
         </div>
       </a>
       ${lines}
+      ${placeRows(item, [], done)}
       ${inParts ? `
       <div class="pos-row" style="border-left:2px dashed var(--line)">
-        <span class="muted">In parts — assemble to bring back</span>
+        <span class="muted">In parts — below</span>
         <span class="badge qty">${inParts}</span>
       </div>` : ""}
-      ${done ? `
-      <a class="pos-row" href="#/items/${item.id}/${DONE}" style="border-left:2px solid var(--good)"
-         aria-label="${done} pcs done">
-        <span class="muted">Done</span>
-        <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
-          <span class="badge qty" style="color:var(--good)">${done}</span>
-          <span class="chev" aria-hidden="true">›</span>
-        </span>
-      </a>` : ""}
+      ${partBlocks(item)}
+      ${places.length || partsOnFloor ? `
+      <div class="card-actions">
+        ${places.length ? `<a href="#/items/${item.id}/split">Split into parts</a>` : ""}
+        ${parts.length && partsOnFloor ? `<a href="#/items/${item.id}/assemble">Assemble</a>` : ""}
+      </div>` : ""}
       ${pending ? `<div style="margin-top:4px"><span class="badge pending">${pending} pending</span></div>` : ""}
     </div>`;
 }
@@ -1063,6 +1107,32 @@ const logSel = {
 /* The assembly form on an item with parts: which place each part is taken
    from, where the finished pieces go, how many. */
 const assembleSel = { itemId: null, qty: null, from: {}, to: null, stationId: null };
+
+/* A part being named on the split screen, before it is added. */
+const partDraft = { name: "", per: "1" };
+
+/* What a piece is made of, on its split screen: the parts it has, and a place
+   to name another. Naming parts needs the server (a part is an item, and
+   items are made there); splitting into parts already named does not. */
+function splitPartsBlock(item, parts) {
+  const out = item.state?.in_parts_qty || 0;
+  return `
+      <label>Its parts</label>
+      ${parts.length
+        ? `<p style="margin:0 0 4px">${parts.map((part) => `${part.per_unit} × ${esc(partName(part))}`).join(", ")} <span class="muted">per piece</span></p>`
+        : `<p class="muted" style="margin:0 0 4px">None yet. Name what this piece is made of — a back, a set of legs — then split.</p>`}
+      <details data-panel="split-parts" ${parts.length ? "" : "open"}>
+        <summary class="muted" style="cursor:pointer">Add a part</summary>
+        <div class="field-grid" style="margin-top:6px">
+          <div><label for="np-name">Name</label><input id="np-name" maxlength="60" autocomplete="off" placeholder="e.g. Back" value="${esc(partDraft.name)}"></div>
+          <div><label for="np-per">How many per piece</label><input id="np-per" type="number" inputmode="numeric" min="1" value="${esc(partDraft.per)}"></div>
+        </div>
+        <button class="ghost" id="np-add" style="width:auto;padding:10px 16px;margin-top:8px" ${S.online && !out ? "" : "disabled"}>Add part</button>
+        ${!S.online ? `<p class="muted" style="margin-top:6px">Naming a new part needs a connection. Splitting into the parts already named does not.</p>`
+          : out ? `<p class="muted" style="margin-top:6px">${out} piece(s) are out in parts by the present list. Assemble them before changing it.</p>` : ""}
+        <p class="warn-text" id="np-err" role="alert" hidden></p>
+      </details>`;
+}
 
 /* The entries of one split or assembly: same moment, same link, one row per
    item. Every row names where its own units come from or go. */
@@ -1096,7 +1166,6 @@ function viewLogScreen(itemId, fromKey) {
   const { places, done, inSample } = localPlaces(item);
   const finish = finishType();
   const parts = partsOf(item);
-  if (!parts.length) logSel.mode = "move";
   // Finishing is not a type the engineer picks: it is what "Done" writes.
   const types = (S.ref.event_types || []).filter(
     (t) => t.is_active && t.moves_quantity && !t.is_finish);
@@ -1114,6 +1183,8 @@ function viewLogScreen(itemId, fromKey) {
   const arrival = `${itemId}/${fromKey || ""}`;
   if (logSel._arrival !== arrival) {
     logSel._arrival = arrival;
+    // "Split into parts" on the card arrives here already splitting.
+    logSel.mode = fromKey === "split" ? "split" : "move";
     logSel.from = sources.some((s) => s.key === fromKey) ? fromKey : null;
     logSel.to = null;
     logSel.typeId = plainType?.id || null;
@@ -1173,6 +1244,10 @@ function viewLogScreen(itemId, fromKey) {
         ${options.map((o) => `<button data-id="${o.key}" class="${o.key === picked ? "on" : ""}" aria-pressed="${o.key === picked}">${esc(o.label)}</button>`).join("")}
       </div>`;
 
+  // "Assemble" on the card arrives here for the assembly form: it goes first.
+  const assembleFirst = fromKey === "assemble";
+  const assembleHtml = parts.length ? assembleCard(item, parts) : "";
+
   $view.innerHTML = `
     <div class="card">
       <div style="display:flex;gap:12px;align-items:center">
@@ -1180,7 +1255,7 @@ function viewLogScreen(itemId, fromKey) {
         <div style="flex:1;min-width:0">
           <div class="spread">
             <h2>${esc(item.code)}</h2>
-            <span class="muted">${item.total_qty} pcs · rev ${esc(item.drawing_revision)}</span>
+            <span class="muted">${esc(batchLabel(item))} · rev ${esc(item.drawing_revision)}</span>
           </div>
           ${itemTags(item) ? `<div style="margin:2px 0">${itemTags(item)}</div>` : ""}
           <div class="muted">${esc(item.description)}</div>
@@ -1192,12 +1267,14 @@ function viewLogScreen(itemId, fromKey) {
         Log it to Done and the batch of ${item.total_qty} is released.</span></p>` : ""}
     </div>
 
+    ${assembleFirst ? assembleHtml : ""}
     <div class="card">
       ${!source ? `
-      <p class="muted">Nothing here to move — every unit of ${esc(item.code)} is Done.</p>` : `
-      ${parts.length ? seg("mode", "What happened", [{ key: "move", label: "Moved" }, { key: "split", label: "Split into parts" }], logSel.mode) : ""}
+      <p class="muted">Nothing here to move — ${item.state?.in_parts_qty ? `the pieces of ${esc(item.code)} are out in parts` : `every unit of ${esc(item.code)} is Done`}.</p>` : `
+      ${parts.length || splitting ? seg("mode", "What happened", [{ key: "move", label: "Moved" }, { key: "split", label: "Split into parts" }], logSel.mode) : ""}
 
-      ${seg("from", "From", sources.map((s) => ({ key: s.key, label: `${s.label} · ${s.qty}` })), logSel.from)}
+      ${seg("from", splitting ? "Split the pieces at" : "From", sources.map((s) => ({ key: s.key, label: `${s.label} · ${s.qty}` })), logSel.from)}
+      ${splitting ? splitPartsBlock(item, parts) : ""}
 
       ${!splitting && shownTypes.length > 1 ? seg("type", "Entry type", shownTypes.map((t) => ({ key: t.id, label: t.name })), logSel.typeId) : ""}
       ${logSel.from === DONE ? `<p class="muted" style="margin-top:6px">Taking a finished piece back out of Done is rework, and needs its reason.</p>` : ""}
@@ -1234,10 +1311,10 @@ function viewLogScreen(itemId, fromKey) {
 
       <div style="height:12px" aria-hidden="true"></div>
       <div class="action-sticky">
-        <button class="primary" id="log-go" ${logSel.to ? "" : "disabled"}>${!logSel.to ? (splitting ? "Pick where the parts go" : "Pick where it went") : splitting ? "Split into parts" : "Log entry"}</button>
+        <button class="primary" id="log-go" ${logSel.to && !(splitting && !parts.length) ? "" : "disabled"}>${splitting && !parts.length ? "Name the parts first" : !logSel.to ? (splitting ? "Pick where the parts go" : "Pick where it went") : splitting ? "Split into parts" : "Log entry"}</button>
       </div>`}
     </div>
-    ${parts.length ? assembleCard(item, parts) : ""}
+    ${assembleFirst ? "" : assembleHtml}
     ${pieceOf(item) ? `<div class="card"><p class="muted">Part of <strong>${esc(itemName(pieceOf(item)))}</strong>,
       ${item.per_unit} per piece. It is split off that item and assembled back into it from that item's screen.</p></div>` : ""}
 
@@ -1267,6 +1344,53 @@ function viewLogScreen(itemId, fromKey) {
   });
   wireSeg("seg-type", (id) => { logSel.typeId = id; rerender(); });
   wireSeg("seg-mode", (key) => { Object.assign(logSel, { mode: key, to: null, stationId: null }); rerender(); });
+
+  // Naming a part, on the split screen. Typed text lives in partDraft so a
+  // segment tap's re-render cannot eat it.
+  const $partName = document.getElementById("np-name");
+  const $partAdd = document.getElementById("np-add");
+  if ($partName && $partAdd) {
+    const $per = document.getElementById("np-per");
+    $partName.oninput = () => { partDraft.name = $partName.value; };
+    $per.oninput = () => { partDraft.per = $per.value; };
+    $partAdd.onclick = async () => {
+      const err = document.getElementById("np-err");
+      const fail = (message) => { err.textContent = message; err.hidden = false; };
+      err.hidden = true;
+      const name = partDraft.name.trim();
+      const perUnit = Number(partDraft.per);
+      if (!name) return fail("Give the part a name.");
+      if (!Number.isInteger(perUnit) || perUnit < 1) return fail("How many per piece: a whole number, 1 or more.");
+      // The part's code is the piece's with the name on the end: BED-01-BACK.
+      const code = `${item.code}-${slugify(name).replace(/_/g, "-").toUpperCase()}`.slice(0, 64);
+      $partAdd.disabled = true;
+      try {
+        const made = await api(`/api/items/${item.id}/parts`, {
+          method: "POST", body: JSON.stringify({ code, description: name, per_unit: perUnit }),
+        });
+        Object.assign(partDraft, { name: "", per: "1" });
+        toast(`${name} added as a part of ${item.code}`);
+        // On this phone at once, from the server's own answer: a sync already
+        // in flight may have read the list before the part existed. Nothing of
+        // it is on the floor yet, which is what an empty state says.
+        if (!S.items.some((i) => i.id === made.id)) {
+          S.items = [...S.items, { ...made, state: {
+            positions: [], phase: "production", sample_qty: 0, done_qty: 0, in_parts_qty: 0, batch_qty: 0,
+          } }];
+          await LSF_DB.put("items", S.items);
+        }
+        sync(); // and every other phone learns of it the usual way
+        if (logSel._arrival === arrival) rerender();
+      } catch (error) {
+        const detail = error.body?.detail;
+        fail(typeof detail === "string" ? detail
+          : Array.isArray(detail) ? rejectReason(error)
+          : isNetworkError(error) ? "No connection — the part was not added."
+          : "Could not add the part.");
+        $partAdd.disabled = false;
+      }
+    };
+  }
   wireSeg("seg-to", (key) => { logSel.to = key; logSel.stationId = null; rerender(); });
   wireSeg("seg-station", (id) => {
     logSel.stationId = id;
@@ -1300,7 +1424,7 @@ function viewLogScreen(itemId, fromKey) {
     document.getElementById("qty-warn").hidden = Number($qty.value) <= available;
 
     document.getElementById("log-go").onclick = async () => {
-      if (!logSel.to) return;
+      if (!logSel.to || (splitting && !parts.length)) return;
       // A whole number of pieces, at least one. Anything else used to be
       // queued as typed and only refused by the server at the next sync -- or,
       // for an empty box, quietly logged as 1.
@@ -1921,7 +2045,7 @@ const OFFICE_SECTIONS = [
   { key: "status", label: "Status", admin: true },
 ];
 
-function viewOffice(section) {
+function viewOffice(section, detail) {
   const sections = OFFICE_SECTIONS.filter((s) => !s.admin || S.user?.is_admin);
   const current = sections.find((s) => s.key === section) || sections[0];
 
@@ -1942,7 +2066,7 @@ function viewOffice(section) {
     areas: officeAreas,
     users: officeUsers,
     status: officeStatus,
-  }[current.key])(body);
+  }[current.key])(body, detail);
 }
 
 /* A one-line upload status for the editors, same contract as the snag-photo
@@ -2138,7 +2262,17 @@ function newItemPhaseRows(projectId) {
    the import -- adding work to a project is not an admin job; rewriting what
    is already there is. The form is the item's facts and nothing else: it has
    no stages to pick, because an item can be logged at any stage. */
-function officeItems(body) {
+function officeItems(body, itemId) {
+  // One item, on a page of its own: #/office/items/<id>.
+  if (itemId) {
+    body.innerHTML = `
+    <div class="card">
+      <a class="back-link" href="#/office/items">‹ All items</a>
+      <div id="of-items" class="muted" style="margin-top:8px">Loading…</div>
+    </div>`;
+    loadItemEditors();
+    return;
+  }
   const projects = (S.ref?.projects || []).filter((p) => p.is_active !== false);
   const remembered = sessionStorage.getItem("ni-project") || "";
 
@@ -2181,8 +2315,11 @@ function officeItems(body) {
 
     <div class="card">
       <h2>Edit items</h2>
-      <p class="muted" style="margin-bottom:8px">Every item, archived ones included. Open one to
-      correct its details, set its icon, bump its drawing revision or remove it.</p>
+      <input id="oi-q" type="search" value="${esc(sessionStorage.getItem("oi-q") || "")}" style="margin-bottom:8px"
+             placeholder="Find an item — code, description, project, area or phase">
+      <label class="pick-row" style="border:0;min-height:0;padding:0 0 8px">
+        <input type="checkbox" id="oi-archived" ${sessionStorage.getItem("oi-archived") ? "checked" : ""}><span>Show archived items too</span>
+      </label>
       <div id="of-items" class="muted">Loading…</div>
     </div>`;
 
@@ -2298,6 +2435,48 @@ function officeItems(body) {
   loadItemEditors();
 }
 
+/* Finding the item to edit. Every item in the factory is behind this list, so
+   it is a lookup first: type part of a code, a description, a project, an
+   area or a phase (commas separate alternatives, words narrow), and open the
+   one you want on a page of its own. */
+const LOOKUP_SHOWN = 60;
+function itemLookup(target, items, projectCode) {
+  const rows = () => {
+    const matches = filingMatcher(sessionStorage.getItem("oi-q") || "");
+    const archivedToo = !!sessionStorage.getItem("oi-archived");
+    const pool = items.filter((item) => archivedToo || item.is_active);
+    const found = pool.filter(matches);
+    const pieceCode = (item) => items.find((i) => i.id === item.parent_item_id)?.code;
+    return `
+      <p class="muted" style="margin:0 0 4px">${found.length === pool.length ? `${pool.length} item${pool.length === 1 ? "" : "s"}` : `${found.length} of ${pool.length} items`}</p>
+      ${found.slice(0, LOOKUP_SHOWN).map((item) => `
+      <a class="lookup-row" href="#/office/items/${item.id}">
+        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
+        <span style="min-width:0;flex:1">
+          <strong>${esc(item.code)}</strong>
+          <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
+          ${itemTags(item)}
+          ${item.parent_item_id ? `<span class="badge tag">part of ${esc(pieceCode(item) || "?")}</span>` : ""}
+          ${item.is_active ? "" : `<span class="badge">archived</span>`}
+          <br><span class="muted">${esc(item.description)} · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
+        </span>
+        <span class="chev" aria-hidden="true">›</span>
+      </a>`).join("")}
+      ${found.length > LOOKUP_SHOWN ? `<p class="muted" style="padding:8px 0">Showing the first ${LOOKUP_SHOWN}. Type more to narrow it down.</p>` : ""}
+      ${found.length ? "" : `<p class="muted" style="padding:8px 0">${pool.length ? "Nothing matches." : "No items yet."}</p>`}`;
+  };
+  target.classList.remove("muted");
+  target.innerHTML = rows();
+  // Typing redraws the rows only: the box keeps its focus and the keyboard.
+  const search = document.getElementById("oi-q");
+  if (search) search.oninput = () => { sessionStorage.setItem("oi-q", search.value); target.innerHTML = rows(); };
+  const archived = document.getElementById("oi-archived");
+  if (archived) archived.onchange = () => {
+    if (archived.checked) sessionStorage.setItem("oi-archived", "1"); else sessionStorage.removeItem("oi-archived");
+    target.innerHTML = rows();
+  };
+}
+
 /* The item editor. Fetched with archived items included, because a mistyped
    batch that was archived last week is exactly the thing someone comes here
    to delete for good. */
@@ -2385,6 +2564,15 @@ async function loadItemEditors() {
   const allProjects = S.ref?.projects || [];
   // The badge must name an archived project too, so the lookup keeps every one.
   const projectCode = new Map(allProjects.map((p) => [p.id, p.code]));
+
+  // Which of the two this is: the lookup, or one item's own page.
+  const [, , , openId] = (location.hash || "").split("/");
+  if (!openId) { itemLookup(target, items, projectCode); return; }
+  const open = items.find((i) => i.id === openId);
+  if (!open) {
+    target.innerHTML = `<p class="muted">That item is not there any more — it may have been deleted.</p>`;
+    return;
+  }
   const projects = allProjects.filter((p) => p.is_active !== false);
   const isAdmin = !!S.user?.is_admin;
   // An archived project is never an option in a project picker -- here or in
@@ -2425,16 +2613,22 @@ async function loadItemEditors() {
           <div><label>Phase</label>${labelSelect("phases", own ? item.phase_id : null, `data-it-phase="${item.id}" ${lock}`, projectId)}</div>`;
   };
 
-  target.innerHTML = items.map((item) => `
-    <details data-panel="item:${item.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
-      <summary style="cursor:pointer;padding:6px 0">
-        <strong>${esc(item.code)}</strong>
-        <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
-        ${itemTags(item)}
-        ${item.is_active ? "" : `<span class="badge">archived</span>`}
-        <br><span class="muted">${esc(item.description)} · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
-      </summary>
-      <div style="padding:8px 0 12px">
+  const piece = open.parent_item_id ? items.find((i) => i.id === open.parent_item_id) : null;
+  target.innerHTML = [open].map((item) => `
+      <div style="display:flex;gap:12px;align-items:center">
+        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : ""}
+        <div style="flex:1;min-width:0">
+          <h2 style="margin:0">${esc(item.code)}</h2>
+          <div style="margin:3px 0">
+            <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
+            ${itemTags(item)}
+            ${item.is_active ? "" : `<span class="badge">archived</span>`}
+          </div>
+          <span class="muted">${esc(item.description)} · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
+          ${piece ? `<br><span class="muted">A part of <a href="#/office/items/${piece.id}">${esc(itemName(piece))}</a></span>` : ""}
+        </div>
+      </div>
+      <div style="padding:8px 0 4px">
         <!-- Readable by anyone, editable by admins: a code or a batch size is
              what the rest of the floor reads the work by. -->
         <div class="field-grid">
@@ -2499,8 +2693,7 @@ async function loadItemEditors() {
         <p class="muted" style="margin-top:6px">Archiving hides the item everywhere and keeps its history;
         an archived item can be reactivated. Deleting for good removes the item <em>and its logged
         events</em>, and cannot be undone.</p>` : ""}
-      </div>
-    </details>`).join("") || `<span class="muted">No items yet.</span>`;
+      </div>`).join("");
 
   restoreView(lastSnapshot); // this list lands after render() restored the view
 
@@ -2565,15 +2758,8 @@ async function loadItemEditors() {
     };
   });
 
-  // Photos load per item, when its panel is opened: this editor lists every
-  // item in the factory, and fetching a photo index for each one on every
-  // render would be dozens of requests for panels nobody looked at.
-  target.querySelectorAll(`details[data-panel^="item:"]`).forEach((panel) => {
-    const id = panel.dataset.panel.slice("item:".length);
-    const load = () => { if (panel.open) loadEditorPhotos(id, isAdmin); };
-    panel.ontoggle = load;
-    load(); // a background re-render lands with the panel already open
-  });
+  // The page is one item's, so its photos load with it.
+  loadEditorPhotos(open.id, isAdmin);
 
   bindPartsEditor(target, byId);
   bindPhaseMover(target, byId);
@@ -2610,7 +2796,8 @@ async function loadItemEditors() {
         const result = await api(`/api/items/${item.id}`, { method: "DELETE" });
         toast(result.archived ? "Item archived (history kept)" : "Item deleted");
         await sync();
-        loadItemEditors();
+        if (result.archived) loadItemEditors();
+        else navigate("#/office/items");
       } catch (error) {
         alert(error.body?.detail || "Could not remove the item.");
       }
@@ -2650,7 +2837,7 @@ async function loadItemEditors() {
         const result = await api(`/api/items/${item.id}?purge=true`, { method: "DELETE" });
         toast(`${item.code} deleted for good (${result.purged_events} event(s) destroyed)`);
         await sync();
-        loadItemEditors();
+        navigate("#/office/items");
       } catch (error) {
         alert(error.body?.detail || "Could not delete the item.");
       }
@@ -2669,7 +2856,7 @@ function partsEditor(item, items) {
         <label style="margin-top:12px">Parts</label>
         ${parts.length ? parts.map((part) => `
         <div class="spread" style="gap:8px;padding:4px 0">
-          <span style="min-width:0"><strong>${esc(part.code)}</strong> <span class="muted">${esc(part.description)}</span></span>
+          <a href="#/office/items/${part.id}" style="min-width:0;color:inherit"><strong>${esc(part.code)}</strong> <span class="muted">${esc(part.description)}</span></a>
           <span style="display:flex;gap:6px;align-items:center;flex:none">
             <input data-pt-per="${part.id}" type="number" inputmode="numeric" min="1" value="${part.per_unit}"
                    aria-label="How many per piece" style="width:70px;padding:8px">

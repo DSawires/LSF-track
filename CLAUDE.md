@@ -345,7 +345,10 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   quantity per phase (`phase_quantities`): one batch per phase, all made or
   none, the first building the sample and the rest waiting on it
   (`sample_item_id`)
-- Office tab: projects, item editing, and admin management of stages/stations
+- Office tab: projects, item editing, and admin management of stages/stations.
+  Office → Items is a lookup (search by code, description, project, area or
+  phase; commas separate alternatives) and each item is edited on a page of
+  its own, `#/office/items/<id>` — never a list of every item's editor
 - Office → Areas & phases (admin): pick a project, then add, rename, reorder,
   retire or delete its areas and phases. An import file that names an area or
   phase its project does not have adds it, and the preview says so first.
@@ -368,10 +371,16 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   item under the company mark (`static/brand/`). Online-only, like the other
   office screens. A picture chosen for a line is stored as an item image of
   kind `document`, which is not the item's icon
-- Parts and assembly: Office → Items → an item's editor → Parts (any
-  engineer); on the floor, the item's screen offers "Split into parts" and
-  "Assemble from parts" (where each part comes from, where the pieces go, how
-  many). Offline like every entry. The card shows pieces out "In parts"
+- Parts and assembly, all from the item's card. Parts have no card of their
+  own in the Items list: `itemRow()` lists each under its piece
+  (`partBlocks`), a tappable row per place, and the list filters match a card
+  by any member of its family (`familyOf`). The card carries "Split into
+  parts" (`#/items/{id}/split`) and "Assemble" (`#/items/{id}/assemble`).
+  The split screen names new parts in place (`POST /api/items/{id}/parts`,
+  online-only; the part's code is the piece's plus the name) — splitting and
+  assembling themselves are queued entries and work offline. Office → Items
+  → an item's editor → Parts changes the count per piece. Reports still count
+  a part as its own item at its stage
 - Splitting a batch across phases (admin, the item's editor,
   `POST /api/items/{id}/split-phase`): before release, planned quantity moves
   and the new batch waits on the original's sample; after, units move place

@@ -293,6 +293,24 @@ main {
 }
 
 .pos-row:active { background: var(--line); }
+
+/* A part, under the piece it belongs to on that piece's card. */
+.part-block { margin: 8px 0 0 6px; padding-left: 10px; border-left: 2px solid var(--line); }
+.part-head {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  color: inherit; text-decoration: none; padding: 6px 0 4px;
+}
+.part-head strong { font-size: 16px; }
+.part-head .muted, .part-empty { font-size: 14px; }
+.part-empty { padding: 2px 0 6px; }
+/* What can be done to the piece as a whole, from its card. */
+.card-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.card-actions a {
+  display: inline-flex; align-items: center; min-height: 44px; padding: 8px 16px;
+  border: 1px solid var(--line); border-radius: 999px;
+  color: inherit; text-decoration: none; font-size: 15px;
+}
+.card-actions a:active { background: var(--line); }
 .pos-row .chev { color: var(--muted); font-size: 22px; line-height: 1; flex: none; }
 
 /* A row is a thumb target first and a label second: everything in it scales up
@@ -525,6 +543,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   font-size: 14px; color: var(--text); cursor: pointer;
 }
 .pick-row input[type="checkbox"] { width: 22px; height: 22px; flex: none; }
+
+/* A row of the item lookup: the whole row opens the item's page. */
+.lookup-row {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 60px; padding: 10px 2px;
+  border-bottom: 1px solid var(--line);
+  color: inherit; text-decoration: none;
+}
+.lookup-row:active { background: var(--line); }
+.lookup-row .chev { color: var(--muted); font-size: 22px; flex: none; }
+.back-link { display: inline-block; padding: 6px 0; color: var(--accent); text-decoration: none; font-size: 15px; }
 
 /* Area and phase, beside an item's code. Part of what the item is, so it reads
    as a label and not as a status. */

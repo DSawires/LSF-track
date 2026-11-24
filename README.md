@@ -228,6 +228,13 @@ cannot carry pictures. The file may be up to 40 MB.
 existing project without a file: project, code, description, batch qty, sample
 qty, revision. Any engineer can do it.
 
+**Editing an item.** Under New item, **Edit items** is a lookup: type part of
+a code, description, project, area or phase (commas find several at once:
+`table, back`) and tap the item. It opens on a page of its own — details,
+parts, phases, icon, photos, revision, archive — with *‹ All items* to go
+back; the search is remembered. Archived items are listed when *Show archived
+items too* is ticked.
+
 **Sample first.** Every item starts as its sample (`sample qty`, default 1).
 Only the sample is on the floor until it is logged to Done; that entry releases
 the batch (`qty`). The release is derived from the log, so voiding the
@@ -283,20 +290,28 @@ A piece can be split into the parts it is built from — a bed into a frame, a
 headboard and four legs — which go through the factory on their own and come
 back together at assembly.
 
-- **Giving an item parts:** Office → Items → its editor → *Parts*. Each part
-  has its own code and says how many go into one piece. A part is an item in
-  its own right: it appears in the list, in the reports and at its stages, and
-  is filed in the same area and phase as its piece (it follows if the piece is
-  re-filed). Parts can have parts.
-- **Splitting, on the floor:** on the item's screen, *What happened → Split
-  into parts*. Pick the pieces (the batch you tapped), where the parts go
-  (not started, or any stage) and how many pieces. 3 beds become 3 frames,
-  3 headboards and 12 legs. The card then shows the 3 as *In parts*.
-- **Moving the parts:** each part's card works like any other item's.
-- **Assembling:** on the piece's screen, *Assemble from parts*. Say where
-  each part is taken from (where most of it is, by default — finished parts
-  included), where the assembled pieces now are, and how many. It works out
-  how many the parts on hand make.
+- **Everything stays on the item's card.** Parts have no card of their own:
+  each is listed under the piece it belongs to, with a row for every place its
+  units are at. The card also carries *Split into parts* and, once parts are
+  on the floor, *Assemble*. The Items filters treat the card as one: "at
+  Paint" finds a chair whose legs are at paint, and a search finds it by a
+  part's name.
+- **Splitting, from the card:** tap *Split into parts*. Pick which pieces
+  (where they are now), where the parts go (not started, or any stage) and
+  how many. The first time, name the parts right there — *Back*, 1 per piece;
+  *Legs*, 4 per piece — and they are kept for every later split. (Naming a
+  new part needs a connection; splitting into parts already named does not.)
+  3 chairs become 3 backs and 12 legs, and the card shows the 3 as *In parts*.
+- **Moving the parts:** tap a part's row under the card, exactly like any
+  batch: the backs to upholstery, the legs to paint.
+- **Assembling, from the card:** tap *Assemble*. Say where each part is
+  taken from (where most of it is, by default — finished parts included),
+  where the assembled pieces now are, and how many. It works out how many the
+  parts on hand make.
+- **Parts in the office:** Office → Items → an item's editor → *Parts* lists
+  them and changes how many go into a piece. A part is still an item in its
+  own right there and in the reports (WIP and aging count it at its stage),
+  filed in the same area and phase as its piece. Parts can have parts.
 - Splitting and assembling work offline, like every entry. The entries of one
   split or assembly are stored together or not at all; if one is refused, all
   of them wait under the sync pill and Retry sends them back together.
