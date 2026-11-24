@@ -192,6 +192,8 @@ Names are indicative; Alembic migrations are authoritative.
   packing, …). Carries behaviour flags. **Extensible at runtime.**
 - `stations` — physical instances of a stage (paint_1, paint_2, carpentry_1, …).
   Many stations per stage. Recorded on events for load balancing.
+  Stages and stations both carry an optional `name_ar`, shown when a phone is
+  set to Arabic (`localName()` in app.js); without one, `name` is shown.
 - `areas`, `phases` — which part of a job a batch is for (guest rooms, the
   spa) and which phase of it. **Each project has its own two lists**
   (`project_id`; a name is unique within a project), edited at runtime and
@@ -435,7 +437,15 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
 - Item photos (snag photos + item icons). Online-only by design: the offline
   guarantee protects the logging path, and multi-megabyte blobs do not belong
   in its sync queue. Adding one offers camera or gallery on a phone; deleting
-  one is admin-only and lives in the item editor, not on the logging screen
+  one is admin-only and lives in the item editor (a ✕ on each photo and on the
+  icon), not on the logging screen. What is stored is never what was sent
+  (`app/services/images.py`): every picture, from an upload or an import, is
+  decoded (HEIC too, via pillow-heif), turned upright, stripped of its metadata
+  (GPS included) and kept as a WebP display copy of at most 2048 px and a
+  320 px thumbnail (`images/<id>.thumb`, served at `/api/images/<id>/thumb`).
+  The original is not kept. Lists and grids load thumbnails. Pictures stored
+  before this are converted by `manage.py compress-images` (restartable; one
+  with no thumbnail is served whole in its place until then)
 
 ### Explicitly out of scope
 

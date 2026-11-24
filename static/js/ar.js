@@ -360,7 +360,7 @@ const LSF_AR = {
   "Set icon": "تعيين أيقونة",
   "Needs a connection": "يحتاج إلى اتصال",
   "Drawing revision — currently {rev}": "مراجعة الرسم — الحالية {rev}",
-  "new rev, e.g. {rev}": "مراجعة جديدة، مثال: {rev}",
+  "new rev, e.g. {rev}": "مثال: {rev}",
   "Bump": "رفع المراجعة",
   "{qty} in flight were built to rev {rev}.": "{qty} قيد التصنيع صُنعت على المراجعة {rev}.",
   "Archive": "أرشفة",
