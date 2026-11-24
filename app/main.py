@@ -146,6 +146,12 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "same-origin")
     response.headers.setdefault("Content-Security-Policy", _CSP)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        # Ask before reusing: without this a browser decides for itself how
+        # long the shell stays fresh -- days, for a file that has not changed
+        # in months -- and a new release can be assembled from an old page
+        # and new scripts. Revalidating costs a 304 when nothing changed.
+        response.headers.setdefault("Cache-Control", "no-cache")
     if get_settings().secure_cookies:
         # Only meaningful once TLS is actually in front; harmless before then.
         response.headers.setdefault(

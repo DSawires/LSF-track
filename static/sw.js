@@ -39,7 +39,16 @@ const SHELL_FILES = [
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(SHELL).then((cache) => cache.addAll(SHELL_FILES)).then(() => self.skipWaiting())
+    // Straight from the server, never from the browser's HTTP cache. The shell
+    // was once served with no Cache-Control, so a phone's HTTP cache could
+    // hold an index.html months old and call it fresh: a new worker then
+    // cached that old page beside a new app.js that needed scripts the old
+    // page does not load, and the app came up blank on every open after the
+    // deploy. Every file of one version, or the install fails and the old
+    // worker keeps serving the old version whole.
+    caches.open(SHELL)
+      .then((cache) => cache.addAll(SHELL_FILES.map((url) => new Request(url, { cache: "reload" }))))
+      .then(() => self.skipWaiting())
   );
 });
 

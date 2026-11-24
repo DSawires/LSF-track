@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -197,6 +198,27 @@ def test_security_headers_present(client, factory):
     response = client.get("/health")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert "default-src 'self'" in response.headers["Content-Security-Policy"]
+
+
+def test_app_shell_is_revalidated_never_assumed_fresh(client, factory):
+    """With no Cache-Control a browser guesses how long the shell stays fresh,
+    and guesses days for a page unchanged in months. A new service worker then
+    cached that old page beside a new app.js that needed scripts the old page
+    does not load, and phones that had used the app came up blank after the
+    deploy. Every file of the shell is checked with the server before reuse,
+    and the worker installs it from the server, past the HTTP cache."""
+    factory.db.commit()
+    for path in ("/", "/static/js/app.js", "/static/js/i18n.js", "/static/css/app.css"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["Cache-Control"] == "no-cache", path
+    worker = client.get("/sw.js").text
+    assert 'cache: "reload"' in worker
+    # Every script the page loads is part of the shell the worker installs:
+    # leave one out and an offline phone opens to a page missing a script.
+    page = client.get("/").text
+    for script in re.findall(r'<script src="([^"]+)"', page):
+        assert f'"{script}"' in worker, f"{script} is not in the service worker's SHELL_FILES"
 
 
 def test_batch_size_is_capped(world, client):
