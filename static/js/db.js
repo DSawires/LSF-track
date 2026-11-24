@@ -1,5 +1,8 @@
 /* IndexedDB: the write queue and the offline reference cache.
-   Queue entries are removed ONLY when the server acknowledges the event id.
+   A queue entry stops being sent ONLY when the server acknowledges its id, and
+   is removed only once the item list this device holds has been fetched again
+   since -- until then it is kept as "acked", so the cards go on showing the
+   move it made (see `ack` below, and `sync()` in app.js).
    Everything else in here is a cache and can be rebuilt from the server. */
 
 "use strict";
@@ -52,7 +55,35 @@ const LSF_DB = (() => {
     // ---- write queue ----
     enqueue: (event) => tx("queue", "readwrite", (s) => s.put({ ...event, _queued_at: Date.now(), _status: "pending" })),
     queueAll: () => getAll("queue"),
-    ack: (id) => tx("queue", "readwrite", (s) => s.delete(id)),
+    // The server has it. Not deleted yet: the item list on this device was
+    // fetched before the entry landed, and the cards are that list plus the
+    // queue -- drop the entry now and the units jump back to where they were
+    // until the next successful refresh, which in a dead spot is a long time,
+    // and an engineer who sees that logs the move again. The first ack's time
+    // is kept: the page and the service worker can both drain the same entry,
+    // and a later "duplicate" must not make it look newer than the list.
+    ack: (id) =>
+      tx("queue", "readwrite", (s) => {
+        const req = s.get(id);
+        req.onsuccess = () => {
+          const entry = req.result;
+          if (!entry || entry._status === "acked") return;
+          s.put({ ...entry, _status: "acked", _acked_at: Date.now(), _reason: undefined });
+        };
+      }),
+    // Acknowledged entries the item list now reflects: every one acked before
+    // the fetch that produced the list was started.
+    dropAcked: (before) =>
+      tx("queue", "readwrite", (s) => {
+        const req = s.openCursor();
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) return;
+          const entry = cursor.value;
+          if (entry._status === "acked" && (entry._acked_at || 0) <= before) cursor.delete();
+          cursor.continue();
+        };
+      }),
     markRejected: (id, reason) =>
       tx("queue", "readwrite", (s) => {
         const req = s.get(id);

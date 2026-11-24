@@ -25,6 +25,12 @@ phase's batch is the same code under that phase, made if it does not exist.
   sample is done, not before.
 - After, it moves real units, place by place, as a linked pair of entries per
   place: out of this batch at that place, into the other at the same place.
+
+A phase is a label for reporting: which delivery a batch is counted under. It
+is not a production fact, so re-filing never depends on how far the units have
+got -- not started, at any stage, or finished, they can be filed under another
+phase, and they stay exactly where they are. Only the sample is not movable:
+it is the sample of the item it was built for.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from app.services.events import EventRejected, parts_of, record_group
 from app.services.items import identity_label, identity_taken, lock_project
 
 UNSTARTED = "unstarted"
+DONE = "done"
 
 
 class PartsError(Exception):
@@ -144,13 +151,22 @@ def guard_removal(db: Session, item: Item, purge: bool) -> None:
         sa.select(sa.func.count()).select_from(Item).where(Item.parent_item_id == item.id)
     ):
         raise PartsError(f"{item.code} has parts; delete them first")
-    if purge and db.scalar(
+    # Whether or not it is a purge: an item with no entries yet is deleted
+    # outright by a plain DELETE too, and the batches waiting on its sample
+    # point at its row.
+    if (purge or not _has_events(db, item)) and db.scalar(
         sa.select(sa.func.count()).select_from(Item).where(Item.sample_item_id == item.id)
     ):
         raise PartsError(
             f"another phase's batch of {item.code} waits on this item's sample; delete or "
             "re-file that batch first"
         )
+
+
+def _has_events(db: Session, item: Item) -> bool:
+    return db.scalar(
+        sa.select(sa.func.count()).select_from(Event).where(Event.item_id == item.id)
+    ) > 0
 
 
 def descendants(db: Session, item: Item) -> list[Item]:
@@ -193,11 +209,70 @@ def _move_type(db: Session) -> EventType:
     return found
 
 
+def _finish_type(db: Session) -> EventType:
+    found = db.scalars(
+        sa.select(EventType).where(
+            EventType.is_finish.is_(True), EventType.is_active.is_(True)
+        ).order_by(EventType.sort_order).limit(1)
+    ).first()
+    if found is None:
+        raise PartsError("no finish event type is seeded", 500)
+    return found
+
+
+def movable(ledger) -> dict[str, int]:
+    """How many batch units rest at each place, keyed "unstarted", a stage id,
+    or "done" -- in the order places are listed: not started, each stage in
+    the factory's listing order, then Done. Sample units are left out."""
+    at: dict[str, int] = {}
+    for bucket in ledger.occupied(include_unstarted=True, include_finished=True):
+        position = bucket.position
+        key = UNSTARTED if position.is_unstarted else DONE if position.is_done else str(position.stage_id)
+        qty = bucket.qty - bucket.sample_qty
+        if qty > 0:
+            at[key] = at.get(key, 0) + qty
+    return at
+
+
+def split_phase_some(db: Session, item: Item, phase_id: uuid.UUID | None,
+                     qty: int, user: User) -> tuple[Item, dict[str, int]]:
+    """Re-file `qty` of `item`'s units into another phase without saying where
+    they are taken from. Returns the other phase's batch and what was taken,
+    by place.
+
+    The units furthest along go first: finished ones, then those at a stage,
+    then those not started. A phase being filled is a delivery being counted,
+    and what is counted first is what is nearest to leaving.
+
+    "Furthest along" between two stages is the one place this application
+    reads an order into the stages (CLAUDE.md rule 3 otherwise forbids it):
+    with free movement nothing records which stage comes after which, so it
+    goes by the order they are listed in, last listed first. It is a default
+    and only that -- the answer says exactly what was taken from where, the
+    units do not move, and someone who wants particular units names the places
+    on the item's own page, which calls `split_phase` directly.
+    """
+    ledger = replay_item(db, item, load_vocabulary(db))
+    if ledger.released_at is None:
+        take = {UNSTARTED: qty}     # nothing is on the floor: planned quantity
+    else:
+        take, left = {}, qty
+        # movable() lists not started, the stages, then Done: read backwards.
+        for key, there in reversed(list(movable(ledger).items())):
+            if left == 0:
+                break
+            take[key] = min(left, there)
+            left -= take[key]
+        if left:
+            raise PartsError(f"{item.code} has only {qty - left} units to move; it cannot give {qty}", 422)
+    return split_phase(db, item, phase_id, take, user), take
+
+
 def split_phase(db: Session, item: Item, phase_id: uuid.UUID | None,
                 take: dict[str, int], user: User) -> Item:
     """Re-file some of `item`'s units into another phase. Returns the other
-    phase's batch. `take` is how many from each place: "unstarted" or a stage
-    id."""
+    phase's batch. `take` is how many from each place: "unstarted", a stage
+    id, or "done"."""
     if not item.is_active:
         raise PartsError(f"{item.code} is archived")
     if item.parent_item_id is not None or parts_of(db, item.id):
@@ -267,16 +342,20 @@ def split_phase(db: Session, item: Item, phase_id: uuid.UUID | None,
 
     # Released: real units, wherever they are, moved as linked pairs.
     stages = {str(stage.id): stage for stage in db.scalars(sa.select(Stage))}
-    at: dict[str, int] = {}
-    for bucket in ledger.occupied(include_unstarted=True):
-        key = UNSTARTED if bucket.position.is_unstarted else str(bucket.position.stage_id)
-        at[key] = at.get(key, 0) + bucket.qty - bucket.sample_qty
+    at = movable(ledger)
     for key, qty in take.items():
-        if key != UNSTARTED and key not in stages:
+        if key not in (UNSTARTED, DONE) and key not in stages:
             raise PartsError("unknown stage", 422)
         if qty > at.get(key, 0):
-            where = "not started" if key == UNSTARTED else stages[key].name
-            raise PartsError(f"only {at.get(key, 0)} of the batch are at {where}", 422)
+            there = at.get(key, 0)
+            where = (
+                "not started" if key == UNSTARTED
+                else "in Done" if key == DONE
+                else f"at {stages[key].name}"
+            )
+            raise PartsError(
+                f"only {there} of the batch {'is' if there == 1 else 'are'} {where}", 422
+            )
 
     if target is None:
         target = new_batch(0, None)
@@ -285,16 +364,21 @@ def split_phase(db: Session, item: Item, phase_id: uuid.UUID | None,
     for offset, (key, qty) in enumerate(sorted(take.items()), start=0):
         link = uuid.uuid4()
         when = moment + timedelta(milliseconds=offset)
-        stage_id = None if key == UNSTARTED else uuid.UUID(key)
+        finished = key == DONE
+        stage_id = None if key in (UNSTARTED, DONE) else uuid.UUID(key)
         note = f"moved to {phase.name if phase else 'no phase'}"
         rows = [
+            # Out of this batch at the place the units are at...
             EventCreate(
                 id=uuid.uuid4(), item_id=item.id, event_type_id=move_type.id, occurred_at=when,
-                qty=qty, from_stage_id=stage_id, from_unstarted=stage_id is None,
-                link_id=link, to_link=True, note=note, user_id=user.id,
+                qty=qty, from_stage_id=stage_id, from_unstarted=key == UNSTARTED,
+                from_done=finished, link_id=link, to_link=True, note=note, user_id=user.id,
             ),
+            # ...and into the other at the same place. Finished units arrive
+            # finished: that is a finish entry, which names no stage.
             EventCreate(
-                id=uuid.uuid4(), item_id=target.id, event_type_id=move_type.id, occurred_at=when,
+                id=uuid.uuid4(), item_id=target.id,
+                event_type_id=(_finish_type(db) if finished else move_type).id, occurred_at=when,
                 qty=qty, stage_id=stage_id, link_id=link, from_link=True,
                 note=f"moved from {_phase_name(db, item.phase_id)}", user_id=user.id,
             ),

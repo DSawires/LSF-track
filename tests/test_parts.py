@@ -416,7 +416,10 @@ def test_filing_items_into_a_phase_can_take_part_of_each_batch(client, factory):
         "quantities": {str(bed.id): 66, str(bench.id): 25, str(table.id): 17},
     })
     assert filed.status_code == 200, filed.text
-    assert filed.json() == {"updated": 3, "split": 2}
+    assert filed.json() == {"updated": 3, "split": 2, "taken": {
+        str(bed.id): [{"place": "not started", "qty": 66}],      # planned quantity
+        str(bench.id): [{"place": "Carpentry", "qty": 25}],       # the furthest along go first
+    }}
 
     rows = client.get("/api/items").json()["items"]
     by = {(row["code"], row["phase_id"]): row for row in rows}
@@ -424,9 +427,10 @@ def test_filing_items_into_a_phase_can_take_part_of_each_batch(client, factory):
     assert (by[("LF-01", str(one.id))]["total_qty"], by[("LF-01", str(two.id))]["total_qty"]) == (150, 66)
     assert by[("LF-01", str(two.id))]["sample_item_id"] == str(bed.id)
     assert {by[("LF-01", str(p.id))]["area_id"] for p in (one, two)} == {str(rooms.id)}
-    # Released: 25 of the 60 not started moved as units; the 40 at carpentry stayed.
-    assert _at(by[("LF-03", str(one.id))]["state"]) == {"unstarted": 35, "carpentry": 40}
-    assert _at(by[("LF-03", str(two.id))]["state"]) == {"unstarted": 25}
+    # Released: real units, and the ones furthest along -- 25 of the 40 at
+    # carpentry. They are still at carpentry; the 60 not started stayed.
+    assert _at(by[("LF-03", str(one.id))]["state"]) == {"unstarted": 60, "carpentry": 15}
+    assert _at(by[("LF-03", str(two.id))]["state"]) == {"carpentry": 25}
     # The whole batch asked for: the item itself moves, as before.
     assert ("SP-03", str(one.id)) not in by and by[("SP-03", str(two.id))]["id"] == str(table.id)
 
@@ -445,7 +449,7 @@ def test_filing_items_into_a_phase_can_take_part_of_each_batch(client, factory):
     # All or nothing: one bad quantity and nothing in the request happens.
     before = client.get("/api/items").json()["items"]
     refused({"item_ids": [str(bed.id), str(bench.id)], "phase_id": str(two.id),
-             "quantities": {str(bed.id): 10, str(bench.id): 36}}, 409, "only 35 of LF-03 have not started")
+             "quantities": {str(bed.id): 10, str(bench.id): 76}}, 422, "LF-03 is a batch of 75")
     refused({"item_ids": [str(bed.id)], "phase_id": str(two.id),
              "quantities": {str(bed.id): 101}}, 422, "batch of 100")
     refused({"item_ids": [str(bed.id)], "area_id": str(rooms.id),
@@ -456,3 +460,90 @@ def test_filing_items_into_a_phase_can_take_part_of_each_batch(client, factory):
     assert [(r["id"], r["total_qty"], r["phase_id"]) for r in before] == [(r["id"], r["total_qty"], r["phase_id"]) for r in after]
     assert client.post("/api/items/assign", json={
         "item_ids": [str(bed.id)], "phase_id": str(two.id), "quantities": {str(bed.id): 0}}).status_code == 422
+
+
+def test_units_are_filed_under_a_phase_wherever_they_have_got_to(client, factory):
+    """A phase is a reporting label, not a production fact: some of a batch can
+    be filed under another phase whether those units have not started, are at
+    a stage or are finished, and they stay exactly where they are. The ones
+    furthest along are the ones that go."""
+    from app.models import Phase
+
+    one, two = factory.label(Phase, "Phase 1"), factory.label(Phase, "Phase 2")
+    item = factory.item("LF-07", 100, sample_qty=1, phase="Phase 1")
+    factory.move(item, None, 1, at=hours_ago(30))                     # the sample: Done
+    factory.move(item, "carpentry", 60, station_code="carpentry_1", at=hours_ago(20))
+    factory.move(item, "paint", 30, frm="carpentry", station_code="paint_1", at=hours_ago(10))
+    factory.move(item, None, 20, frm="paint", at=hours_ago(5))
+    factory.db.commit()
+    assert _at(_state(factory, item.id)) == {"unstarted": 40, "carpentry": 30, "paint": 10}
+    assert _state(factory, item.id)["completed_qty"] == 20
+
+    def file(qty):
+        answer = client.post("/api/items/assign", json={
+            "item_ids": [str(item.id)], "phase_id": str(two.id), "quantities": {str(item.id): qty},
+        })
+        assert answer.status_code == 200, answer.text
+        return [(row["place"], row["qty"]) for row in answer.json()["taken"][str(item.id)]]
+
+    def other():
+        rows = client.get("/api/items").json()["items"]
+        return next(r for r in rows if r["code"] == "LF-07" and r["phase_id"] == str(two.id))
+
+    # By place, from the item's own page: finished units can be named there.
+    moved = client.post(f"/api/items/{item.id}/split-phase", json={
+        "phase_id": str(two.id), "take": {"done": 2},
+    })
+    assert moved.status_code == 200, moved.text
+    assert (_state(factory, item.id)["completed_qty"], other()["state"]["completed_qty"]) == (18, 2)
+    too_many = client.post(f"/api/items/{item.id}/split-phase", json={
+        "phase_id": str(two.id), "take": {"done": 19},
+    })
+    assert too_many.status_code == 422 and "only 18 of the batch are in Done" in too_many.json()["detail"]
+
+    # From the list, with only a number: the furthest along first -- what is
+    # finished, then paint before carpentry -- and the answer says where.
+    assert file(55) == [("Done", 18), ("Paint", 10), ("Carpentry", 27)]
+    here, there = _state(factory, item.id), other()["state"]
+    assert _at(here) == {"unstarted": 40, "carpentry": 3}
+    # Nothing moved on the floor: what was at carpentry is at carpentry.
+    assert _at(there) == {"carpentry": 27, "paint": 10}
+    # Finished units arrive finished, and count as finished where they are filed.
+    assert (here["completed_qty"], there["completed_qty"]) == (0, 20)
+    # The sample is not batch: it stays with the item it is the sample of.
+    assert here["done_qty"] == 1 and here["sample_done_at"] is not None
+
+    # Units that have not started are the last to go, and they go too.
+    assert file(40) == [("Carpentry", 3), ("not started", 37)]
+    here, there = _state(factory, item.id), other()["state"]
+    assert _at(here) == {"unstarted": 3}
+    assert _at(there) == {"unstarted": 37, "carpentry": 30, "paint": 10}
+    assert (here["batch_qty"], there["batch_qty"]) == (3, 97)
+
+    # Nothing was made or lost on the way.
+    total = sum(
+        sum(p["qty"] for p in state["positions"]) + state["done_qty"]
+        for state in (here, there)
+    )
+    assert total == 101   # the batch of 100 and its sample
+
+
+def test_furthest_along_follows_the_stage_list_as_the_factory_has_it(client, factory):
+    """A stage added at runtime takes its place in that order with no code
+    knowing its name: listed after paint, its units go before paint's."""
+    from app.models import Phase
+
+    _one, two = factory.label(Phase, "Phase 1"), factory.label(Phase, "Phase 2")
+    factory.add_stage("gilding", sort=35)          # paint is 30, upholstery 40
+    item = factory.item("LF-08", 30, phase="Phase 1")
+    factory.move(item, "paint", 10, station_code="paint_1", at=hours_ago(9))
+    factory.move(item, "gilding", 10, at=hours_ago(8))
+    factory.db.commit()
+
+    answer = client.post("/api/items/assign", json={
+        "item_ids": [str(item.id)], "phase_id": str(two.id), "quantities": {str(item.id): 25},
+    })
+    assert answer.status_code == 200, answer.text
+    assert [(row["place"], row["qty"]) for row in answer.json()["taken"][str(item.id)]] == [
+        ("Gilding", 10), ("Paint", 10), ("not started", 5),
+    ]

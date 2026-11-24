@@ -100,7 +100,15 @@ docker compose start app
 
 `--reset` drops and recreates the `public` schema first, which a dump made by
 `manage.py backup` needs when restoring onto a non-empty database. A local
-file path works in place of a storage key.
+file path works in place of a storage key. The dump is read to its end before
+anything is dropped; one that was cut short is refused and nothing changes.
+
+Pruning only ever touches the job's own `backups/lsf-<stamp>.sql.gz` files, so
+a copy you leave beside them under another name is never deleted. A dump more
+than twice the size of the newest one is not pruned either — the job prints a
+warning each night it holds one back. That is what keeps a container started
+against an empty database from pushing the real backups out; if the database
+really did shrink, delete the old dumps by hand.
 
 ### Upgrading
 

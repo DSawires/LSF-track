@@ -97,6 +97,13 @@ def record_event(db: Session, payload, session_user: User, in_group: bool = Fals
     event_type = db.get(EventType, payload.event_type_id)
     if event_type is None or not event_type.is_active:
         raise EventRejected("unknown event type", "event_type_id")
+    if event_type.is_archive or event_type.is_revision_bump or event_type.is_release:
+        # These record something the server did -- archived an item, changed
+        # its drawing revision -- and it writes them itself as it does it.
+        # Posted from outside they would say it happened when it did not.
+        raise EventRejected(
+            "this kind of entry is written by the server, not logged", "event_type_id"
+        )
 
     stage = None
     item_step = None
@@ -215,6 +222,16 @@ def record_event(db: Session, payload, session_user: User, in_group: bool = Fals
         if superseded is not None and superseded.item_id != item.id:
             raise EventRejected(
                 "cannot supersede an event on another item", "supersedes_event_id"
+            )
+        if superseded is not None and superseded.link_id is not None:
+            # One row of a split, an assembly or a move between phases. Voided
+            # alone, its units come back here while the other items keep
+            # theirs: ten beds and the six frames made from them. The phone
+            # does not offer it; the server does not take it either.
+            raise EventRejected(
+                "one entry of a split, an assembly or a move between phases cannot be "
+                "voided on its own; log the opposite move instead",
+                "supersedes_event_id",
             )
         # A correction whose target has not synced yet is fine: the log is a set,
         # and the target is excluded from the derivation the moment it lands.
@@ -549,6 +566,17 @@ def link_kind(db: Session, rows) -> str:
             item.parent_item_id is None and not parts_of(db, item.id) for item in (a, b)
         )
         if plain and a.code == b.code and outs[0].qty == ins[0].qty:
+            # Re-filing changes which batch the units belong to, not where
+            # they are: they arrive at the place they left.
+            # Not started stays not started, a stage stays that stage, and
+            # finished units stay finished.
+            left = "done" if outs[0].from_done else outs[0].from_stage_id or "unstarted"
+            arrives_done = bool(db.get(EventType, ins[0].event_type_id).is_finish)
+            arrived = "done" if arrives_done else ins[0].stage_id or "unstarted"
+            if left != arrived:
+                raise EventRejected(
+                    "units moved into another phase stay at the place they are at", "stage_id"
+                )
             return "transfer"
     raise EventRejected(
         "these entries do not add up to a split into parts, an assembly or a move into "
@@ -567,7 +595,11 @@ def record_group(db: Session, rows, session_user: User) -> list[EventWrite]:
     stored = [db.get(Event, row.id) for row in rows]
     if all(event is not None for event in stored):
         return [EventWrite(event=event, created=False) for event in stored]
-    link_kind(db, rows)
+    if link_kind(db, rows) == "transfer" and not session_user.is_admin:
+        # What phase a batch is in is part of what it is: filing is the
+        # office's, and POST /api/items/{id}/split-phase is admin-only. The
+        # same rows posted straight to the log must not be a way round that.
+        raise EventRejected("moving units between phases is done by an admin", "link_id")
     ordered = sorted(rows, key=lambda row: (not row.to_link, str(row.item_id)))
     written: dict[uuid.UUID, EventWrite] = {}
     with db.begin_nested():

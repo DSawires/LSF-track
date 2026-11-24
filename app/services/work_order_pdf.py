@@ -370,7 +370,11 @@ def render(db: Session, work_order: WorkOrder, compress: bool = True) -> bytes:
         }
         rows.append([cells[name]() for name in names])
 
-    table = Table(rows, colWidths=[w for _name, w in columns], repeatRows=1)
+    # splitInRow: a row taller than what is left of the page -- or than a whole
+    # page: a description may run to 2,000 characters in each language -- is
+    # carried over inside the row. Without it reportlab cannot place the row
+    # at all and the whole document fails to render, every time it is asked for.
+    table = Table(rows, colWidths=[w for _name, w in columns], repeatRows=1, splitInRow=1)
     style = [
         ("BACKGROUND", (0, 0), (-1, 0), _INK),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),

@@ -17,6 +17,7 @@ from app.models import (
     ItemStep,
     Phase,
     Project,
+    Stage,
     User,
     WorkOrderLine,
 )
@@ -431,14 +432,8 @@ def assign_items(
                 )
             if qty == batch:
                 continue   # all of it: an ordinary move
-            waiting = state["production_unstarted_qty"] if state else item.total_qty
-            if qty > waiting:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    f"nothing was changed: only {waiting} of {item.code} have not started. Units "
-                    "already on the floor are moved from the item's own page (Office → Items), "
-                    "where you say which stage they come from.",
-                )
+            # Any of it, wherever it has got to: a phase is a reporting label,
+            # not a production fact, and the units stay where they are.
             partial[item.id] = qty
 
     def target(item: Item) -> tuple:
@@ -488,16 +483,29 @@ def assign_items(
     except parts_service.PartsError as exc:
         db.rollback()
         raise HTTPException(exc.status, f"nothing was changed: {exc}")
+    stage_names = {str(row.id): row.name for row in db.scalars(sa.select(Stage))}
+    taken: dict[str, list[dict]] = {}
     for item in items:
         if item.id not in partial:
             continue
         try:
-            parts_service.split_phase(
-                db, item, payload.phase_id, {parts_service.UNSTARTED: partial[item.id]}, admin
+            _target, took = parts_service.split_phase_some(
+                db, item, payload.phase_id, partial[item.id], admin
             )
         except parts_service.PartsError as exc:
             db.rollback()
             raise HTTPException(exc.status, f"nothing was changed: {item.code}: {exc}")
+        # Where they were taken from, for whoever asked: the furthest along
+        # first -- finished, then stage by stage from the last listed, then
+        # not started.
+        taken[str(item.id)] = [
+            {
+                "place": "not started" if key == parts_service.UNSTARTED
+                else "Done" if key == parts_service.DONE else stage_names.get(key, "?"),
+                "qty": qty,
+            }
+            for key, qty in took.items()
+        ]
     log.info(
         "%d item(s) filed by %s: %s",
         len(items),
@@ -508,7 +516,11 @@ def assign_items(
             if key in sent
         ),
     )
-    return {"updated": len(items), "split": len(partial)}
+    answer: dict = {"updated": len(items), "split": len(partial)}
+    if taken:
+        # For each item filed in part: what was taken, and from where.
+        answer["taken"] = taken
+    return answer
 
 
 @router.patch("/{item_id}")
@@ -613,6 +625,14 @@ def update_item(
             for part in parts_service.descendants(db, item):
                 part.is_active = True
 
+    if "total_qty" in fields and item.parent_item_id is not None:
+        # A part has no batch of its own (its total is 0): its units arrive
+        # when the piece is split and leave when it is assembled. A number
+        # typed here would put units on the floor that no split made.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "a part has no quantity of its own; its units come from splitting the piece it belongs to",
+        )
     if "total_qty" in fields:
         state = reports.item_state(db, [item.id]).get(str(item.id))
         # Batch units only: the sample is not part of total_qty.

@@ -150,7 +150,7 @@ def _translate_chunk(client: anthropic.Anthropic, model: str, chunk: list[tuple[
         answer = json.loads(text)["translations"]
         found = {int(row["id"]): str(row["text"]) for row in answer}
     except (ValueError, KeyError, TypeError):
-        log.warning("translation answer could not be read (request %s)", message._request_id)
+        log.warning("translation answer could not be read (request %s)", getattr(message, "_request_id", None))
         raise TranslationError("the translation came back unreadable; try again") from None
     missing = [index for index, _text in chunk if index not in found]
     if missing:

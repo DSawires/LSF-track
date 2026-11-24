@@ -85,7 +85,7 @@ def upload_image(
             size += len(chunk)
             if size > settings.max_upload_bytes:
                 raise HTTPException(
-                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    413,
                     f"image exceeds {settings.max_upload_bytes // (1024 * 1024)}MB",
                 )
             spool.write(chunk)

@@ -29,6 +29,7 @@ from app.api import (
 )
 from app.config import get_settings, require_session_key
 from app.db import dispose_engine, get_engine
+from app.limits import BodyLimitMiddleware
 
 
 def _configure_logging() -> None:
@@ -151,6 +152,11 @@ async def security_headers(request: Request, call_next):
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
         )
     return response
+
+
+# Added last, so it is outermost: nothing reads a request body before this has
+# decided how much of one it will take. See app/limits.py.
+app.add_middleware(BodyLimitMiddleware)
 
 
 @app.get("/health")

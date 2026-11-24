@@ -134,11 +134,25 @@ def cmd_backup(_args) -> None:
         storage = get_storage()
         storage.put(key, spool, "application/gzip")
 
-    existing = storage.list("backups/")
-    for old in existing[: -settings.backup_keep] if settings.backup_keep > 0 else []:
+    # Which old dumps go is decided in app/services/backups.py: only this
+    # job's own files, and never one more than twice the size of tonight's.
+    from app.services.backups import dump_keys, prune_plan
+
+    sizes = storage.sizes("backups/")
+    delete, held = prune_plan(sizes, settings.backup_keep)
+    for old in delete:
         storage.delete(old)
     destination = f"s3://{settings.s3_bucket}/{settings.s3_prefix}" if settings.s3_bucket else settings.upload_dir
-    print(f"backup: wrote {key} ({size // 1024}KB) to {destination}; {min(len(existing), settings.backup_keep)} kept")
+    kept = len(dump_keys(sizes)) - len(delete)
+    print(f"backup: wrote {key} ({size // 1024}KB) to {destination}; {kept} kept")
+    if held:
+        print(
+            f"backup: WARNING: tonight's dump is less than half the size of {len(held)} older "
+            f"one(s), which were NOT pruned ({held[0]} ... {held[-1]}). If the database "
+            "really shrank, delete them by hand; if it did not, tonight's dump is of the "
+            "wrong or an empty database.",
+            file=sys.stderr,
+        )
 
 
 def cmd_restore(args) -> None:
@@ -209,6 +223,22 @@ def cmd_restore(args) -> None:
         spool.close()
         dump_path = spool.name
         cleanup = spool.name
+
+    # Read it to its end before anything is dropped: a dump cut short (the
+    # disk filled while it was written) fails partway through loading, and by
+    # then --reset has already taken the live schema.
+    from app.services.backups import unreadable
+
+    problem = unreadable(dump_path)
+    if problem:
+        if cleanup:
+            os.unlink(cleanup)
+        print(
+            f"restore: {args.source} cannot be restored from: {problem}. "
+            "Nothing was changed; pick another dump (see --list).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     psql_base = [
         "psql",

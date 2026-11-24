@@ -101,6 +101,14 @@ assumes a direction. `stages.sort_order` is the order stages are *listed* in,
 nothing more. The phone may remember where units last went from a place and
 offer that first — a default the engineer can see and change, not a rule.
 
+One stated exception, of the same kind: filing *some* of a batch under a phase
+by number alone takes the units furthest along first, and between two stages
+"further along" is read off the listing order, last listed first
+(`parts.split_phase_some`). It is a default for an office filing action — the
+answer says what was taken from where, nothing moves on the floor, and the
+item's own page takes the places by name instead. It is not a route, and
+nothing else may lean on it.
+
 `item_steps` and `events.item_step_id` are legacy. Items used to carry an
 ordered sequence, and an entry named a step and no source: it took the nearest
 units before that step. Those rows are in the log and replay exactly as they
@@ -268,7 +276,8 @@ Names are indicative; Alembic migrations are authoritative.
 
 Exactly one of `from_stage_id` / `from_unstarted` / `from_done` / `from_link`
 is set on every new entry that moves units. `from_done` outside rework is only
-for a linked row taking finished parts into an assembly.
+for a linked row: finished parts going into an assembly, or finished units
+re-filed into another phase (where they arrive finished).
 
 Index for the queries that matter: `(item_id, occurred_at)`,
 `(station_id, occurred_at)`, `(received_at)`, `(stage_id)`.
@@ -281,7 +290,15 @@ connection.
 - Every write goes to the IndexedDB queue first and updates the UI immediately.
   Nothing blocks on the network. No spinners on the logging path.
 - A background sync drains the queue when connectivity returns. Queue entries are
-  cleared **only** on server acknowledgement.
+  cleared **only** on server acknowledgement — and not at that moment: an
+  acknowledged entry is kept as `acked` and still drawn on the cards
+  (`localPlaces`) until the item list has been fetched again, because the list
+  in hand predates it. `sync()` fetches the list whenever one is held, whatever
+  `items_token` says, and drops them as it swaps the new list in. Dropped on
+  the ack alone, the units jumped back in a dead spot and got logged twice.
+- Only a 422 is a verdict on an entry and quarantines it. A 403, a 429 or any
+  other failure of the request as a whole says nothing about the entries:
+  they stay pending and are retried.
 - `POST /events` is idempotent on the client-generated UUID: re-posting an existing
   ID returns the stored event, does not error, does not duplicate. Assume responses
   get lost and clients retry.
@@ -363,9 +380,15 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   an area and/or a phase on everything ticked. `POST /api/items/assign` does
   it all-or-nothing: if any two items would become the same batch, nothing
   changes. Each ticked item also takes a quantity (`quantities`): fewer than
-  the batch splits that many not-started units into the phase
-  (`parts.split_phase`) and leaves the rest where they are; parts are not
-  offered here, they follow their piece
+  the batch files that many of its units under the phase and leaves the rest
+  where they are filed. **A phase is a reporting label, not a production
+  fact**, so this never depends on how far the units have got: not started,
+  at a stage or finished, they can be filed under a phase, and they stay
+  where they are on the floor. With only a number to go on, the units
+  furthest along go first — finished, then stage by stage from the last
+  listed, then not started (`parts.split_phase_some`) — and the answer says
+  what was taken from where (`taken`). Parts are not offered here, they follow
+  their piece
 - Taking work off the floor (admin): archive an item, or a project together
   with its items — each archive is an event, and both can be reactivated.
   Finished jobs should be archived: every active item is replayed by every
@@ -391,7 +414,10 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
 - Splitting a batch across phases (admin, the item's editor,
   `POST /api/items/{id}/split-phase`): before release, planned quantity moves
   and the new batch waits on the original's sample; after, units move place
-  by place as linked pairs. Online-only, an office action
+  by place as linked pairs — out of one batch and into the other at the same
+  place, Done included (`take` keys: `unstarted`, a stage id, `done`). The
+  sample never moves: it is the sample of the item it was built for.
+  Online-only, an office action
 - Work orders in Arabic: the PDF prints in English, Arabic (mirrored, right to
   left) or both. Arabic is shaped and ordered in `app/services/arabic.py`
   before reportlab sees it, so it must be wrapped there too — never hand a
@@ -428,6 +454,17 @@ above, role hierarchies beyond user/admin.
 - Tests: any new report or aggregation needs a test that passes with an extra stage
   inserted at runtime. If adding a stage to the fixture breaks a test, the code has
   a hardcoded assumption — fix the code, not the test.
+- The app speaks English and Arabic (right to left), chosen per device on the
+  sign-in and account screens. Every word the client says goes through `t("…")`,
+  `tn(n, "one", "other")` or a table entry marked `N_("…")` (`static/js/i18n.js`),
+  keyed by its English wording, with the Arabic in `static/js/ar.js`.
+  `tests/test_i18n.py` fails on a key with no Arabic, a translation nothing
+  uses, or a lost `{placeholder}`. Keys are literal strings, never built at
+  runtime. Factory data (stage, station, area, phase names, codes,
+  descriptions) is never translated, and server error messages stay English.
+  Layout is written in start/end terms (`margin-inline-start`, `text-align:
+  start`), never left/right, and free text sharing a line with other words is
+  wrapped in `<bdi>`.
 
 ## Adding a new stage (the procedure this design exists to support)
 
@@ -457,6 +494,17 @@ fixed rather than patched around.
   phone "stored" — and the phone has cleared the entry. With the scope it is
   a 5xx and the entry stays queued. `tests/test_durability.py` fails on any
   route that declares it the other way.
+- Request bodies are capped in front of everything else (`app/limits.py`):
+  FastAPI parses a body before the session check runs, so without it anyone
+  who can reach the server can make it read whatever they send. 1 MB with no
+  valid session cookie (signature checked, no database call), 16 MB with one,
+  the import and photo limits plus a margin for a file. A new endpoint that
+  takes more than that needs its allowance raised there.
+- The backup job prunes only its own `backups/lsf-<stamp>.sql.gz` files, and
+  never deletes a dump more than twice the size of the one it just wrote: a
+  container started against an empty database must not evict the real
+  backups (`app/services/backups.py`). `restore` reads a dump to its end
+  before `--reset` drops anything. Local storage writes are atomic.
 - The login throttle is in-memory and per-process: correct at one uvicorn
   worker (the shipped configuration). Adding `--workers N` needs a shared
   store for it first.
@@ -492,7 +540,9 @@ fixed rather than patched around.
 - **Item** — a batch of identical pieces tracked as one unit, with a quantity.
   Named by project, code, area and phase together.
 - **Area** — a part of the client's job: guest rooms, the spa.
-- **Phase** — a phase of the job a batch is built and delivered in.
+- **Phase** — a phase of the job a batch is delivered in. A label for
+  reporting, not a production fact: filing units under one never depends on,
+  or changes, where they are.
 - **Sample** — the first unit(s) of an item, built before the batch exists.
   Logging it Done releases the batch.
 - **Place** — where units can rest: not started, a stage, or Done.

@@ -484,7 +484,11 @@ class ItemLedger:
             self._arrive(event, move)
             return
 
-        taken, shortfall = self._take(move.sources, event.qty)
+        # Units re-filed into another phase are batch units: the sample stays
+        # with the item it is the sample of, even where it is the oldest lot at
+        # that place -- as it always is in Done.
+        transfer_out = move.outflow and not self.parts_link
+        taken, shortfall = self._take(move.sources, event.qty, spare_sample=transfer_out)
         if shortfall:
             if move.named:
                 where = "at the place it takes them from"
@@ -560,14 +564,21 @@ class ItemLedger:
         if self.released_at is None and self.done_qty >= self.sample_qty and not self.shares_sample:
             self._release(event.occurred_at)
 
-    def _take(self, source_indexes, qty: int) -> tuple[list[tuple[int, Lot]], int]:
+    def _take(
+        self, source_indexes, qty: int, spare_sample: bool = False
+    ) -> tuple[list[tuple[int, Lot]], int]:
+        """Oldest lots first. `spare_sample` passes over sample lots, leaving
+        them where they are and in their order."""
         taken: list[tuple[int, Lot]] = []
         remaining = qty
         for index in source_indexes:
             lots = self.buckets[index]
+            passed: list[Lot] = []
             while lots and remaining > 0:
                 lot = lots[0]
-                if lot.qty <= remaining:
+                if spare_sample and lot.is_sample:
+                    passed.append(lots.popleft())
+                elif lot.qty <= remaining:
                     lots.popleft()
                     taken.append((index, lot))
                     remaining -= lot.qty
@@ -586,6 +597,8 @@ class ItemLedger:
                         )
                     )
                     remaining = 0
+            # Back at the front, oldest first, exactly as they were.
+            lots.extendleft(reversed(passed))
             if remaining == 0:
                 break
         return taken, remaining

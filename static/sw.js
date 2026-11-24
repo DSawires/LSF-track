@@ -27,6 +27,8 @@ const IMAGE_CACHE_MAX_ENTRIES = 300;
 const SHELL_FILES = [
   "/",
   "/static/css/app.css",
+  "/static/js/ar.js",
+  "/static/js/i18n.js",
   "/static/js/db.js",
   "/static/js/app.js",
   "/static/icon.svg",
@@ -149,7 +151,7 @@ async function drainFromWorker() {
     else last.push(entry);
   }
   for (const chunk of chunks) {
-    const events = chunk.map(({ _queued_at, _status, _reason, ...event }) => event);
+    const events = chunk.map(({ _queued_at, _status, _acked_at, _reason, ...event }) => event);
     const response = await fetch("/api/events/batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

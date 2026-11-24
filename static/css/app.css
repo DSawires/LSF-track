@@ -259,7 +259,7 @@ main {
 .row-list > * {
   display: block;
   width: 100%;
-  text-align: left;
+  text-align: start;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -297,8 +297,11 @@ main {
   padding: 10px 12px;
   margin: 6px 0;
   background: var(--panel-2);
-  border-left: 3px solid var(--line);
-  border-radius: 0 8px 8px 0;
+  border-inline-start: 3px solid var(--line);
+  border-start-start-radius: 0;
+  border-end-start-radius: 0;
+  border-start-end-radius: 8px;
+  border-end-end-radius: 8px;
   color: inherit;
   text-decoration: none;
 }
@@ -306,7 +309,7 @@ main {
 .pos-row:active { background: var(--line); }
 
 /* A part, under the piece it belongs to on that piece's card. */
-.part-block { margin: 8px 0 0 6px; padding-left: 10px; border-left: 2px solid var(--line); }
+.part-block { margin-block: 8px 0; margin-inline: 6px 0; padding-inline-start: 10px; border-inline-start: 2px solid var(--line); }
 .part-head {
   display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
   color: inherit; text-decoration: none; padding: 6px 0 4px;
@@ -538,7 +541,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 .photo-tile .drop {
   position: absolute;
   top: 4px;
-  right: 4px;
+  inset-inline-end: 4px;
   width: 34px;
   min-height: 34px;
   padding: 0;
@@ -555,9 +558,9 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 .table-scroll { overflow-x: auto; }
 
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
-th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+th, td { text-align: start; padding: 8px 6px; border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-weight: 500; font-size: 12px; }
-td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.num, th.num { text-align: end; font-variant-numeric: tabular-nums; }
 
 .bar-track { background: var(--panel-2); border-radius: 4px; height: 8px; overflow: hidden; }
 .bar-fill { background: var(--accent); height: 100%; }
@@ -599,7 +602,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 /* A stage on the WIP report: the whole block is the button. */
 .wip-row {
-  display: block; text-align: left;
+  display: block; text-align: start;
   background: transparent; border: 1px solid transparent;
   padding: 8px; margin: 0 -8px 4px; width: calc(100% + 16px);
 }
@@ -659,8 +662,8 @@ td.overdue { color: var(--warn-text); font-weight: 700; }
 
 /* ---- work orders ---------------------------------------------------------- */
 
-/* One line of a work order being written: its picture on the left, what will
-   be printed about it on the right. Stacks on a narrow phone. */
+/* One line of a work order being written: its picture at the start, what will
+   be printed about it after it. Stacks on a narrow phone. */
 .wo-line {
   display: flex; gap: 12px; align-items: flex-start;
   padding: 12px 0; border-bottom: 1px solid var(--line);
@@ -676,6 +679,23 @@ td.overdue { color: var(--warn-text); font-weight: 700; }
 /* Arabic is typed and read right to left; a little more line height keeps its
    marks from touching the row above. */
 [lang="ar"] { line-height: 1.7; }
+
+/* The whole app in Arabic: <html dir="rtl" lang="ar">. The layout above is
+   written in start/end terms, so it mirrors by itself, and the chevrons
+   (› ‹) are mirrored by the browser as right-to-left text. What is left is
+   the type. Codes, quantities
+   and revisions are Latin and stay left to right inside an Arabic line
+   (unicode-bidi: isolate keeps "LF-01" from being reordered by the text around
+   it). */
+html[dir="rtl"] body { font-family: "Segoe UI", Tahoma, "Geeza Pro", "Noto Sans Arabic", -apple-system, Roboto, sans-serif; }
+html[dir="rtl"] strong, html[dir="rtl"] .badge { unicode-bidi: isolate; }
+html[dir="rtl"] input[type="number"], html[dir="rtl"] input[type="password"] { direction: ltr; }
+html[dir="rtl"] .qty-row input[type="number"] { text-align: center; }
+
+/* The language switch: two buttons, the one in use lit. */
+.lang-switch { display: flex; gap: 8px; justify-content: center; margin-top: 14px; }
+.lang-switch button { width: auto; min-height: 40px; padding: 6px 16px; font-size: 14px; }
+.lang-switch button.on { border-color: var(--accent); color: var(--accent); }
 .check-row { display: flex; flex-wrap: wrap; }
 @media (max-width: 420px) {
   .wo-line { flex-direction: column; }

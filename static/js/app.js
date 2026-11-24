@@ -108,7 +108,7 @@ async function drainQueue() {
     let chunk = queue.slice(0, BATCH_CHUNK);
     const links = new Set(chunk.map((q) => q.link_id).filter(Boolean));
     if (links.size) chunk = chunk.concat(queue.slice(BATCH_CHUNK).filter((q) => links.has(q.link_id)));
-    const events = chunk.map(({ _queued_at, _status, _reason, ...event }) => event);
+    const events = chunk.map(({ _queued_at, _status, _acked_at, _reason, ...event }) => event);
     let results;
     try {
       ({ results } = await api("/api/events/batch", {
@@ -116,11 +116,12 @@ async function drainQueue() {
         body: JSON.stringify({ events }),
       }));
     } catch (error) {
-      // Only a batch-level 4xx falls back to one-at-a-time posting: one
+      // A batch refused as a whole falls back to one-at-a-time posting: one
       // malformed entry fails request validation for all 100, and the poison
-      // entry must quarantine alone instead of wedging the queue. Network
-      // failures and 5xx are retried whole next sync.
-      if (!(error.status >= 400 && error.status < 500)) throw error;
+      // entry must quarantine alone instead of wedging the queue. Anything
+      // else -- no network, a 5xx, a proxy's 403 or 429 -- says nothing about
+      // the entries, and the whole batch is retried next sync.
+      if (!aboutTheEntries(error)) throw error;
       results = await drainOneByOne(events);
     }
     let divergent = 0;
@@ -138,11 +139,19 @@ async function drainQueue() {
       // it retries next sync rather than being quarantined for a server bug.
     }
     if (divergent) {
-      toast(`${divergent} ${divergent === 1 ? "entry" : "entries"} already existed with different details`);
+      toast(tn(divergent, "{n} entry already existed with different details", "{n} entries already existed with different details"));
     }
     if (!progressed) return; // all errors: stop looping, wait for the next sync
   }
 }
+
+/* Is this answer a verdict on what was sent? 422 is the server refusing an
+   entry (or a batch it cannot parse); 413 is a batch too big to take whole.
+   Every other failure is about the connection, the session or something in
+   between -- a 403 from the origin check after a proxy change, a 429 -- and an
+   entry must never be quarantined for one of those: that would mark the whole
+   queue "not accepted" on every phone for a fault that is nobody's entry. */
+const aboutTheEntries = (error) => error.status === 422 || error.status === 413;
 
 async function drainOneByOne(events) {
   const results = [];
@@ -156,7 +165,7 @@ async function drainOneByOne(events) {
       const answer = await api("/api/events/batch", { method: "POST", body: JSON.stringify({ events: group }) });
       results.push(...answer.results);
     } catch (error) {
-      if (!(error.status >= 400 && error.status < 500)) throw error;
+      if (error.status !== 422) throw error;
       for (const event of group) results.push({ id: event.id, status: "rejected", reason: rejectReason(error) });
     }
   }
@@ -168,7 +177,7 @@ async function drainOneByOne(events) {
       });
       results.push({ id: event.id, status: "stored", divergent });
     } catch (error) {
-      if (!(error.status >= 400 && error.status < 500)) throw error;
+      if (error.status !== 422) throw error;
       results.push({ id: event.id, status: "rejected", reason: rejectReason(error) });
     }
   }
@@ -184,13 +193,25 @@ function rejectReason(error) {
     const first = detail[0];
     return `${(first.loc || []).slice(1).join(".")}: ${first.msg}`.replace(/^: /, "");
   }
-  return "rejected by server";
+  return t("rejected by server");
 }
 
 async function sync() {
   if (syncRunning) return;
   syncRunning = true;
   try {
+    // Signed out while there was no signal: finish the job now, before
+    // anything else is sent under a session that was meant to have ended.
+    if (!S.user) {
+      try {
+        if (await LSF_DB.get("logoutOwed")) {
+          await api("/api/auth/logout", { method: "POST" });
+          await LSF_DB.put("logoutOwed", false);
+        }
+      } catch {
+        // Still no signal (or no storage): it stays owed.
+      }
+    }
     try {
       await drainQueue();
     } catch (error) {
@@ -210,15 +231,36 @@ async function sync() {
     try {
       S.ref = await apiLive("/api/reference");
       await LSF_DB.put("reference", S.ref);
-      const current = !!S.itemsMeta.token
+      // Entries the server has taken are kept ("acked") and still drawn on
+      // the cards until the list has been fetched again: this list predates
+      // them. So while any are held the list is fetched whatever the token
+      // says, and they go the moment a list fetched after them is in place --
+      // not before, or the units jump back; not after, or they count twice.
+      const fetchStarted = Date.now();
+      const holding = (await LSF_DB.queueAll()).some((q) => q._status === "acked");
+      const current = !holding
+        && !!S.itemsMeta.token
         && S.itemsMeta.token === S.ref.items_token
         && Date.now() - S.itemsMeta.at < ITEMS_MAX_AGE_MS;
       if (!current) {
         const itemsPayload = await apiLive("/api/items");
+        // Which entries this list already contains: read from storage, where
+        // the drain marked them -- the copy in memory still says "pending".
+        const reflected = new Set((await LSF_DB.queueAll())
+          .filter((q) => q._status === "acked" && (q._acked_at || 0) <= fetchStarted)
+          .map((q) => q.id));
+        // No await between these two: nothing may draw the new list with the
+        // old entries still on top of it.
         S.items = itemsPayload.items;
+        S.pending = S.pending.filter((q) => !reflected.has(q.id));
         S.itemsMeta = { token: itemsPayload.token || null, at: Date.now() };
+        // On disk, the list first and the entries after. Stopped in between,
+        // the next start draws a move twice until its first sync; the other
+        // order would draw it not at all, which is the one that gets a move
+        // logged a second time.
         await LSF_DB.put("items", S.items);
         await LSF_DB.put("itemsMeta", S.itemsMeta);
+        await LSF_DB.dropAcked(fetchStarted);
       }
       S.lastSync = Date.now();
       await LSF_DB.put("lastSync", S.lastSync);
@@ -248,11 +290,11 @@ function renderPill() {
   // They must not look alike.
   $pill.classList.toggle("rejected", rejected > 0);
   const parts = [];
-  if (pending) parts.push(`${pending} pending`);
-  if (rejected) parts.push(`${rejected} not accepted`);
-  if (!S.online) parts.push("offline");
-  else if (S.needsLogin) parts.push("sign-in needed");
-  parts.push(S.lastSync ? `synced ${timeAgo(S.lastSync)}` : "never synced");
+  if (pending) parts.push(t("{n} pending", { n: pending }));
+  if (rejected) parts.push(t("{n} not accepted", { n: rejected }));
+  if (!S.online) parts.push(t("offline"));
+  else if (S.needsLogin) parts.push(t("sign-in needed"));
+  parts.push(S.lastSync ? t("synced {when}", { when: timeAgo(S.lastSync) }) : t("never synced"));
   $pillText.textContent = parts.join(" · ");
   const banner = document.getElementById("session-banner");
   if (banner) banner.hidden = !(S.needsLogin && S.user);
@@ -279,16 +321,21 @@ function renderStatusBanner() {
   el.hidden = !show;
   if (!show) { el.className = ""; el.textContent = ""; return; }
   el.className = BANNER_COLORS.includes(banner.color) ? banner.color : "neutral";
-  el.innerHTML = `<span class="label">${esc(banner.color)}</span>` +
+  el.innerHTML = `<span class="label">${esc(bannerColorName(banner.color))}</span>` +
     (banner.message ? ` ${esc(banner.message)}` : "");
 }
 
+/* The banner's colour, in words. The label is what makes the colour readable
+   to someone who cannot tell it apart, so it is said in the reader's language. */
+const BANNER_COLOR_NAMES = { green: N_("Green"), yellow: N_("Yellow"), red: N_("Red"), neutral: N_("Neutral") };
+const bannerColorName = (color) => t(BANNER_COLOR_NAMES[color] || BANNER_COLOR_NAMES.neutral);
+
 function timeAgo(timestamp) {
   const minutes = Math.round((Date.now() - timestamp) / 60000);
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 1) return t("just now");
+  if (minutes < 60) return t("{n}m ago", { n: minutes });
   const hours = Math.round(minutes / 60);
-  return hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+  return hours < 24 ? t("{n}h ago", { n: hours }) : t("{n}d ago", { n: Math.round(hours / 24) });
 }
 
 /* "5 Nov, 03:49": the day first and the month by name, so a date cannot be read
@@ -299,11 +346,17 @@ function fmtWhen(value) {
   if (Number.isNaN(when.getTime())) return "";
   const options = { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
   if (when.getFullYear() !== new Date().getFullYear()) options.year = "numeric";
-  return when.toLocaleString("en-GB", options);
+  return when.toLocaleString(LSF_I18N.locale(), options);
 }
 
 /* "1 pc", "40 pcs". */
-const pcs = (n) => `${n} ${Number(n) === 1 ? "pc" : "pcs"}`;
+const pcs = (n) => tn(n, "{n} pc", "{n} pcs");
+
+/* "rev C": a drawing revision, beside a code. */
+const revLabel = (rev) => t("rev {rev}", { rev });
+
+/* "2.5d": days at a place, on the cards and in the aging report. */
+const daysLabel = (days) => t("{n}d", { n: days.toFixed(1) });
 
 window.addEventListener("online", () => { S.online = true; sync(); });
 window.addEventListener("offline", () => { S.online = false; renderPill(); });
@@ -349,12 +402,12 @@ async function logEvents(events) {
   } catch {
     // IndexedDB refused the write (quota, private browsing, corruption). The
     // one thing worse than an error is pretending the entry was recorded.
-    toast("NOT saved — device storage failed");
+    toast(t("NOT saved — device storage failed"));
     return false;
   }
   S.pending = await LSF_DB.queueAll();
   renderPill();
-  toast("Logged ✓");
+  toast(t("Logged ✓"));
   requestBackgroundSync();
   sync(); // fire and forget; the queue survives if this fails
   return true;
@@ -403,14 +456,14 @@ const familyOf = (item) => [item, ...partsOf(item).flatMap(familyOf)];
 function batchLabel(item) {
   if (item.parent_item_id) {
     const piece = pieceOf(item);
-    return `×${item.per_unit} per ${piece ? piece.code : "piece"}`;
+    return piece ? t("×{n} per {code}", { n: item.per_unit, code: piece.code }) : t("×{n} per piece", { n: item.per_unit });
   }
   return pcs(item.state?.batch_qty ?? item.total_qty);
 }
 
 function placeName(key) {
-  if (key === UNSTARTED) return "Not started";
-  if (key === DONE) return "Done";
+  if (key === UNSTARTED) return t("Not started");
+  if (key === DONE) return t("Done");
   return stageById(key)?.name || "?";
 }
 
@@ -453,7 +506,7 @@ function labelOptions(list, field, items, noneLabel, projectId) {
       : used.has(row.id) || projects.get(row.project_id)?.is_active !== false));
   const named = (row) => (projectId ? row.name : `${projects.get(row.project_id)?.code || "?"} · ${row.name}`);
   const options = rows.map((row) => ({ id: row.id, name: named(row) }));
-  if (!projectId) options.sort((x, y) => x.name.localeCompare(y.name));
+  if (!projectId) options.sort((x, y) => x.name.localeCompare(y.name, LSF_I18N.locale()));
   if (rows.length && items.some((item) => !item[field])) options.push({ id: NONE, name: noneLabel });
   return options;
 }
@@ -474,9 +527,9 @@ function progressOf(item) {
   return places.length ? "progress" : "finished";
 }
 const PROGRESS = [
-  ["unstarted", "Haven't started"],
-  ["progress", "In progress"],
-  ["finished", "Finished"],
+  ["unstarted", N_("Haven't started")],
+  ["progress", N_("In progress")],
+  ["finished", N_("Finished")],
 ];
 
 /* A remembered filter, dropped if what it points at is no longer on offer.
@@ -538,8 +591,10 @@ function localPlaces(item) {
   const waits = !!state?.waits_on_sample;
   const sampleQty = state?.sample_qty || 0;
 
+  // Pending, and taken by the server but newer than the list in hand: both
+  // are moves this list does not show yet.
   const queue = S.pending
-    .filter((q) => q._status === "pending" && q.item_id === item.id)
+    .filter((q) => (q._status === "pending" || q._status === "acked") && q.item_id === item.id)
     .sort(byOccurredAt);
   for (const q of queue) {
     const type = eventType(q.event_type_id);
@@ -608,7 +663,7 @@ function rejectedCountFor(itemId) {
 /* "Carpentry", "Not started", with the sample called out: until it is done,
    the sample is the only thing on the floor for that item. */
 function whereLabel(p) {
-  return p.sample_qty ? `${p.name} · sample` : p.name;
+  return p.sample_qty ? `${p.name} · ${t("sample")}` : p.name;
 }
 
 /* -------------------------------------------------------------- routing -- */
@@ -734,7 +789,7 @@ function render(background = false) {
   const moved = renderedHash !== null && hash !== renderedHash;
   if (moved && isItemList(renderedHash)) listScroll.top = $view.scrollTop;
   document.getElementById("topbar").hidden = false;
-  document.getElementById("tabs").hidden = S.needsLogin && !S.user;
+  document.getElementById("tabs").hidden = !S.user;
   // Before every early return below: the banner lives in the shell, not the
   // view, and must not depend on whether this particular render went ahead.
   renderStatusBanner();
@@ -742,8 +797,12 @@ function render(background = false) {
   // Only force the login screen when there is no cached identity to work
   // with. A session expiring mid-shift must NOT lock an engineer out of an
   // offline-first app: they keep logging from cache (the banner explains),
-  // and the queue drains after the next successful sign-in.
-  if (!S.user && (S.needsLogin || !S.ref)) {
+  // and the queue drains after the next successful sign-in. That engineer
+  // still has `S.user`. Nobody signed in at all -- a fresh phone, or one
+  // someone signed out of -- gets the login screen and nothing else: with the
+  // lists cached, this used to let the app be reopened signed out, and
+  // whatever was logged then was credited to whoever signed in next.
+  if (!S.user) {
     if (hash !== "#/login") { navigate("#/login"); return; }
   }
 
@@ -783,6 +842,29 @@ function render(background = false) {
   renderedFingerprint = fingerprint;
 }
 
+/* ------------------------------------------------------------- language -- */
+
+/* English / العربية, on the sign-in screen and the account screen. Each name
+   is written in its own language, so whoever cannot read the one in use can
+   still find theirs. The choice belongs to the phone (see i18n.js). */
+function langSwitch() {
+  const now = LSF_I18N.lang();
+  const button = (code, name) =>
+    `<button type="button" class="ghost${code === now ? " on" : ""}" data-lang="${code}" lang="${code}" aria-pressed="${code === now}">${name}</button>`;
+  return `<div class="lang-switch" role="group" aria-label="${esc(t("Language"))}">${button("en", "English")}${button("ar", "العربية")}</div>`;
+}
+
+function bindLangSwitch() {
+  $view.querySelectorAll("[data-lang]").forEach((button) => {
+    button.onclick = () => {
+      if (button.dataset.lang === LSF_I18N.lang()) return;
+      LSF_I18N.setLang(button.dataset.lang);
+      renderPill();
+      render();
+    };
+  });
+}
+
 /* ---------------------------------------------------------------- login -- */
 
 function viewLogin() {
@@ -792,16 +874,18 @@ function viewLogin() {
     <div class="login-wrap">
       <h2 style="text-align:center;font-size:22px;margin-bottom:12px">Life Style Track</h2>
       <form class="card" id="login-form">
-        <label for="login-user">Username</label>
-        <input id="login-user" autocapitalize="none" autocomplete="username" enterkeyhint="next" required>
-        <label for="login-pass">Password</label>
+        <label for="login-user">${t("Username")}</label>
+        <input id="login-user" autocapitalize="none" autocomplete="username" enterkeyhint="next" dir="ltr" required>
+        <label for="login-pass">${t("Password")}</label>
         <input id="login-pass" type="password" autocomplete="current-password" enterkeyhint="go" required>
         <div style="height:14px"></div>
-        <button class="primary" id="login-go" type="submit">Sign in</button>
+        <button class="primary" id="login-go" type="submit">${t("Sign in")}</button>
         <p id="login-err" class="warn-text" role="alert" hidden></p>
-        ${pendingCount ? `<p class="muted" style="margin-top:10px">${pendingCount} queued ${pendingCount === 1 ? "entry is" : "entries are"} safe on this device and will sync after sign-in.</p>` : ""}
+        ${pendingCount ? `<p class="muted" style="margin-top:10px">${tn(pendingCount, "{n} queued entry is safe on this device and will sync after sign-in.", "{n} queued entries are safe on this device and will sync after sign-in.")}</p>` : ""}
       </form>
+      ${langSwitch()}
     </div>`;
+  bindLangSwitch();
   document.getElementById("login-form").onsubmit = async (e) => {
     e.preventDefault();
     const err = document.getElementById("login-err");
@@ -817,16 +901,18 @@ function viewLogin() {
       S.user = user;
       S.needsLogin = false;
       await LSF_DB.put("user", user);
+      // A sign-out still owed from before is void: it would end this session.
+      await LSF_DB.put("logoutOwed", false).catch(() => {});
       document.getElementById("tabs").hidden = false;
       navigate("#/items");
       sync();
     } catch (error) {
       // "Wrong password" when the real problem is no signal is an infuriating
       // dead end on the floor — name the actual failure.
-      if (error.auth) err.textContent = "Wrong username or password.";
-      else if (error.status === 429) err.textContent = error.body?.detail || "Too many attempts — wait a minute and try again.";
-      else if (error.status) err.textContent = "The server had a problem — try again shortly.";
-      else err.textContent = "No connection. Sign-in needs the network; queued entries are safe and will sync later.";
+      if (error.auth) err.textContent = t("Wrong username or password.");
+      else if (error.status === 429) err.textContent = error.body?.detail || t("Too many attempts — wait a minute and try again.");
+      else if (error.status) err.textContent = t("The server had a problem — try again shortly.");
+      else err.textContent = t("No connection. Sign-in needs the network; queued entries are safe and will sync later.");
       err.hidden = false;
     } finally {
       button.disabled = false;
@@ -849,11 +935,11 @@ function viewSyncStatus() {
     const from = queuedSource(q);
     const to = queuedTarget(q);
     const what = [
-      type?.name || "entry",
+      type?.name || t("entry"),
       from && to ? `${placeName(from)} → ${placeName(to)}` : to ? placeName(to) : "",
       q.qty ? pcs(q.qty) : "",
     ].filter(Boolean).join(" · ");
-    return { code: item ? itemName(item) : "unknown item", what, when: fmtWhen(q._queued_at || Date.now()) };
+    return { code: item ? itemName(item) : t("unknown item"), what, when: fmtWhen(q._queued_at || Date.now()) };
   };
 
   const entryRow = (q, actions) => {
@@ -868,8 +954,8 @@ function viewSyncStatus() {
         ${q._reason ? `<div class="warn-text" style="margin:4px 0">${esc(q._reason)}</div>` : ""}
         ${actions ? `
         <div style="display:flex;gap:8px;margin-top:6px">
-          <button class="ghost" data-retry="${q.id}" style="width:auto;padding:8px 16px">Retry</button>
-          <button class="ghost" data-discard="${q.id}" style="width:auto;padding:8px 16px">Discard</button>
+          <button class="ghost" data-retry="${q.id}" style="width:auto;padding:8px 16px">${t("Retry")}</button>
+          <button class="ghost" data-discard="${q.id}" style="width:auto;padding:8px 16px">${t("Discard")}</button>
         </div>` : ""}
       </div>`;
   };
@@ -877,25 +963,27 @@ function viewSyncStatus() {
   $view.innerHTML = `
     <div class="card">
       <div class="spread">
-        <span>Signed in as <strong>${esc(S.user?.display_name || S.user?.username || "nobody")}</strong>${S.user?.is_admin ? ` <span class="badge">admin</span>` : ""}</span>
-        ${S.user ? `<button class="ghost" id="sign-out" style="width:auto;padding:8px 16px;flex:none">Sign out</button>` : ""}
+        <span>${t("Signed in as")} <strong>${esc(S.user?.display_name || S.user?.username || t("nobody"))}</strong>${S.user?.is_admin ? ` <span class="badge">${t("admin")}</span>` : ""}</span>
+        ${S.user ? `<button class="ghost" id="sign-out" style="width:auto;padding:8px 16px;flex:none">${t("Sign out")}</button>` : ""}
       </div>
+      ${langSwitch()}
     </div>
 
     <div class="card">
-      <h2>Waiting to sync (${pending.length})</h2>
+      <h2>${t("Waiting to sync ({n})", { n: pending.length })}</h2>
       ${pending.map((q) => entryRow(q, false)).join("") || `<p class="muted">${rejected.length
-        ? "Nothing waiting — but see below: not everything was accepted."
-        : "Nothing waiting — everything has reached the server."}</p>`}
-      <p class="muted" style="margin-top:8px">${S.lastSync ? `Last synced ${timeAgo(S.lastSync)}.` : "Never synced from this device."}${S.online ? "" : " Currently offline; entries are safe here until the network returns."}</p>
+        ? t("Nothing waiting — but see below: not everything was accepted.")
+        : t("Nothing waiting — everything has reached the server.")}</p>`}
+      <p class="muted" style="margin-top:8px">${S.lastSync ? t("Last synced {when}.", { when: timeAgo(S.lastSync) }) : t("Never synced from this device.")}${S.online ? "" : ` ${t("Currently offline; entries are safe here until the network returns.")}`}</p>
     </div>
 
     ${rejected.length ? `
     <div class="card">
-      <h2>Not accepted (${rejected.length})</h2>
-      <p class="muted" style="margin-bottom:6px">These are not in the log. Retry if things have changed since — the entry it depends on may have synced from another phone. Discard it if it was a mistake, and log it again correctly.</p>
+      <h2>${t("Not accepted ({n})", { n: rejected.length })}</h2>
+      <p class="muted" style="margin-bottom:6px">${t("These are not in the log. Retry if things have changed since — the entry it depends on may have synced from another phone. Discard it if it was a mistake, and log it again correctly.")}</p>
       ${rejected.map((q) => entryRow(q, true)).join("")}
     </div>` : ""}`;
+  bindLangSwitch();
 
   // A split or an assembly was refused as a group, and goes back (or goes)
   // as one: a single row of it on its own is never stored.
@@ -916,8 +1004,8 @@ function viewSyncStatus() {
     button.onclick = async () => {
       const ids = groupOf(button.dataset.discard);
       if (!confirm(ids.length > 1
-        ? `Discard this split or assembly (${ids.length} entries together)? It was never stored on the server and will be gone for good.`
-        : "Discard this entry? It was never stored on the server and will be gone for good.")) return;
+        ? t("Discard this split or assembly ({n} entries together)? It was never stored on the server and will be gone for good.", { n: ids.length })
+        : t("Discard this entry? It was never stored on the server and will be gone for good."))) return;
       for (const id of ids) await LSF_DB.dropRejected(id);
       S.pending = await LSF_DB.queueAll();
       renderPill();
@@ -928,12 +1016,16 @@ function viewSyncStatus() {
   const signOut = document.getElementById("sign-out");
   if (signOut) signOut.onclick = async () => {
     const waiting = pending.length;
-    if (waiting && !confirm(`${waiting} ${waiting === 1 ? "entry has" : "entries have"} not synced yet. ${waiting === 1 ? "It stays" : "They stay"} on this device and will sync after the next sign-in. Sign out anyway?`)) return;
+    if (waiting && !confirm(tn(waiting,
+      "{n} entry has not synced yet. It stays on this device and will sync after the next sign-in. Sign out anyway?",
+      "{n} entries have not synced yet. They stay on this device and will sync after the next sign-in. Sign out anyway?"))) return;
     try {
       await api("/api/auth/logout", { method: "POST" });
     } catch {
       // Offline: the server cookie outlives this, but the local identity and
-      // cached data still clear so the next user starts clean.
+      // cached data still clear so the next user starts clean. The sign-out
+      // itself is owed to the server, and sync() sends it when it can.
+      await LSF_DB.put("logoutOwed", true).catch(() => {});
     }
     S.user = null;
     S.needsLogin = true;
@@ -960,8 +1052,8 @@ function viewItems() {
   // The same goes for a stage taken off the floor.
   const filterStage = validFilter("f-stage", stages);
   const inProject = S.items.filter((item) => !filterProject || item.project_id === filterProject);
-  const areas = labelOptions("areas", "area_id", inProject, "No area", filterProject);
-  const phases = labelOptions("phases", "phase_id", inProject, "No phase", filterProject);
+  const areas = labelOptions("areas", "area_id", inProject, t("No area"), filterProject);
+  const phases = labelOptions("phases", "phase_id", inProject, t("No phase"), filterProject);
   const filterArea = validFilter("f-area", areas);
   const filterPhase = validFilter("f-phase", phases);
   const filterProgress = validFilter("f-progress", PROGRESS.map(([id]) => ({ id })));
@@ -981,7 +1073,7 @@ function viewItems() {
   // A part has no card of its own: it is listed under the piece it belongs to.
   const list = (text) =>
     S.items.filter((item) => !pieceOf(item) && matches(item, text)).map(itemRow).join("")
-    || `<p class="muted">No items match.</p>`;
+    || `<p class="muted">${t("No items match.")}</p>`;
 
   // Search is how a batch is found among a few hundred; the filters are the
   // slower second tool, and five dropdowns above every list cost a quarter of
@@ -993,43 +1085,43 @@ function viewItems() {
     stages.find((s) => s.id === filterStage)?.name,
     areas.find((a) => a.id === filterArea)?.name,
     phases.find((ph) => ph.id === filterPhase)?.name,
-    PROGRESS.find(([id]) => id === filterProgress)?.[1],
+    filterProgress ? t(PROGRESS.find(([id]) => id === filterProgress)?.[1] || "") : "",
   ].filter(Boolean);
   const filtersOpen = sessionStorage.getItem("f-open") === "1";
 
   $view.innerHTML = `
     <div class="find-row">
-      <input id="f-q" type="search" placeholder="Search code or description"
+      <input id="f-q" type="search" placeholder="${esc(t("Search code or description"))}"
              value="${esc(sessionStorage.getItem("f-q") || "")}">
-      <button class="ghost${active.length ? " on" : ""}" id="f-toggle" aria-expanded="${filtersOpen}" aria-controls="f-panel">Filters${active.length ? ` · ${active.length}` : ""}</button>
+      <button class="ghost${active.length ? " on" : ""}" id="f-toggle" aria-expanded="${filtersOpen}" aria-controls="f-panel">${t("Filters")}${active.length ? ` · ${active.length}` : ""}</button>
     </div>
     ${active.length && !filtersOpen ? `
     <div class="filter-summary">
-      <span class="muted">Showing only ${esc(active.join(" · "))}</span>
-      <button class="ghost" id="f-clear">Show all</button>
+      <span class="muted">${t("Showing only")} ${esc(active.join(" · "))}</span>
+      <button class="ghost" id="f-clear">${t("Show all")}</button>
     </div>` : ""}
     <div class="filters" id="f-panel" ${filtersOpen ? "" : "hidden"}>
-      <select id="f-project" aria-label="Project">
-        <option value="">All projects</option>
+      <select id="f-project" aria-label="${esc(t("Project"))}">
+        <option value="">${t("All projects")}</option>
         ${projects.map((p) => `<option value="${p.id}" ${p.id === filterProject ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
       </select>
-      <select id="f-stage" aria-label="Stage">
-        <option value="">All stages</option>
+      <select id="f-stage" aria-label="${esc(t("Stage"))}">
+        <option value="">${t("All stages")}</option>
         ${stages.map((s) => `<option value="${s.id}" ${s.id === filterStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
       </select>
       ${areas.length ? `
-      <select id="f-area" aria-label="Area">
-        <option value="">All areas</option>
+      <select id="f-area" aria-label="${esc(t("Area"))}">
+        <option value="">${t("All areas")}</option>
         ${areas.map((a) => `<option value="${a.id}" ${a.id === filterArea ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
       </select>` : ""}
       ${phases.length ? `
-      <select id="f-phase" aria-label="Phase">
-        <option value="">All phases</option>
+      <select id="f-phase" aria-label="${esc(t("Phase"))}">
+        <option value="">${t("All phases")}</option>
         ${phases.map((ph) => `<option value="${ph.id}" ${ph.id === filterPhase ? "selected" : ""}>${esc(ph.name)}</option>`).join("")}
       </select>` : ""}
-      <select id="f-progress" aria-label="Progress">
-        <option value="">Any progress</option>
-        ${PROGRESS.map(([id, name]) => `<option value="${id}" ${id === filterProgress ? "selected" : ""}>${name}</option>`).join("")}
+      <select id="f-progress" aria-label="${esc(t("Progress"))}">
+        <option value="">${t("Any progress")}</option>
+        ${PROGRESS.map(([id, name]) => `<option value="${id}" ${id === filterProgress ? "selected" : ""}>${t(name)}</option>`).join("")}
       </select>
     </div>
     <div class="row-list">
@@ -1073,18 +1165,18 @@ function viewItems() {
 function placeRows(item, places, done) {
   return places.map((p) => `
     <a class="pos-row" href="#/items/${item.id}/${p.key}"
-       aria-label="Move ${pcs(p.qty)} of ${esc(item.code)} from ${esc(whereLabel(p))}">
-      <span class="muted" style="min-width:0">${esc(whereLabel(p))}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
+       aria-label="${esc(t("Move {qty} of {code} from {place}", { qty: pcs(p.qty), code: item.code, place: whereLabel(p) }))}">
+      <span class="muted" style="min-width:0">${esc(whereLabel(p))}${p.reworked_qty ? ` <span class="badge rework" title="${esc(t("Reworked"))}">${t("R")}</span>` : ""}</span>
       <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
         <span class="badge qty">${p.qty}</span>${p.key === UNSTARTED ? "" : p.days_in_state == null ? `
-        <span class="badge pending">new</span>` : `
-        <span class="badge${p.overdue ? " age-hot" : ""}">${p.days_in_state.toFixed(1)}d</span>`}
+        <span class="badge pending">${t("new")}</span>` : `
+        <span class="badge${p.overdue ? " age-hot" : ""}">${daysLabel(p.days_in_state)}</span>`}
         <span class="chev" aria-hidden="true">›</span>
       </span>
     </a>`).join("") + (done ? `
-      <a class="pos-row" href="#/items/${item.id}/${DONE}" style="border-left:2px solid var(--good)"
-         aria-label="${pcs(done)} of ${esc(item.code)} done">
-        <span class="muted">Done</span>
+      <a class="pos-row" href="#/items/${item.id}/${DONE}" style="border-inline-start:2px solid var(--good)"
+         aria-label="${esc(t("{qty} of {code} done", { qty: pcs(done), code: item.code }))}">
+        <span class="muted">${t("Done")}</span>
         <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
           <span class="badge qty" style="color:var(--good)">${done}</span>
           <span class="chev" aria-hidden="true">›</span>
@@ -1101,10 +1193,10 @@ function partBlocks(item) {
     return `
       <div class="part-block">
         <a class="part-head" href="#/items/${part.id}">
-          <span><strong>${esc(partName(part))}</strong> <span class="muted">×${part.per_unit} per piece</span></span>
+          <span><strong>${esc(partName(part))}</strong> <span class="muted">${t("×{n} per piece", { n: part.per_unit })}</span></span>
           <span class="muted">${esc(part.code)}</span>
         </a>
-        ${placeRows(part, places, done) || `<div class="muted part-empty">None on the floor</div>`}
+        ${placeRows(part, places, done) || `<div class="muted part-empty">${t("None on the floor")}</div>`}
         ${partBlocks(part)}
       </div>`;
   }).join("");
@@ -1139,36 +1231,36 @@ function itemRow(item) {
           <div style="flex:1;min-width:0">
             <div class="spread">
               <strong>${esc(item.code)}</strong>
-              <span class="muted">${esc(batchLabel(item))} · rev ${esc(item.drawing_revision)}</span>
+              <span class="muted">${esc(batchLabel(item))} · ${esc(revLabel(item.drawing_revision))}</span>
             </div>
             ${itemTags(item) ? `<div style="margin-top:3px">${itemTags(item)}</div>` : ""}
-            <div class="muted" style="margin:2px 0 6px">${esc(item.description)}</div>
-            ${piece ? `<div style="margin-bottom:6px"><span class="badge tag">part of ${esc(piece.code)}</span></div>` : ""}
-            ${waits ? `<div style="margin-bottom:6px"><span class="badge sample">Waiting</span>
-              <span class="muted">released when the sample of ${esc(sampler ? itemName(sampler) : "the other phase")} is done</span></div>`
-            : inSample ? `<div style="margin-bottom:6px"><span class="badge sample">Sample</span>
-              <span class="muted">batch of ${item.total_qty} follows once the sample is done</span></div>` : ""}
+            <div class="muted" style="margin:2px 0 6px"><bdi>${esc(item.description)}</bdi></div>
+            ${piece ? `<div style="margin-bottom:6px"><span class="badge tag">${esc(t("part of {code}", { code: piece.code }))}</span></div>` : ""}
+            ${waits ? `<div style="margin-bottom:6px"><span class="badge sample">${t("Waiting")}</span>
+              <span class="muted">${esc(t("released when the sample of {name} is done", { name: sampler ? itemName(sampler) : t("the other phase") }))}</span></div>`
+            : inSample ? `<div style="margin-bottom:6px"><span class="badge sample">${t("Sample")}</span>
+              <span class="muted">${t("batch of {n} follows once the sample is done", { n: item.total_qty })}</span></div>` : ""}
           </div>
         </div>
       </a>
       ${rejected ? `
       <a class="reject-row" href="#/sync">
-        <span>${rejected} ${rejected === 1 ? "entry was" : "entries were"} not accepted — see why</span>
+        <span>${tn(rejected, "{n} entry was not accepted — see why", "{n} entries were not accepted — see why")}</span>
         <span class="chev" aria-hidden="true">›</span>
       </a>` : ""}
-      ${pending ? `<div class="card-flags"><span class="badge pending">${pending} not synced yet</span></div>` : ""}
+      ${pending ? `<div class="card-flags"><span class="badge pending">${t("{n} not synced yet", { n: pending })}</span></div>` : ""}
       ${lines}
       ${placeRows(item, [], done)}
       ${inParts ? `
-      <div class="pos-row" style="border-left:2px dashed var(--line)">
-        <span class="muted">In parts — below</span>
+      <div class="pos-row" style="border-inline-start:2px dashed var(--line)">
+        <span class="muted">${t("In parts — below")}</span>
         <span class="badge qty">${inParts}</span>
       </div>` : ""}
       ${partBlocks(item)}
       ${places.length || partsOnFloor ? `
       <div class="card-actions">
-        ${places.length ? `<a href="#/items/${item.id}/split">Split into parts</a>` : ""}
-        ${parts.length && partsOnFloor ? `<a href="#/items/${item.id}/assemble">Assemble</a>` : ""}
+        ${places.length ? `<a href="#/items/${item.id}/split">${t("Split into parts")}</a>` : ""}
+        ${parts.length && partsOnFloor ? `<a href="#/items/${item.id}/assemble">${t("Assemble")}</a>` : ""}
       </div>` : ""}
     </div>`;
 }
@@ -1202,7 +1294,7 @@ function usualStation(stage, stations) {
 const assembleSel = { itemId: null, qty: null, from: {}, to: null, stationId: null };
 
 /* A part being named on the split screen, before it is added. */
-const partDraft = { name: "", per: "1" };
+const partDraft = { name: "", per: "1", open: false };
 
 /* What a piece is made of, on its split screen: the parts it has, and a place
    to name another. Naming parts needs the server (a part is an item, and
@@ -1210,19 +1302,19 @@ const partDraft = { name: "", per: "1" };
 function splitPartsBlock(item, parts) {
   const out = item.state?.in_parts_qty || 0;
   return `
-      <label>Its parts</label>
+      <label>${t("Its parts")}</label>
       ${parts.length
-        ? `<p style="margin:0 0 4px">${parts.map((part) => `${part.per_unit} × ${esc(partName(part))}`).join(", ")} <span class="muted">per piece</span></p>`
-        : `<p class="muted" style="margin:0 0 4px">None yet. Name what this piece is made of — a back, a set of legs — then split.</p>`}
-      <details data-panel="split-parts" ${parts.length ? "" : "open"}>
-        <summary class="muted" style="cursor:pointer">Add a part</summary>
+        ? `<p style="margin:0 0 4px">${parts.map((part) => `${part.per_unit} × ${esc(partName(part))}`).join(t(", "))} <span class="muted">${t("per piece")}</span></p>`
+        : `<p class="muted" style="margin:0 0 4px">${t("None yet. Name what this piece is made of — a back, a set of legs — then split.")}</p>`}
+      <details data-panel="split-parts" ${partDraft.open || !parts.length ? "open" : ""}>
+        <summary class="muted" style="cursor:pointer">${t("Add a part")}</summary>
         <div class="field-grid" style="margin-top:6px">
-          <div><label for="np-name">Name</label><input id="np-name" maxlength="60" autocomplete="off" placeholder="e.g. Back" value="${esc(partDraft.name)}"></div>
-          <div><label for="np-per">How many per piece</label><input id="np-per" type="number" inputmode="numeric" min="1" value="${esc(partDraft.per)}"></div>
+          <div><label for="np-name">${t("Name")}</label><input id="np-name" maxlength="60" autocomplete="off" placeholder="${esc(t("e.g. Back"))}" value="${esc(partDraft.name)}"></div>
+          <div><label for="np-per">${t("How many per piece")}</label><input id="np-per" type="number" inputmode="numeric" min="1" value="${esc(partDraft.per)}"></div>
         </div>
-        <button class="ghost" id="np-add" style="width:auto;padding:10px 16px;margin-top:8px" ${S.online && !out ? "" : "disabled"}>Add part</button>
-        ${!S.online ? `<p class="muted" style="margin-top:6px">Naming a new part needs a connection. Splitting into the parts already named does not.</p>`
-          : out ? `<p class="muted" style="margin-top:6px">${out} piece(s) are out in parts by the present list. Assemble them before changing it.</p>` : ""}
+        <button class="ghost" id="np-add" style="width:auto;padding:10px 16px;margin-top:8px" ${S.online && !out ? "" : "disabled"}>${t("Add part")}</button>
+        ${!S.online ? `<p class="muted" style="margin-top:6px">${t("Naming a new part needs a connection. Splitting into the parts already named does not.")}</p>`
+          : out ? `<p class="muted" style="margin-top:6px">${t("{n} piece(s) are out in parts by the present list. Assemble them before changing it.", { n: out })}</p>` : ""}
         <p class="warn-text" id="np-err" role="alert" hidden></p>
       </details>`;
 }
@@ -1268,7 +1360,7 @@ function viewLogScreen(itemId, fromKey) {
   // Every place holding units is somewhere a move can start. Done too, but
   // only as rework: a finished piece coming back has a reason.
   const sources = places.map((p) => ({ key: p.key, label: whereLabel(p), qty: p.qty }));
-  if (done > 0 && reworkType) sources.push({ key: DONE, label: "Done", qty: done });
+  if (done > 0 && reworkType) sources.push({ key: DONE, label: t("Done"), qty: done });
 
   // Arrived by tapping a batch on the item card: aim the form at moving THAT
   // batch. Applied once per arrival, so segment taps and background
@@ -1285,6 +1377,8 @@ function viewLogScreen(itemId, fromKey) {
     logSel.qty = null;
     // A note typed on another item and abandoned there is not about this one.
     logSel.note = "";
+    // Nor is an "Add a part" form left open there.
+    partDraft.open = false;
     // The batch was chosen by tapping it on the card, so the picker for it
     // starts folded to one line; with no batch chosen it starts open.
     logSel.fromOpen = !logSel.from;
@@ -1308,13 +1402,13 @@ function viewLogScreen(itemId, fromKey) {
   // another booth, not a move to nowhere.
   const targets = splitting
     // The parts start wherever they start: not started, or at a stage.
-    ? [{ key: UNSTARTED, label: "Not started" }, ...activeStages().map((st) => ({ key: st.id, label: st.name }))]
+    ? [{ key: UNSTARTED, label: t("Not started") }, ...activeStages().map((st) => ({ key: st.id, label: st.name }))]
     : activeStages()
       .filter((st) => st.id !== logSel.from || st.requires_station)
       .map((st) => ({ key: st.id, label: st.name }));
   // Plain "Done": a tick in the label reads as "selected", which is what a
   // tick means on every other button of these pickers.
-  if (!splitting && finish && !type?.is_rework && logSel.from !== DONE) targets.push({ key: DONE, label: "Done" });
+  if (!splitting && finish && !type?.is_rework && logSel.from !== DONE) targets.push({ key: DONE, label: t("Done") });
   if (!targets.some((t) => t.key === logSel.to)) {
     const usual = logSel.from && !splitting ? usualDestination(logSel.from) : null;
     logSel.to = targets.some((t) => t.key === usual) ? usual : null;
@@ -1349,19 +1443,19 @@ function viewLogScreen(itemId, fromKey) {
   // which, so it is one line here with a way to change it -- the full picker
   // took the top third of the screen to ask a question that had been answered,
   // and pushed the quantity below the fold.
-  const fromLabel = splitting ? "Split the pieces at" : "From";
+  const fromLabel = splitting ? t("Split the pieces at") : t("From");
   const fromPicker = logSel.fromOpen || !source
     ? seg("from", fromLabel, sources.map((s) => ({ key: s.key, label: `${s.label} · ${s.qty}` })), logSel.from)
     : `
       <label id="lbl-from">${fromLabel}</label>
       <div class="picked-row" role="group" aria-labelledby="lbl-from">
         <strong>${esc(source.label)} · ${source.qty}</strong>
-        ${sources.length > 1 ? `<button class="ghost" id="from-change">Change</button>` : ""}
+        ${sources.length > 1 ? `<button class="ghost" id="from-change">${t("Change")}</button>` : ""}
       </div>`;
-  const goLabel = splitting && !parts.length ? "Name the parts first"
-    : !logSel.to ? (splitting ? "Pick where the parts go" : "Pick where it went")
-    : needsStation ? "Pick the station"
-    : splitting ? "Split into parts" : "Log entry";
+  const goLabel = splitting && !parts.length ? t("Name the parts first")
+    : !logSel.to ? (splitting ? t("Pick where the parts go") : t("Pick where it went"))
+    : needsStation ? t("Pick the station")
+    : splitting ? t("Split into parts") : t("Log entry");
   const goReady = !!logSel.to && !needsStation && !(splitting && !parts.length);
 
   // "Assemble" on the card arrives here for the assembly form: it goes first.
@@ -1375,57 +1469,58 @@ function viewLogScreen(itemId, fromKey) {
         <div style="flex:1;min-width:0">
           <div class="spread">
             <h2>${esc(item.code)}</h2>
-            <span class="muted">${esc(batchLabel(item))} · rev ${esc(item.drawing_revision)}</span>
+            <span class="muted">${esc(batchLabel(item))} · ${esc(revLabel(item.drawing_revision))}</span>
           </div>
           ${itemTags(item) ? `<div style="margin:2px 0">${itemTags(item)}</div>` : ""}
-          <div class="muted">${esc(item.description)}</div>
+          <div class="muted"><bdi>${esc(item.description)}</bdi></div>
         </div>
       </div>
       ${inSample ? `
-      <p style="margin-top:8px"><span class="badge sample">Sample</span>
-        <span class="muted">Only the sample (${sampleQty} pc${sampleQty === 1 ? "" : "s"}) is on the floor.
-        Log it to Done and the batch of ${item.total_qty} is released.</span></p>` : ""}
+      <p style="margin-top:8px"><span class="badge sample">${t("Sample")}</span>
+        <span class="muted">${t("Only the sample ({qty}) is on the floor. Log it to Done and the batch of {n} is released.", { qty: pcs(sampleQty), n: item.total_qty })}</span></p>` : ""}
     </div>
 
     ${assembleFirst ? assembleHtml : ""}
     <div class="card">
       ${!source ? `
-      <p class="muted">Nothing here to move — ${item.state?.in_parts_qty ? `the pieces of ${esc(item.code)} are out in parts` : `every unit of ${esc(item.code)} is Done`}.</p>` : `
-      ${parts.length || splitting ? seg("mode", "What happened", [{ key: "move", label: "Moved" }, { key: "split", label: "Split into parts" }], logSel.mode) : ""}
+      <p class="muted">${esc(item.state?.in_parts_qty
+        ? t("Nothing here to move — the pieces of {code} are out in parts.", { code: item.code })
+        : t("Nothing here to move — every unit of {code} is Done.", { code: item.code }))}</p>` : `
+      ${parts.length || splitting ? seg("mode", t("What happened"), [{ key: "move", label: t("Moved") }, { key: "split", label: t("Split into parts") }], logSel.mode) : ""}
 
       ${fromPicker}
       ${splitting ? splitPartsBlock(item, parts) : ""}
 
-      ${!splitting && shownTypes.length > 1 ? seg("type", "Entry type", shownTypes.map((t) => ({ key: t.id, label: t.name })), logSel.typeId, true) : ""}
-      ${logSel.from === DONE ? `<p class="muted" style="margin-top:6px">Taking a finished piece back out of Done is rework, and needs its reason.</p>` : ""}
+      ${!splitting && shownTypes.length > 1 ? seg("type", t("Entry type"), shownTypes.map((ty) => ({ key: ty.id, label: ty.name })), logSel.typeId, true) : ""}
+      ${logSel.from === DONE ? `<p class="muted" style="margin-top:6px">${t("Taking a finished piece back out of Done is rework, and needs its reason.")}</p>` : ""}
 
-      ${seg("to", splitting ? "The parts go to" : type?.is_rework ? "Send back to" : "Now at", targets, logSel.to)}
+      ${seg("to", splitting ? t("The parts go to") : type?.is_rework ? t("Send back to") : t("Now at"), targets, logSel.to)}
 
-      ${stage?.requires_station ? seg("station", "Station", stations.map((st) => ({ key: st.id, label: st.name })), logSel.stationId) : ""}
+      ${stage?.requires_station ? seg("station", t("Station"), stations.map((st) => ({ key: st.id, label: st.name })), logSel.stationId) : ""}
 
       ${!splitting && type?.requires_reason_code ? `
-      <label for="sel-reason">Reason</label>
+      <label for="sel-reason">${t("Reason")}</label>
       <select id="sel-reason">
         ${reasons.map((r) => `<option value="${r.id}" ${r.id === logSel.reasonId ? "selected" : ""}>${esc(r.name)}</option>`).join("")}
       </select>` : ""}
 
-      <label for="qty">Quantity</label>
+      <label for="qty">${t("Quantity")}</label>
       <div class="qty-row">
-        <button id="qty-minus" aria-label="One fewer">−</button>
+        <button id="qty-minus" aria-label="${esc(t("One fewer"))}">−</button>
         <input id="qty" type="number" inputmode="numeric" min="1"
                value="${esc(logSel.qty ?? (available || 1))}">
-        <button id="qty-plus" aria-label="One more">+</button>
+        <button id="qty-plus" aria-label="${esc(t("One more"))}">+</button>
       </div>
-      <p class="muted" style="margin-top:5px">${available} at ${esc(source.label)}</p>
+      <p class="muted" style="margin-top:5px">${esc(t("{n} at {place}", { n: available, place: source.label }))}</p>
       ${splitting ? `<p class="muted" id="split-preview"></p>` : ""}
-      ${sameStage ? `<p class="muted">Same stage — this moves them to another station. Their age keeps counting.</p>` : ""}
-      ${stage?.requires_external_po ? `<p class="muted">External supplier stage — time in state is supplier lead time.</p>` : ""}
-      ${stage && !stage.allows_partial_qty ? `<p class="muted">Whole-lot stage — the move must take everything from where it comes.</p>` : ""}
-      <p class="warn-text" id="qty-warn" hidden>More than is resting there — the server will reject this entry until the log shows that many. It will wait under the sync pill with a Retry button.</p>
+      ${sameStage ? `<p class="muted">${t("Same stage — this moves them to another station. Their age keeps counting.")}</p>` : ""}
+      ${stage?.requires_external_po ? `<p class="muted">${t("External supplier stage — time in state is supplier lead time.")}</p>` : ""}
+      ${stage && !stage.allows_partial_qty ? `<p class="muted">${t("Whole-lot stage — the move must take everything from where it comes.")}</p>` : ""}
+      <p class="warn-text" id="qty-warn" hidden>${t("More than is resting there — the server will reject this entry until the log shows that many. It will wait under the sync pill with a Retry button.")}</p>
 
       <details data-panel="log-note" ${logSel.note ? "open" : ""} style="margin-top:12px">
-        <summary class="muted" style="cursor:pointer">Add note${logSel.note ? " ·" : ""}</summary>
-        <input id="log-note" maxlength="2000" placeholder="e.g. rack 3, waiting on fittings"
+        <summary class="muted" style="cursor:pointer">${t("Add note")}${logSel.note ? " ·" : ""}</summary>
+        <input id="log-note" maxlength="2000" placeholder="${esc(t("e.g. rack 3, waiting on fittings"))}"
                value="${esc(logSel.note)}" style="margin-top:6px">
       </details>
 
@@ -1435,25 +1530,24 @@ function viewLogScreen(itemId, fromKey) {
       </div>`}
     </div>
     ${assembleFirst ? "" : assembleHtml}
-    ${pieceOf(item) ? `<div class="card"><p class="muted">Part of <strong>${esc(itemName(pieceOf(item)))}</strong>,
-      ${item.per_unit} per piece. It is split off that item and assembled back into it from that item's screen.</p></div>` : ""}
+    ${pieceOf(item) ? `<div class="card"><p class="muted">${t("Part of {name}, {n} per piece. It is split off that item and assembled back into it from that item's screen.", { name: `<strong>${esc(itemName(pieceOf(item)))}</strong>`, n: item.per_unit })}</p></div>` : ""}
 
     <div class="card">
-      <h2>Photos <span class="muted" id="photo-count"></span></h2>
-      <div id="photos" class="muted">Loading…</div>
+      <h2>${t("Photos")} <span class="muted" id="photo-count"></span></h2>
+      <div id="photos" class="muted">${t("Loading…")}</div>
       <div style="height:8px"></div>
       <div id="photo-progress" hidden>
         <div class="bar-track" id="photo-track"><div class="bar-fill" id="photo-bar" style="width:0"></div></div>
         <p id="photo-status" class="muted" style="margin:4px 0 8px" role="status" aria-live="polite"></p>
       </div>
-      <input id="photo-note" maxlength="255" placeholder="Describe the snag (optional)"
+      <input id="photo-note" maxlength="255" placeholder="${esc(t("Describe the snag (optional)"))}"
              style="margin-bottom:8px" ${S.online ? "" : "disabled"}>
-      ${photoPicker("snag", { camera: "Take snag photo", gallery: "From gallery", single: "Add snag photo" })}
+      ${photoPicker("snag", { camera: t("Take snag photo"), gallery: t("From gallery"), single: t("Add snag photo") })}
     </div>
 
     <div class="card">
-      <h2>Recent entries</h2>
-      <div id="recent" class="muted">Loading…</div>
+      <h2>${t("Recent entries")}</h2>
+      <div id="recent" class="muted">${t("Loading…")}</div>
     </div>`;
 
   const rerender = () => viewLogScreen(itemId, fromKey);
@@ -1472,6 +1566,11 @@ function viewLogScreen(itemId, fromKey) {
   // segment tap's re-render cannot eat it.
   const $partName = document.getElementById("np-name");
   const $partAdd = document.getElementById("np-add");
+  // Whether "Add a part" is unfolded is the engineer's, and every tap on this
+  // screen redraws it: remembered here, or the form would fold itself shut
+  // after the first part of several is added.
+  const $partPanel = $view.querySelector('details[data-panel="split-parts"]');
+  if ($partPanel) $partPanel.ontoggle = () => { if ($partPanel.isConnected) partDraft.open = $partPanel.open; };
   if ($partName && $partAdd) {
     const $per = document.getElementById("np-per");
     $partName.oninput = () => { partDraft.name = $partName.value; };
@@ -1482,8 +1581,8 @@ function viewLogScreen(itemId, fromKey) {
       err.hidden = true;
       const name = partDraft.name.trim();
       const perUnit = Number(partDraft.per);
-      if (!name) return fail("Give the part a name.");
-      if (!Number.isInteger(perUnit) || perUnit < 1) return fail("How many per piece: a whole number, 1 or more.");
+      if (!name) return fail(t("Give the part a name."));
+      if (!Number.isInteger(perUnit) || perUnit < 1) return fail(t("How many per piece: a whole number, 1 or more."));
       // The part's code is the piece's with the name on the end: BED-01-BACK.
       const code = `${item.code}-${slugify(name).replace(/_/g, "-").toUpperCase()}`.slice(0, 64);
       $partAdd.disabled = true;
@@ -1491,8 +1590,9 @@ function viewLogScreen(itemId, fromKey) {
         const made = await api(`/api/items/${item.id}/parts`, {
           method: "POST", body: JSON.stringify({ code, description: name, per_unit: perUnit }),
         });
-        Object.assign(partDraft, { name: "", per: "1" });
-        toast(`${name} added as a part of ${item.code}`);
+        // Cleared for the next one, and left open: a piece is rarely one part.
+        Object.assign(partDraft, { name: "", per: "1", open: true });
+        toast(t("{name} added as a part of {code}", { name, code: item.code }));
         // On this phone at once, from the server's own answer: a sync already
         // in flight may have read the list before the part existed. Nothing of
         // it is on the floor yet, which is what an empty state says.
@@ -1508,8 +1608,8 @@ function viewLogScreen(itemId, fromKey) {
         const detail = error.body?.detail;
         fail(typeof detail === "string" ? detail
           : Array.isArray(detail) ? rejectReason(error)
-          : isNetworkError(error) ? "No connection — the part was not added."
-          : "Could not add the part.");
+          : isNetworkError(error) ? t("No connection — the part was not added.")
+          : t("Could not add the part."));
         $partAdd.disabled = false;
       }
     };
@@ -1533,7 +1633,8 @@ function viewLogScreen(itemId, fromKey) {
       const target = document.getElementById("split-preview");
       if (!target) return;
       const n = Number($qty.value) || 0;
-      target.textContent = `${n} piece${n === 1 ? "" : "s"} become ` + parts.map((part) => `${n * part.per_unit} × ${partName(part)}`).join(", ");
+      target.textContent = tn(n, "{n} piece becomes {parts}", "{n} pieces become {parts}",
+        { parts: parts.map((part) => `${n * part.per_unit} × ${partName(part)}`).join(t(", ")) });
     };
     const warn = () => {
       logSel.qty = $qty.value;
@@ -1554,7 +1655,7 @@ function viewLogScreen(itemId, fromKey) {
       // for an empty box, quietly logged as 1.
       const qty = Number($qty.value);
       if (!Number.isInteger(qty) || qty < 1) {
-        toast("Enter a whole quantity of 1 or more");
+        toast(t("Enter a whole quantity of 1 or more"));
         $qty.focus();
         return;
       }
@@ -1622,7 +1723,7 @@ function viewLogScreen(itemId, fromKey) {
       input.onchange = async () => {
         const file = input.files[0];
         if (!file) return;
-        if (photoStatus.busy) { toast("A photo is already uploading."); return; }
+        if (photoStatus.busy) { toast(t("A photo is already uploading.")); return; }
         const noteInput = noteInputId ? document.getElementById(noteInputId) : null;
         photoStatus.start();
         try {
@@ -1645,7 +1746,7 @@ function viewLogScreen(itemId, fromKey) {
     });
   };
   // Snags only. The item's icon is set in its editor: Office → Items.
-  wireUpload("snag", "snag", "Snag photo added", "photo-note");
+  wireUpload("snag", "snag", t("Snag photo added"), "photo-note");
 
   if (parts.length) bindAssemble(item, parts, rerender);
   loadRecent(item);
@@ -1657,7 +1758,7 @@ function viewLogScreen(itemId, fromKey) {
 function partSources(part) {
   const { places, done } = localPlaces(part);
   const out = places.map((p) => ({ key: p.key, label: p.name, qty: p.qty }));
-  if (done > 0) out.push({ key: DONE, label: "Done", qty: done });
+  if (done > 0) out.push({ key: DONE, label: t("Done"), qty: done });
   return out;
 }
 
@@ -1675,8 +1776,8 @@ function assembleCard(item, parts) {
   });
   const most = Math.min(...rows.map((r) => r.sets));
   const targets = activeStages().map((st) => ({ key: st.id, label: st.name }));
-  if (finishType()) targets.push({ key: DONE, label: "Done" });
-  if (!targets.some((t) => t.key === sel.to)) sel.to = null;
+  if (finishType()) targets.push({ key: DONE, label: t("Done") });
+  if (!targets.some((target) => target.key === sel.to)) sel.to = null;
   const stage = sel.to && sel.to !== DONE ? stageById(sel.to) : null;
   const stations = stage ? S.ref.stations.filter((st) => st.stage_id === stage.id && st.is_active) : [];
   if (stage?.requires_station && !stations.some((st) => st.id === sel.stationId)) sel.stationId = usualStation(stage, stations);
@@ -1689,25 +1790,24 @@ function assembleCard(item, parts) {
       </div>`;
   return `
     <div class="card">
-      <h2>Assemble from parts</h2>
-      <p class="muted">Each piece takes ${parts.map((part) => `${part.per_unit} × ${esc(partName(part))}`).join(", ")}.
-        Say where each part is taken from.</p>
+      <h2>${t("Assemble from parts")}</h2>
+      <p class="muted">${t("Each piece takes {parts}. Say where each part is taken from.", { parts: parts.map((part) => `${part.per_unit} × ${esc(partName(part))}`).join(t(", ")) })}</p>
       ${rows.map(({ part, options, sets }) => `
       <label for="asm-from-${part.id}">${esc(partName(part))} <span class="muted">(${esc(part.code)})</span></label>
       ${options.length ? `
       <select id="asm-from-${part.id}" data-asm-from="${part.id}">
         ${options.map((o) => `<option value="${o.key}" ${o.key === sel.from[part.id] ? "selected" : ""}>${esc(o.label)} · ${o.qty}</option>`).join("")}
       </select>
-      <p class="muted" style="margin:2px 0 0">enough for ${sets} piece${sets === 1 ? "" : "s"}</p>`
-      : `<p class="warn-text" style="margin:2px 0 0">None on the floor — split some ${esc(item.code)} first.</p>`}`).join("")}
-      ${seg("asm-to", "The assembled pieces are now at", targets, sel.to)}
-      ${stage?.requires_station ? seg("asm-station", "Station", stations.map((st) => ({ key: st.id, label: st.name })), sel.stationId) : ""}
-      <label for="asm-qty">Pieces assembled</label>
+      <p class="muted" style="margin:2px 0 0">${tn(sets, "enough for {n} piece", "enough for {n} pieces")}</p>`
+      : `<p class="warn-text" style="margin:2px 0 0">${esc(t("None on the floor — split some {code} first.", { code: item.code }))}</p>`}`).join("")}
+      ${seg("asm-to", t("The assembled pieces are now at"), targets, sel.to)}
+      ${stage?.requires_station ? seg("asm-station", t("Station"), stations.map((st) => ({ key: st.id, label: st.name })), sel.stationId) : ""}
+      <label for="asm-qty">${t("Pieces assembled")}</label>
       <input id="asm-qty" type="number" inputmode="numeric" min="1" value="${esc(qty)}">
-      <p class="muted" style="margin-top:5px">The parts on hand make ${most} piece${most === 1 ? "" : "s"}.</p>
-      <p class="warn-text" id="asm-warn" ${Number(qty) > most ? "" : "hidden"}>More than the parts on hand make — the server will refuse it until they are there.</p>
+      <p class="muted" style="margin-top:5px">${tn(most, "The parts on hand make {n} piece.", "The parts on hand make {n} pieces.")}</p>
+      <p class="warn-text" id="asm-warn" ${Number(qty) > most ? "" : "hidden"}>${t("More than the parts on hand make — the server will refuse it until they are there.")}</p>
       <div style="height:12px" aria-hidden="true"></div>
-      <button class="primary" id="asm-go" ${sel.to && !needsStation && rows.every((r) => r.options.length) ? "" : "disabled"}>${!sel.to ? "Pick where the pieces go" : needsStation ? "Pick the station" : "Assemble"}</button>
+      <button class="primary" id="asm-go" ${sel.to && !needsStation && rows.every((r) => r.options.length) ? "" : "disabled"}>${!sel.to ? t("Pick where the pieces go") : needsStation ? t("Pick the station") : t("Assemble")}</button>
     </div>`;
 }
 
@@ -1730,7 +1830,7 @@ function bindAssemble(item, parts, rerender) {
   if (!go) return;
   go.onclick = async () => {
     const qty = Number($qty.value);
-    if (!Number.isInteger(qty) || qty < 1) { toast("Enter a whole quantity of 1 or more"); return; }
+    if (!Number.isInteger(qty) || qty < 1) { toast(t("Enter a whole quantity of 1 or more")); return; }
     if (!sel.to || parts.some((part) => !sel.from[part.id])) return;
     const plain = (S.ref.event_types || []).find((t) => t.is_active && t.moves_quantity && !t.is_finish && !t.is_rework && !t.is_correction);
     const finish = finishType();
@@ -1803,7 +1903,7 @@ function cacheSet(item, key, value) {
    so "Take photo" there would open the same file dialog and mean nothing. */
 const hasCamera = () => window.matchMedia?.("(pointer: coarse)").matches ?? false;
 
-function photoPicker(key, { camera = "Take photo", gallery = "From gallery", single = "Add photo", offline = "Photos need a connection" } = {}) {
+function photoPicker(key, { camera = t("Take photo"), gallery = t("From gallery"), single = t("Add photo"), offline = t("Photos need a connection") } = {}) {
   const box = (label, capture) => `
     <label class="photo-pick${S.online ? "" : " off"}">
       ${esc(label)}
@@ -1849,14 +1949,14 @@ function uploadImage(itemId, file, { kind = "snag", note = "", onProgress } = {}
       if (xhr.status >= 200 && xhr.status < 300) { resolve(body); return; }
       if (xhr.status === 401) {
         S.needsLogin = true;
-        fail("Session expired — sign in again, then add the photo.");
+        fail(t("Session expired — sign in again, then add the photo."));
       } else {
-        fail(body.detail ? rejectReason({ body }) : `The server refused it (HTTP ${xhr.status}).`);
+        fail(body.detail ? rejectReason({ body }) : t("The server refused it (HTTP {status}).", { status: xhr.status }));
       }
     };
-    xhr.onerror = () => fail("No connection — the photo was not sent. Try again in range.");
-    xhr.ontimeout = () => fail("Timed out — the connection dropped mid-upload. Try again.");
-    xhr.onabort = () => fail("Upload cancelled.");
+    xhr.onerror = () => fail(t("No connection — the photo was not sent. Try again in range."));
+    xhr.ontimeout = () => fail(t("Timed out — the connection dropped mid-upload. Try again."));
+    xhr.onabort = () => fail(t("Upload cancelled."));
     xhr.send(form);
   });
 }
@@ -1881,7 +1981,7 @@ const photoStatus = {
     const text = document.getElementById("photo-status");
     text.className = "muted";
     // The bytes are up but the server still has to sniff, cap and store them.
-    text.textContent = percent < 100 ? `Sending photo… ${percent}%` : "Saving on the server…";
+    text.textContent = percent < 100 ? t("Sending photo… {n}%", { n: percent }) : t("Saving on the server…");
   },
   done() {
     photoStatus.busy = false;
@@ -1896,7 +1996,7 @@ const photoStatus = {
     document.getElementById("photo-track").hidden = true;
     const text = document.getElementById("photo-status");
     text.className = "warn-text";
-    text.textContent = reason || "Upload failed.";
+    text.textContent = reason || t("Upload failed.");
   },
 };
 
@@ -1916,36 +2016,36 @@ async function loadPhotos(item) {
               <a href="${img.url}" target="_blank" rel="noopener" style="position:relative;display:block">
                 <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy"
                      style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;border:1px solid var(--line)">
-                ${img.kind === "icon" ? `<span class="badge" style="position:absolute;top:4px;left:4px;background:rgba(0,0,0,.55)">icon</span>` : ""}
+                ${img.kind === "icon" ? `<span class="badge" style="position:absolute;top:4px;inset-inline-start:4px;background:rgba(0,0,0,.55)">${t("icon")}</span>` : ""}
               </a>
               <button class="ghost" data-note-for="${img.id}" ${S.online ? "" : "disabled"}
-                      style="width:100%;margin-top:4px;padding:6px 4px;min-height:36px;font-size:12px;text-align:left;overflow:hidden;overflow-wrap:anywhere"
-                      title="${esc(img.note || "")}">${img.note ? esc(img.note) : "+ note"}</button>
+                      style="width:100%;margin-top:4px;padding:6px 4px;min-height:36px;font-size:12px;text-align:start;overflow:hidden;overflow-wrap:anywhere"
+                      title="${esc(img.note || "")}">${img.note ? esc(img.note) : t("+ note")}</button>
             </div>`).join("")}
          </div>`
-      : `<span class="muted">No photos yet.</span>`;
+      : `<span class="muted">${t("No photos yet.")}</span>`;
 
     // The note is written after the shutter: on the floor you photograph the
     // snag first and find the words for it second.
     target.querySelectorAll("[data-note-for]").forEach((button) => {
       const image = images.find((img) => img.id === button.dataset.noteFor);
       button.onclick = async () => {
-        const note = prompt("What is the snag?", image.note || "");
+        const note = prompt(t("What is the snag?"), image.note || "");
         if (note === null) return;
         try {
           await api(`/api/images/${image.id}`, {
             method: "PATCH", body: JSON.stringify({ note: note.trim() }),
           });
-          toast(note.trim() ? "Note saved" : "Note cleared");
+          toast(note.trim() ? t("Note saved") : t("Note cleared"));
           logScreenCache.fetchedAt = 0;
           loadPhotos(item);
         } catch (error) {
-          alert(error.body?.detail || "Could not save the note.");
+          alert(error.body?.detail || t("Could not save the note."));
         }
       };
     });
   } catch {
-    if (target.isConnected) target.textContent = "Offline — photos unavailable.";
+    if (target.isConnected) target.textContent = t("Offline — photos unavailable.");
   }
 }
 
@@ -1970,14 +2070,15 @@ async function loadRecent(item) {
       // A linked entry's other side is another item: its parts, the piece it
       // belongs to, or the same code in another phase.
       const hasParts = partsOf(item).length > 0;
-      const other = hasParts ? "parts" : item.parent_item_id ? "assembly" : "another phase";
-      const to = e.to_link ? `into ${other}` : type?.is_finish ? "Done"
-        : e.to_stage_id ? placeName(e.to_stage_id) : e.from_link ? "Not started" : "";
-      const from = e.from_link ? `from ${hasParts ? "parts" : item.parent_item_id ? `split of ${pieceOf(item)?.code || "its piece"}` : "another phase"}`
-        : e.from_unstarted ? "Not started" : e.from_done ? "Done"
+      const to = e.to_link ? (hasParts ? t("into parts") : item.parent_item_id ? t("into assembly") : t("into another phase"))
+        : type?.is_finish ? t("Done")
+        : e.to_stage_id ? placeName(e.to_stage_id) : e.from_link ? t("Not started") : "";
+      const from = e.from_link
+        ? (hasParts ? t("from parts") : item.parent_item_id ? t("from split of {code}", { code: pieceOf(item)?.code || t("its piece") }) : t("from another phase"))
+        : e.from_unstarted ? t("Not started") : e.from_done ? t("Done")
         : e.from_stage_id ? placeName(e.from_stage_id) : "";
       const label = [
-        type?.name || "event",
+        type?.name || t("event"),
         from && to ? `${from} → ${to}` : to,
         e.qty ? pcs(e.qty) : "",
         e.state_name || "", // rows logged before states were removed
@@ -1988,13 +2089,13 @@ async function loadRecent(item) {
       const canVoid = correctionType && type?.moves_quantity && !voided && !e.link_id;
       return `
         <div class="spread" style="padding:6px 0;border-bottom:1px solid var(--line)">
-          <span><span${voided ? ` style="text-decoration:line-through;opacity:.6"` : ""}>${esc(label)}</span>${voided ? ` <span class="badge">voided</span>` : ""}<br><span class="muted">${fmtWhen(e.occurred_at)}</span>${e.note ? `<br><span class="muted">“${esc(e.note)}”</span>` : ""}</span>
-          ${canVoid ? `<button class="ghost" data-void="${e.id}">Void</button>` : ""}
+          <span><span${voided ? ` style="text-decoration:line-through;opacity:.6"` : ""}>${esc(label)}</span>${voided ? ` <span class="badge">${t("voided")}</span>` : ""}<br><span class="muted">${fmtWhen(e.occurred_at)}</span>${e.note ? `<br><span class="muted">“${esc(e.note)}”</span>` : ""}</span>
+          ${canVoid ? `<button class="ghost" data-void="${e.id}">${t("Void")}</button>` : ""}
         </div>`;
-    }).join("") || "No entries yet.";
+    }).join("") || t("No entries yet.");
     target.querySelectorAll("[data-void]").forEach((button) => {
       button.onclick = async () => {
-        if (!confirm("Void this entry? A correction event will be logged; history is kept.")) return;
+        if (!confirm(t("Void this entry? A correction event will be logged; history is kept."))) return;
         await logEvent({
           id: newId(),
           item_id: item.id,
@@ -2013,7 +2114,7 @@ async function loadRecent(item) {
       };
     });
   } catch {
-    if (target.isConnected) target.textContent = "Offline — recent entries unavailable.";
+    if (target.isConnected) target.textContent = t("Offline — recent entries unavailable.");
   }
 }
 
@@ -2022,6 +2123,21 @@ async function loadRecent(item) {
 /* Which request for the reports is the latest, and whether the last tap asked
    to be taken to the aging table once it is drawn. */
 const reportsView = { asked: 0, showAging: false };
+
+/* An aging row's place: the stage, as the factory named it, or "Not started"
+   -- which the server says in English, so it is said here instead. */
+const agingWhere = (row) => (row.stage ? row.label : t("Not started"));
+
+/* The exceptions view's badges. These are the ledger's own fixed codes, not
+   factory vocabulary; one it does not know yet is shown as the code. */
+const EXCEPTION_NAMES = {
+  orphaned_correction: N_("Orphaned correction"),
+  competing_correction: N_("Competing correction"),
+  device_clock_ahead: N_("Device clock ahead"),
+  late_sync: N_("Late sync"),
+  over_advance: N_("Over-advance"),
+};
+const exceptionName = (code) => (EXCEPTION_NAMES[code] ? t(EXCEPTION_NAMES[code]) : code);
 
 async function viewReports() {
   const projects = (S.ref?.projects || []).filter((p) => p.is_active !== false);
@@ -2041,7 +2157,7 @@ async function viewReports() {
   const fArea = validFilter("r-area", areas);
   const fPhase = validFilter("r-phase", phases);
 
-  $view.innerHTML = `<p class="muted">Loading reports…</p>`;
+  $view.innerHTML = `<p class="muted">${t("Loading reports…")}</p>`;
   let wip, aging, exceptions;
   let cachedFrom = null; // set when the service worker served last-known data
   const fetchReport = async (path) => {
@@ -2066,12 +2182,14 @@ async function viewReports() {
       fetchReport("/api/reports/exceptions"),
     ]);
   } catch {
-    if (current()) $view.innerHTML = `<p class="muted">Reports need a connection — they are computed from the full log on the server.</p>`;
+    if (current()) $view.innerHTML = `<p class="muted">${t("Reports need a connection — they are computed from the full log on the server.")}</p>`;
     return;
   }
   if (!current()) return;
   const staleNote = cachedFrom
-    ? `<p class="warn-text" style="margin-bottom:8px">Offline — showing last-known reports${cachedFrom !== "1" ? ` from ${fmtWhen(cachedFrom)}` : ""}.</p>`
+    ? `<p class="warn-text" style="margin-bottom:8px">${cachedFrom !== "1"
+      ? t("Offline — showing last-known reports from {when}.", { when: fmtWhen(cachedFrom) })
+      : t("Offline — showing last-known reports.")}</p>`
     : "";
 
   const maxQty = Math.max(1, ...wip.stages.map((s) => s.total_qty));
@@ -2079,74 +2197,76 @@ async function viewReports() {
   $view.innerHTML = `
     ${staleNote}
     <div class="filters">
-      <select id="r-project">
-        <option value="">All projects</option>
+      <select id="r-project" aria-label="${esc(t("Project"))}">
+        <option value="">${t("All projects")}</option>
         ${projects.map((p) => `<option value="${p.id}" ${p.id === fProject ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
       </select>
-      <select id="r-stage">
-        <option value="">All stages</option>
+      <select id="r-stage" aria-label="${esc(t("Stage"))}">
+        <option value="">${t("All stages")}</option>
         ${stages.map((s) => `<option value="${s.id}" ${s.id === fStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
       </select>
       ${areas.length ? `
-      <select id="r-area" aria-label="Area">
-        <option value="">All areas</option>
+      <select id="r-area" aria-label="${esc(t("Area"))}">
+        <option value="">${t("All areas")}</option>
         ${areas.map((a) => `<option value="${a.id}" ${a.id === fArea ? "selected" : ""}>${esc(a.name)}</option>`).join("")}
       </select>` : ""}
       ${phases.length ? `
-      <select id="r-phase" aria-label="Phase">
-        <option value="">All phases</option>
+      <select id="r-phase" aria-label="${esc(t("Phase"))}">
+        <option value="">${t("All phases")}</option>
         ${phases.map((ph) => `<option value="${ph.id}" ${ph.id === fPhase ? "selected" : ""}>${esc(ph.name)}</option>`).join("")}
       </select>` : ""}
-      <select id="r-days">
-        <option value="">Any age</option>
-        ${[1, 2, 3, 5, 7, 14].map((d) => `<option value="${d}" ${String(d) === fDays ? "selected" : ""}>≥ ${d}d</option>`).join("")}
+      <select id="r-days" aria-label="${esc(t("Age"))}">
+        <option value="">${t("Any age")}</option>
+        ${[1, 2, 3, 5, 7, 14].map((d) => `<option value="${d}" ${String(d) === fDays ? "selected" : ""}>≥ ${t("{n}d", { n: d })}</option>`).join("")}
       </select>
     </div>
 
     <div class="card">
-      <h2>WIP by stage</h2>
-      <p class="muted" style="margin:-4px 0 10px">Tap a stage to see what is sitting there.</p>
+      <h2>${t("WIP by stage")}</h2>
+      <p class="muted" style="margin:-4px 0 10px">${t("Tap a stage to see what is sitting there.")}</p>
       ${wip.stages.map((row) => `
         <button class="wip-row${row.stage.id === fStage ? " on" : ""}" data-wip-stage="${row.stage.id}" aria-pressed="${row.stage.id === fStage}">
           <span class="spread">
             <strong>${esc(row.stage.name)}</strong>
-            <span class="muted">${pcs(row.total_qty)} · ${row.item_count} item${row.item_count === 1 ? "" : "s"}${row.sample_qty ? ` · <span class="badge sample">${row.sample_qty} sample</span>` : ""}${row.reworked_qty ? ` · <span class="badge rework">rework ${row.reworked_qty}</span>` : ""}</span>
+            <span class="muted">${pcs(row.total_qty)} · ${tn(row.item_count, "{n} item", "{n} items")}${row.sample_qty ? ` · <span class="badge sample">${t("{n} sample", { n: row.sample_qty })}</span>` : ""}${row.reworked_qty ? ` · <span class="badge rework">${t("rework {n}", { n: row.reworked_qty })}</span>` : ""}</span>
           </span>
           <span class="bar-track" style="margin:4px 0"><span class="bar-fill" style="width:${(row.total_qty / maxQty) * 100}%"></span></span>
           ${row.stage.requires_station ? row.stations.map((s) =>
-            `<span class="muted">· ${s.station ? esc(s.station.name) : "No station yet"}: ${s.total_qty}</span>`).join("") : ""}
-        </button>`).join("") || `<p class="muted">Nothing in progress.</p>`}
-      ${wip.unstarted.qty ? `<p class="muted">Not started: ${pcs(wip.unstarted.qty)} across ${wip.unstarted.item_count} item${wip.unstarted.item_count === 1 ? "" : "s"}</p>` : ""}
+            `<span class="muted">· ${s.station ? esc(s.station.name) : t("No station yet")}: ${s.total_qty}</span>`).join("") : ""}
+        </button>`).join("") || `<p class="muted">${t("Nothing in progress.")}</p>`}
+      ${wip.unstarted.qty ? `<p class="muted">${t("Not started: {qty} across {items}", { qty: pcs(wip.unstarted.qty), items: tn(wip.unstarted.item_count, "{n} item", "{n} items") })}</p>` : ""}
     </div>
 
     <div class="card" id="aging-card">
-      <h2>Aging — days at ${fStage ? esc(stages.find((s) => s.id === fStage)?.name || "current stage") : "current stage"}</h2>
+      <h2>${fStage
+        ? esc(t("Aging — days at {stage}", { stage: stages.find((s) => s.id === fStage)?.name || t("current stage") }))
+        : t("Aging — days at current stage")}</h2>
       <div class="table-scroll">
       <table>
-        <thead><tr><th scope="col">Item</th><th scope="col">Where</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Days</th></tr></thead>
+        <thead><tr><th scope="col">${t("Item")}</th><th scope="col">${t("Where")}</th><th scope="col" class="num">${t("Qty")}</th><th scope="col" class="num">${t("Days")}</th></tr></thead>
         <tbody>
           ${aging.rows.map((row) => `
             <tr>
               <td><a class="cell-link" href="#/items/${row.item.id}">${esc(row.item.code)}${
                 row.item.area || row.item.phase ? `<br><span class="muted">${esc([row.item.area, row.item.phase].filter(Boolean).join(" · "))}</span>` : ""}</a></td>
-              <td>${esc(row.label)}${row.sample_qty ? ` <span class="badge sample">sample</span>` : ""}${row.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</td>
+              <td>${esc(agingWhere(row))}${row.sample_qty ? ` <span class="badge sample">${t("sample")}</span>` : ""}${row.reworked_qty ? ` <span class="badge rework" title="${esc(t("Reworked"))}">${t("R")}</span>` : ""}</td>
               <td class="num">${row.qty}</td>
               <td class="num${row.overdue ? " overdue" : ""}">${row.days_in_state.toFixed(1)}${row.overdue ? " ⚠" : ""}</td>
             </tr>`).join("")}
         </tbody>
       </table>
       </div>
-      ${aging.rows.length ? "" : `<p class="muted" style="margin-top:8px">Nothing matches.</p>`}
+      ${aging.rows.length ? "" : `<p class="muted" style="margin-top:8px">${t("Nothing matches.")}</p>`}
     </div>
 
     ${exceptions.rows.length ? `
     <div class="card">
-      <h2>Needs review (${exceptions.rows.length})</h2>
+      <h2>${t("Needs review ({n})", { n: exceptions.rows.length })}</h2>
       ${exceptions.rows.slice(0, 20).map((row) => `
         <div style="padding:6px 0;border-bottom:1px solid var(--line)">
-          <span class="badge">${esc(row.code)}</span> <strong>${esc(row.item_code || "")}</strong>${
+          <span class="badge">${esc(exceptionName(row.code))}</span> <strong>${esc(row.item_code || "")}</strong>${
             row.area || row.phase ? ` <span class="muted">${esc([row.area, row.phase].filter(Boolean).join(" · "))}</span>` : ""}
-          <div class="muted">${esc(row.detail)}</div>
+          <div class="muted" dir="auto">${esc(row.detail)}</div>
         </div>`).join("")}
     </div>` : ""}`;
 
@@ -2197,24 +2317,25 @@ function nextRevision(current) {
    Items page. There is no Routes subpage and nothing to set up per item: an
    item can be logged at any stage. */
 const OFFICE_SECTIONS = [
-  { key: "import", label: "Import" },
-  { key: "items", label: "Items" },
-  { key: "projects", label: "Projects" },
-  { key: "stages", label: "Stages", admin: true },
-  { key: "workorders", label: "Work orders" },
-  { key: "areas", label: "Areas & phases", admin: true },
-  { key: "users", label: "Users", admin: true },
-  { key: "status", label: "Status", admin: true },
+  { key: "import", label: N_("Import") },
+  { key: "items", label: N_("Items") },
+  { key: "projects", label: N_("Projects") },
+  { key: "stages", label: N_("Stages"), admin: true },
+  { key: "workorders", label: N_("Work orders") },
+  { key: "areas", label: N_("Areas & phases"), admin: true },
+  { key: "users", label: N_("Users"), admin: true },
+  { key: "status", label: N_("Status"), admin: true },
 ];
 
 function viewOffice(section, detail) {
   const sections = OFFICE_SECTIONS.filter((s) => !s.admin || S.user?.is_admin);
+  // Labels are kept in English above and said in the reader's language here.
   const current = sections.find((s) => s.key === section) || sections[0];
 
   $view.innerHTML = `
     <nav class="subnav">
       ${sections.map((s) => `
-        <a href="#/office/${s.key}"${s.key === current.key ? ` class="on" aria-current="page"` : ""}>${esc(s.label)}</a>`).join("")}
+        <a href="#/office/${s.key}"${s.key === current.key ? ` class="on" aria-current="page"` : ""}>${esc(t(s.label))}</a>`).join("")}
     </nav>
     <div id="office-body"></div>`;
 
@@ -2239,13 +2360,13 @@ function inlineUpload(el) {
       const percent = Math.round(fraction * 100);
       el.hidden = false;
       el.className = "muted";
-      el.textContent = percent < 100 ? `Uploading… ${percent}%` : "Saving on the server…";
+      el.textContent = percent < 100 ? t("Uploading… {n}%", { n: percent }) : t("Saving on the server…");
     },
     done: () => { el.hidden = true; },
     fail: (reason) => {
       el.hidden = false;
       el.className = "warn-text";
-      el.textContent = reason || "Upload failed.";
+      el.textContent = reason || t("Upload failed.");
     },
   };
 }
@@ -2271,64 +2392,60 @@ function officeImport(body) {
 
   body.innerHTML = `
     <div class="card">
-      <h2>Import a project</h2>
-      <p class="muted" style="margin-bottom:8px">One spreadsheet (.xlsx or .csv), one row per item.
-      Every item starts as a sample; when the sample is logged Done, the batch is released.
-      There are no stages to list: an item can be logged at any stage, in any order.
-      For a single item, use <a href="#/office/items">Items → New item</a>.</p>
+      <h2>${t("Import a project")}</h2>
+      <p class="muted" style="margin-bottom:8px">${t("One spreadsheet (.xlsx or .csv), one row per item. Every item starts as a sample; when the sample is logged Done, the batch is released. There are no stages to list: an item can be logged at any stage, in any order.")}
+      ${t("For a single item, use")} <a href="#/office/items">${t("Items → New item")}</a>.</p>
       <div class="table-scroll">
       <table>
-        <thead><tr><th scope="col">Column</th><th scope="col">What goes in it</th></tr></thead>
+        <thead><tr><th scope="col">${t("Column")}</th><th scope="col">${t("What goes in it")}</th></tr></thead>
         <tbody>
-          <tr><td><strong>project</strong></td><td>Project code. New codes create the project; existing ones are added to.</td></tr>
-          <tr><td>project name, client</td><td>Optional. Only used when the project is new.</td></tr>
-          <tr><td><strong>item</strong></td><td>Item code. It may repeat on several rows, as long as each
-            has a different area or phase: those are separate batches.</td></tr>
-          <tr><td>area, phase</td><td>Optional. Which part of the job, and which phase of it, the batch is
-            for. Each project has its own; a name it does not have yet is added to it.</td></tr>
-          <tr><td>description</td><td>Optional.</td></tr>
-          <tr><td>dimensions</td><td>Optional, as the drawing gives them. Printed on work orders.</td></tr>
-          <tr><td><strong>qty</strong></td><td>The production batch.</td></tr>
-          <tr><td>sample qty</td><td>Optional, default 1. Built first; 0 for no sample.</td></tr>
-          <tr><td>revision</td><td>Optional drawing revision, default A.</td></tr>
-          <tr><td>picture</td><td>Optional, .xlsx only. Put a picture on the item's row
-            (Insert → Pictures → <em>Place over Cells</em>) and it becomes the item's icon.</td></tr>
+          <!-- The column names are what the file must say, so they stay as
+               they are; only what they mean is translated. -->
+          <tr><td dir="ltr"><strong>project</strong></td><td>${t("Project code. New codes create the project; existing ones are added to.")}</td></tr>
+          <tr><td dir="ltr">project name, client</td><td>${t("Optional. Only used when the project is new.")}</td></tr>
+          <tr><td dir="ltr"><strong>item</strong></td><td>${t("Item code. It may repeat on several rows, as long as each has a different area or phase: those are separate batches.")}</td></tr>
+          <tr><td dir="ltr">area, phase</td><td>${t("Optional. Which part of the job, and which phase of it, the batch is for. Each project has its own; a name it does not have yet is added to it.")}</td></tr>
+          <tr><td dir="ltr">description</td><td>${t("Optional.")}</td></tr>
+          <tr><td dir="ltr">dimensions</td><td>${t("Optional, as the drawing gives them. Printed on work orders.")}</td></tr>
+          <tr><td dir="ltr"><strong>qty</strong></td><td>${t("The production batch.")}</td></tr>
+          <tr><td dir="ltr">sample qty</td><td>${t("Optional, default 1. Built first; 0 for no sample.")}</td></tr>
+          <tr><td dir="ltr">revision</td><td>${t("Optional drawing revision, default A.")}</td></tr>
+          <tr><td dir="ltr">picture</td><td>${t("Optional, .xlsx only. Put a picture on the item's row (Insert → Pictures → Place over Cells) and it becomes the item's icon.")}</td></tr>
         </tbody>
       </table>
       </div>
-      <p style="margin:10px 0"><a href="/api/import/template" download>Download a template</a></p>
+      <p style="margin:10px 0"><a href="/api/import/template" download>${t("Download a template")}</a></p>
 
-      <label for="imp-file">File</label>
+      <label for="imp-file">${t("File")}</label>
       <input id="imp-file" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ${S.online ? "" : "disabled"}>
       ${file ? `<p class="muted" style="margin-top:4px">${esc(file.name)}</p>` : ""}
-      ${S.online ? "" : `<p class="warn-text">Importing needs a connection.</p>`}
-      ${busy ? `<p class="muted">Reading the file…</p>` : ""}
+      ${S.online ? "" : `<p class="warn-text">${t("Importing needs a connection.")}</p>`}
+      ${busy ? `<p class="muted">${t("Reading the file…")}</p>` : ""}
       ${error ? `<p class="warn-text">${esc(error)}</p>` : ""}
     </div>
 
     ${preview ? `
     <div class="card">
-      <h2>${errors.length ? `${errors.length} problem${errors.length === 1 ? "" : "s"} — nothing will be imported` : "Ready to import"}</h2>
+      <h2>${errors.length ? tn(errors.length, "{n} problem — nothing will be imported", "{n} problems — nothing will be imported") : t("Ready to import")}</h2>
       ${errors.length ? `
-      <p class="muted" style="margin-bottom:8px">Fix these in the spreadsheet and choose the file again.
-      Row numbers are the spreadsheet's own.</p>
+      <p class="muted" style="margin-bottom:8px">${t("Fix these in the spreadsheet and choose the file again. Row numbers are the spreadsheet's own.")}</p>
       ${errors.map((e) => `
         <div style="padding:4px 0;border-bottom:1px solid var(--line)">
-          ${e.row ? `<span class="badge">row ${e.row}</span> ` : ""}${esc(e.message)}
+          ${e.row ? `<span class="badge">${t("row {n}", { n: e.row })}</span> ` : ""}${esc(e.message)}
         </div>`).join("")}` : ""}
       ${(preview.notes || []).map((note) => `<p class="muted" style="margin-bottom:6px">${esc(note)}</p>`).join("")}
-      ${withPictures ? `<p class="muted" style="margin-bottom:6px">${withPictures} of ${items.length} item${items.length === 1 ? "" : "s"} ${withPictures === 1 ? "has" : "have"} a picture, which will be set as ${withPictures === 1 ? "its" : "their"} icon.</p>` : ""}
+      ${withPictures ? `<p class="muted" style="margin-bottom:6px">${t("{n} of {total} items have a picture, which will be set as their icon.", { n: withPictures, total: items.length })}</p>` : ""}
       ${(preview.projects || []).map((p) => `
-        <p style="margin-top:8px"><strong>${esc(p.code)}</strong> ${p.is_new ? `<span class="badge">new</span>` : `<span class="badge">existing</span>`}
-          <span class="muted">${esc(p.name || "")}${p.client ? ` · ${esc(p.client)}` : ""} · ${p.item_count} item${p.item_count === 1 ? "" : "s"}</span></p>`).join("")}
+        <p style="margin-top:8px"><strong>${esc(p.code)}</strong> ${p.is_new ? `<span class="badge">${t("new")}</span>` : `<span class="badge">${t("existing")}</span>`}
+          <span class="muted"><bdi>${esc(p.name || "")}</bdi>${p.client ? ` · <bdi>${esc(p.client)}</bdi>` : ""} · ${tn(p.item_count, "{n} item", "{n} items")}</span></p>`).join("")}
       ${items.length ? `
       <div class="table-scroll" style="margin-top:8px">
       <table>
-        <thead><tr><th scope="col">Item</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Sample</th><th scope="col">Picture</th></tr></thead>
+        <thead><tr><th scope="col">${t("Item")}</th><th scope="col" class="num">${t("Qty")}</th><th scope="col" class="num">${t("Sample")}</th><th scope="col">${t("Picture")}</th></tr></thead>
         <tbody>
           ${items.map((i) => `
             <tr>
-              <td><strong>${esc(i.code)}</strong>${[i.area, i.phase].filter(Boolean).map((t) => ` <span class="badge tag">${esc(t)}</span>`).join("")}<br><span class="muted">${esc(i.description)} · rev ${esc(i.revision)}</span></td>
+              <td><strong>${esc(i.code)}</strong>${[i.area, i.phase].filter(Boolean).map((tag) => ` <span class="badge tag">${esc(tag)}</span>`).join("")}<br><span class="muted"><bdi>${esc(i.description)}</bdi> · ${esc(revLabel(i.revision))}</span></td>
               <td class="num">${i.qty}</td>
               <td class="num">${i.sample_qty}</td>
               <td>${i.has_picture ? "✓" : `<span class="muted">—</span>`}</td>
@@ -2338,7 +2455,7 @@ function officeImport(body) {
       </div>` : ""}
       ${ready ? `
       <div style="height:12px"></div>
-      <button class="primary" id="imp-go" ${S.online && !busy ? "" : "disabled"}>Import ${items.length} item${items.length === 1 ? "" : "s"}</button>` : ""}
+      <button class="primary" id="imp-go" ${S.online && !busy ? "" : "disabled"}>${tn(items.length, "Import {n} item", "Import {n} items")}</button>` : ""}
     </div>` : ""}`;
 
   const send = async (commit) => {
@@ -2361,7 +2478,7 @@ function officeImport(body) {
       const detail = error.body?.detail;
       importState.preview = detail?.errors ? { ...detail, items: detail.items || [] } : null;
       importState.error = importState.preview ? null
-        : (detail?.reason || detail || (isNetworkError(error) ? "No connection." : "Could not read the file."));
+        : (detail?.reason || detail || (isNetworkError(error) ? t("No connection.") : t("Could not read the file.")));
     }
     importState.busy = false;
     rerender();
@@ -2376,7 +2493,9 @@ function officeImport(body) {
         const done = await send(true);
         Object.assign(importState, { file: null, preview: null, error: null, busy: false });
         const pictures = done.items.filter((i) => i.has_picture).length;
-        toast(`Imported ${done.items.length} item${done.items.length === 1 ? "" : "s"}${pictures ? ` with ${pictures} picture${pictures === 1 ? "" : "s"}` : ""}`);
+        toast(pictures
+          ? t("Imported {items} with {pictures}", { items: tn(done.items.length, "{n} item", "{n} items"), pictures: tn(pictures, "{n} picture", "{n} pictures") })
+          : tn(done.items.length, "Imported {n} item", "Imported {n} items"));
         await sync();
         navigate("#/items");
       } catch (error) {
@@ -2385,7 +2504,7 @@ function officeImport(body) {
         // Someone else created one of these codes since the preview: show the
         // fresh list of problems rather than a bare refusal.
         if (detail?.errors) importState.preview = { ...detail, items: detail.items || [] };
-        else importState.error = detail?.reason || detail || "Import failed.";
+        else importState.error = detail?.reason || detail || t("Import failed.");
         rerender();
       }
     };
@@ -2397,7 +2516,7 @@ function officeImport(body) {
 /* The area and phase pickers of the New item form, for one project. */
 function newItemLabels(projectId) {
   return `
-          <div><label for="ni-area">Area</label>${labelSelect("areas", sessionStorage.getItem("ni-area"), `id="ni-area"`, projectId)}</div>`;
+          <div><label for="ni-area">${t("Area")}</label>${labelSelect("areas", sessionStorage.getItem("ni-area"), `id="ni-area"`, projectId)}</div>`;
 }
 
 /* The New item form's phases: one row is one batch. Kept here, not in the
@@ -2408,11 +2527,11 @@ function newItemPhaseRows(projectId) {
   const many = niPhases.length > 1;
   return niPhases.map((row, index) => `
         <div class="field-grid" style="align-items:end">
-          <div><label>${index ? "Another phase" : "Phase"}</label>${labelSelect("phases", row.phase, `data-ni-phase="${index}"`, projectId)}</div>
-          <div><label>${many ? "Qty in this phase" : "Batch qty"}</label>
+          <div><label>${index ? t("Another phase") : t("Phase")}</label>${labelSelect("phases", row.phase, `data-ni-phase="${index}"`, projectId)}</div>
+          <div><label>${many ? t("Qty in this phase") : t("Batch qty")}</label>
             <div style="display:flex;gap:6px">
               <input data-ni-pqty="${index}" type="number" inputmode="numeric" min="1" value="${esc(row.qty)}">
-              ${index ? `<button class="ghost" data-ni-drop="${index}" aria-label="Remove this phase" style="width:auto;padding:8px 12px">✕</button>` : ""}
+              ${index ? `<button class="ghost" data-ni-drop="${index}" aria-label="${esc(t("Remove this phase"))}" style="width:auto;padding:8px 12px">✕</button>` : ""}
             </div>
           </div>
         </div>`).join("") + (many ? `
@@ -2429,8 +2548,8 @@ function officeItems(body, itemId) {
   if (itemId) {
     body.innerHTML = `
     <div class="card">
-      <a class="back-link" href="#/office/items">‹ All items</a>
-      <div id="of-items" class="muted" style="margin-top:8px">Loading…</div>
+      <a class="back-link" href="#/office/items"><span aria-hidden="true">‹</span> ${t("All items")}</a>
+      <div id="of-items" class="muted" style="margin-top:8px">${t("Loading…")}</div>
     </div>`;
     loadItemEditors();
     return;
@@ -2441,48 +2560,44 @@ function officeItems(body, itemId) {
   body.innerHTML = `
     <div class="card">
       <details data-panel="new-item">
-        <summary style="cursor:pointer"><strong>New item</strong>
-          <span class="muted">— add one to a project without an import</span></summary>
+        <summary style="cursor:pointer"><strong>${t("New item")}</strong>
+          <span class="muted">${t("— add one to a project without an import")}</span></summary>
         ${projects.length ? `
-        <label for="ni-project" style="margin-top:10px">Project</label>
+        <label for="ni-project" style="margin-top:10px">${t("Project")}</label>
         <select id="ni-project">
           ${projects.map((p) => `<option value="${p.id}" ${p.id === remembered ? "selected" : ""}>${esc(p.code)} — ${esc(p.name)}</option>`).join("")}
         </select>
         <div class="field-grid">
-          <div><label for="ni-code">Item code</label><input id="ni-code" maxlength="64" autocapitalize="characters" autocomplete="off"></div>
-          <div><label for="ni-rev">Drawing revision</label><input id="ni-rev" maxlength="32" autocapitalize="characters" placeholder="A"></div>
+          <div><label for="ni-code">${t("Item code")}</label><input id="ni-code" maxlength="64" autocapitalize="characters" autocomplete="off" dir="ltr"></div>
+          <div><label for="ni-rev">${t("Drawing revision")}</label><input id="ni-rev" maxlength="32" autocapitalize="characters" placeholder="A" dir="ltr"></div>
         </div>
-        <label for="ni-desc">Description</label>
-        <input id="ni-desc" maxlength="255" autocomplete="off">
-        <label for="ni-dims">Dimensions</label>
-        <input id="ni-dims" maxlength="255" autocomplete="off" placeholder="e.g. W 600 x D 450 x H 720 mm">
+        <label for="ni-desc">${t("Description")}</label>
+        <input id="ni-desc" maxlength="255" autocomplete="off" dir="auto">
+        <label for="ni-dims">${t("Dimensions")}</label>
+        <input id="ni-dims" maxlength="255" autocomplete="off" dir="auto" placeholder="${esc(t("e.g. W 600 x D 450 x H 720 mm"))}">
         <div class="field-grid" id="ni-labels">${newItemLabels(projects.some((p) => p.id === remembered) ? remembered : projects[0].id)}</div>
         <div id="ni-phases">${newItemPhaseRows(projects.some((p) => p.id === remembered) ? remembered : projects[0].id)}</div>
-        <button class="ghost" id="ni-add-phase" style="width:auto;padding:8px 14px;margin-top:8px">+ Split across another phase</button>
-        <p class="muted" style="margin-top:6px">Area and phase are optional, from the project's own lists. Each
-        phase is its own batch with its own quantity, under the same code.</p>
+        <button class="ghost" id="ni-add-phase" style="width:auto;padding:8px 14px;margin-top:8px">${t("+ Split across another phase")}</button>
+        <p class="muted" style="margin-top:6px">${t("Area and phase are optional, from the project's own lists. Each phase is its own batch with its own quantity, under the same code.")}</p>
         <div class="field-grid">
-          <div><label for="ni-sample">Sample qty</label><input id="ni-sample" type="number" inputmode="numeric" min="0" placeholder="1"></div>
+          <div><label for="ni-sample">${t("Sample qty")}</label><input id="ni-sample" type="number" inputmode="numeric" min="0" placeholder="1"></div>
         </div>
-        <p class="muted" style="margin-top:6px">The sample is built first; the batch is released when the
-        sample is logged Done. Sample 0 puts the whole batch on the floor at once. Split across phases,
-        one sample serves them all: the first phase builds it, and every phase is released when it is done.</p>
+        <p class="muted" style="margin-top:6px">${t("The sample is built first; the batch is released when the sample is logged Done. Sample 0 puts the whole batch on the floor at once. Split across phases, one sample serves them all: the first phase builds it, and every phase is released when it is done.")}</p>
         <div style="height:8px"></div>
-        <button class="primary" id="ni-go" ${S.online ? "" : "disabled"}>${S.online ? "Add item" : "Adding an item needs a connection"}</button>
+        <button class="primary" id="ni-go" ${S.online ? "" : "disabled"}>${S.online ? t("Add item") : t("Adding an item needs a connection")}</button>
         <p class="warn-text" id="ni-err" role="alert" hidden></p>`
-        : `<p class="muted" style="margin-top:10px">There is no active project to add it to. Projects
-        arrive through <a href="#/office/import">Import</a>.</p>`}
+        : `<p class="muted" style="margin-top:10px">${t("There is no active project to add it to. Projects arrive through")} <a href="#/office/import">${t("Import")}</a>.</p>`}
       </details>
     </div>
 
     <div class="card">
-      <h2>Edit items</h2>
+      <h2>${t("Edit items")}</h2>
       <input id="oi-q" type="search" value="${esc(sessionStorage.getItem("oi-q") || "")}" style="margin-bottom:8px"
-             placeholder="Find an item — code, description, project, area or phase">
+             placeholder="${esc(t("Find an item — code, description, project, area or phase"))}">
       <label class="pick-row" style="border:0;min-height:0;padding:0 0 8px">
-        <input type="checkbox" id="oi-archived" ${sessionStorage.getItem("oi-archived") ? "checked" : ""}><span>Show archived items too</span>
+        <input type="checkbox" id="oi-archived" ${sessionStorage.getItem("oi-archived") ? "checked" : ""}><span>${t("Show archived items too")}</span>
       </label>
-      <div id="of-items" class="muted">Loading…</div>
+      <div id="of-items" class="muted">${t("Loading…")}</div>
     </div>`;
 
   const go = document.getElementById("ni-go");
@@ -2493,7 +2608,7 @@ function officeItems(body, itemId) {
       const line = document.getElementById("ni-total");
       if (!line) return;
       const sum = niPhases.reduce((a, row) => a + (Number(row.qty) || 0), 0);
-      line.textContent = `${sum} pcs across ${niPhases.length} phases`;
+      line.textContent = t("{qty} across {n} phases", { qty: pcs(sum), n: niPhases.length });
     };
     const paintPhases = () => { $phases.innerHTML = newItemPhaseRows(value("ni-project")); total(); };
     // One listener each for every row: rows come and go, the container stays.
@@ -2543,14 +2658,14 @@ function officeItems(body, itemId) {
       const qty = qtys.reduce((a, b) => a + b, 0);
       const sample = value("ni-sample") === "" ? 1 : Number(value("ni-sample"));
       const split = niPhases.length > 1;
-      if (!code) return fail("The item needs a code.");
+      if (!code) return fail(t("The item needs a code."));
       if (qtys.some((n) => !Number.isInteger(n) || n < 1)) {
-        return fail(split ? "Each phase needs a quantity: a whole number, 1 or more." : "Batch qty must be a whole number, 1 or more.");
+        return fail(split ? t("Each phase needs a quantity: a whole number, 1 or more.") : t("Batch qty must be a whole number, 1 or more."));
       }
       if (split && new Set(niPhases.map((row) => row.phase)).size !== niPhases.length) {
-        return fail("Each phase once: two rows name the same phase.");
+        return fail(t("Each phase once: two rows name the same phase."));
       }
-      if (!Number.isInteger(sample) || sample < 0) return fail("Sample qty must be a whole number, 0 or more.");
+      if (!Number.isInteger(sample) || sample < 0) return fail(t("Sample qty must be a whole number, 0 or more."));
       go.disabled = true;
       try {
         const created = await api("/api/items", {
@@ -2570,8 +2685,8 @@ function officeItems(body, itemId) {
           }),
         });
         toast(split
-          ? `${created.code} added in ${created.phases.length} phases — they are on the Items list now`
-          : `${itemName(created)} added — it is on the Items list now`);
+          ? t("{code} added in {n} phases — they are on the Items list now", { code: created.code, n: created.phases.length })
+          : t("{name} added — it is on the Items list now", { name: itemName(created) }));
         // Clear what was typed, but not the project or the first phase: the
         // next one is usually for the same job.
         for (const id of ["ni-code", "ni-desc", "ni-dims", "ni-sample", "ni-rev"]) {
@@ -2586,8 +2701,8 @@ function officeItems(body, itemId) {
         const detail = error.body?.detail;
         fail(typeof detail === "string" ? detail
           : Array.isArray(detail) ? rejectReason(error)
-          : isNetworkError(error) ? "No connection — the item was not added."
-          : "Could not add the item.");
+          : isNetworkError(error) ? t("No connection — the item was not added.")
+          : t("Could not add the item."));
       } finally {
         go.disabled = !S.online;
       }
@@ -2610,22 +2725,22 @@ function itemLookup(target, items, projectCode) {
     const found = pool.filter(matches);
     const pieceCode = (item) => items.find((i) => i.id === item.parent_item_id)?.code;
     return `
-      <p class="muted" style="margin:0 0 4px">${found.length === pool.length ? `${pool.length} item${pool.length === 1 ? "" : "s"}` : `${found.length} of ${pool.length} items`}</p>
+      <p class="muted" style="margin:0 0 4px">${found.length === pool.length ? tn(pool.length, "{n} item", "{n} items") : t("{n} of {total} items", { n: found.length, total: pool.length })}</p>
       ${found.slice(0, LOOKUP_SHOWN).map((item) => `
       <a class="lookup-row" href="#/office/items/${item.id}">
         ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
         <span style="min-width:0;flex:1">
           <strong>${esc(item.code)}</strong>
-          <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
+          <span class="badge">${esc(projectCode.get(item.project_id) || t("no project"))}</span>
           ${itemTags(item)}
-          ${item.parent_item_id ? `<span class="badge tag">part of ${esc(pieceCode(item) || "?")}</span>` : ""}
-          ${item.is_active ? "" : `<span class="badge">archived</span>`}
-          <br><span class="muted">${esc(item.description)} · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
+          ${item.parent_item_id ? `<span class="badge tag">${esc(t("part of {code}", { code: pieceCode(item) || "?" }))}</span>` : ""}
+          ${item.is_active ? "" : `<span class="badge">${t("archived")}</span>`}
+          <br><span class="muted"><bdi>${esc(item.description)}</bdi> · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${t("{n} sample", { n: item.sample_qty })}` : ""} · ${esc(revLabel(item.drawing_revision))}</span>
         </span>
         <span class="chev" aria-hidden="true">›</span>
       </a>`).join("")}
-      ${found.length > LOOKUP_SHOWN ? `<p class="muted" style="padding:8px 0">Showing the first ${LOOKUP_SHOWN}. Type more to narrow it down.</p>` : ""}
-      ${found.length ? "" : `<p class="muted" style="padding:8px 0">${pool.length ? "Nothing matches." : "No items yet."}</p>`}`;
+      ${found.length > LOOKUP_SHOWN ? `<p class="muted" style="padding:8px 0">${t("Showing the first {n}. Type more to narrow it down.", { n: LOOKUP_SHOWN })}</p>` : ""}
+      ${found.length ? "" : `<p class="muted" style="padding:8px 0">${pool.length ? t("Nothing matches.") : t("No items yet.")}</p>`}`;
   };
   target.classList.remove("muted");
   target.innerHTML = rows();
@@ -2661,7 +2776,7 @@ async function loadEditorPhotos(itemId, canDelete) {
       ({ images } = await api(`/api/items/${itemId}/images`));
       editorPhotos.set(itemId, images);
     } catch {
-      if (target.isConnected) target.textContent = "Photos need a connection.";
+      if (target.isConnected) target.textContent = t("Photos need a connection.");
       return;
     }
   }
@@ -2675,21 +2790,21 @@ async function loadEditorPhotos(itemId, canDelete) {
             <a href="${img.url}" target="_blank" rel="noopener">
               <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy">
             </a>
-            ${img.kind === "icon" ? `<span class="badge" style="position:absolute;bottom:4px;left:4px;background:rgba(0,0,0,.55)">icon</span>` : ""}
-            ${canDelete ? `<button class="drop" data-drop="${img.id}" aria-label="Delete this photo"
-                    title="Delete this photo" ${S.online ? "" : "disabled"}>✕</button>` : ""}
+            ${img.kind === "icon" ? `<span class="badge" style="position:absolute;bottom:4px;inset-inline-start:4px;background:rgba(0,0,0,.55)">${t("icon")}</span>` : ""}
+            ${canDelete ? `<button class="drop" data-drop="${img.id}" aria-label="${esc(t("Delete this photo"))}"
+                    title="${esc(t("Delete this photo"))}" ${S.online ? "" : "disabled"}>✕</button>` : ""}
           </div>`).join("")}
        </div>
-       ${canDelete ? "" : `<p class="muted" style="margin-top:6px">Deleting a photo is an admin job.</p>`}`
-    : "No photos on this item.";
+       ${canDelete ? "" : `<p class="muted" style="margin-top:6px">${t("Deleting a photo is an admin job.")}</p>`}`
+    : t("No photos on this item.");
 
   target.querySelectorAll("[data-drop]").forEach((button) => {
     const image = images.find((img) => img.id === button.dataset.drop);
     button.onclick = async () => {
-      const what = image.kind === "icon" ? "this icon"
-        : image.note ? `the photo "${image.note}"`
-        : "this photo";
-      if (!confirm(`Delete ${what}? The picture goes for good. The item and its logged history are untouched.`)) return;
+      const question = image.kind === "icon" ? t("Delete this icon? The picture goes for good. The item and its logged history are untouched.")
+        : image.note ? t("Delete the photo \"{note}\"? The picture goes for good. The item and its logged history are untouched.", { note: image.note })
+        : t("Delete this photo? The picture goes for good. The item and its logged history are untouched.");
+      if (!confirm(question)) return;
       try {
         await api(`/api/images/${image.id}`, { method: "DELETE" });
         // The device that just deleted it must not keep serving it back out of
@@ -2699,12 +2814,12 @@ async function loadEditorPhotos(itemId, canDelete) {
         navigator.serviceWorker?.controller?.postMessage({ type: "drop-image", url: image.url });
         editorPhotos.delete(itemId);
         logScreenCache.fetchedAt = 0; // the log screen's copy is stale too
-        toast("Photo deleted");
+        toast(t("Photo deleted"));
         // Only an icon changes anything the item list is drawn from.
         if (image.kind === "icon") await sync();
         await loadEditorPhotos(itemId, canDelete);
       } catch (error) {
-        alert(error.body?.detail || "Could not delete the photo.");
+        alert(error.body?.detail || t("Could not delete the photo."));
       }
     };
   });
@@ -2718,7 +2833,7 @@ async function loadItemEditors() {
   try {
     ({ items } = await api("/api/items?include_archived=true"));
   } catch {
-    if (target.isConnected) target.textContent = "Editing items needs a connection.";
+    if (target.isConnected) target.textContent = t("Editing items needs a connection.");
     return;
   }
   if (!target.isConnected) return;
@@ -2732,7 +2847,7 @@ async function loadItemEditors() {
   if (!openId) { itemLookup(target, items, projectCode); return; }
   const open = items.find((i) => i.id === openId);
   if (!open) {
-    target.innerHTML = `<p class="muted">That item is not there any more — it may have been deleted.</p>`;
+    target.innerHTML = `<p class="muted">${t("That item is not there any more — it may have been deleted.")}</p>`;
     return;
   }
   const projects = allProjects.filter((p) => p.is_active !== false);
@@ -2749,17 +2864,17 @@ async function loadItemEditors() {
       `<option value="${p.id}" ${selected ? "selected" : ""}>${esc(p.code)}</option>`;
     if (projects.some((p) => p.id === item.project_id)) {
       return `
-        <label>Project</label>
+        <label>${t("Project")}</label>
         <select data-it-project="${item.id}" ${lock}>
           ${projects.map((p) => option(p, p.id === item.project_id)).join("")}
         </select>`;
     }
     return `
-        <label>Project</label>
-        <p class="muted">${esc(projectCode.get(item.project_id) || "no project")} — archived</p>
-        <label>Move to a live project</label>
+        <label>${t("Project")}</label>
+        <p class="muted">${esc(projectCode.get(item.project_id) || t("no project"))} — ${t("archived")}</p>
+        <label>${t("Move to a live project")}</label>
         <select data-it-project="${item.id}" ${lock}>
-          <option value="" selected>Leave it where it is</option>
+          <option value="" selected>${t("Leave it where it is")}</option>
           ${projects.map((p) => option(p, false)).join("")}
         </select>`;
   };
@@ -2771,8 +2886,8 @@ async function loadItemEditors() {
     const own = projectId === item.project_id;
     const lock = isAdmin ? "" : "disabled";
     return `
-          <div><label>Area</label>${labelSelect("areas", own ? item.area_id : null, `data-it-area="${item.id}" ${lock}`, projectId)}</div>
-          <div><label>Phase</label>${labelSelect("phases", own ? item.phase_id : null, `data-it-phase="${item.id}" ${lock}`, projectId)}</div>`;
+          <div><label>${t("Area")}</label>${labelSelect("areas", own ? item.area_id : null, `data-it-area="${item.id}" ${lock}`, projectId)}</div>
+          <div><label>${t("Phase")}</label>${labelSelect("phases", own ? item.phase_id : null, `data-it-phase="${item.id}" ${lock}`, projectId)}</div>`;
   };
 
   const piece = open.parent_item_id ? items.find((i) => i.id === open.parent_item_id) : null;
@@ -2782,79 +2897,76 @@ async function loadItemEditors() {
         <div style="flex:1;min-width:0">
           <h2 style="margin:0">${esc(item.code)}</h2>
           <div style="margin:3px 0">
-            <span class="badge">${esc(projectCode.get(item.project_id) || "no project")}</span>
+            <span class="badge">${esc(projectCode.get(item.project_id) || t("no project"))}</span>
             ${itemTags(item)}
-            ${item.is_active ? "" : `<span class="badge">archived</span>`}
+            ${item.is_active ? "" : `<span class="badge">${t("archived")}</span>`}
           </div>
-          <span class="muted">${esc(item.description)} · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${item.sample_qty} sample` : ""} · rev ${esc(item.drawing_revision)}</span>
-          ${piece ? `<br><span class="muted">A part of <a href="#/office/items/${piece.id}">${esc(itemName(piece))}</a></span>` : ""}
+          <span class="muted"><bdi>${esc(item.description)}</bdi> · ${esc(batchLabel(item))}${item.sample_qty ? ` + ${t("{n} sample", { n: item.sample_qty })}` : ""} · ${esc(revLabel(item.drawing_revision))}</span>
+          ${piece ? `<br><span class="muted">${t("A part of")} <a href="#/office/items/${piece.id}">${esc(itemName(piece))}</a></span>` : ""}
         </div>
       </div>
       <div style="padding:8px 0 4px">
         <!-- Readable by anyone, editable by admins: a code or a batch size is
              what the rest of the floor reads the work by. -->
         <div class="field-grid">
-          <div><label>Code</label><input data-it-code="${item.id}" value="${esc(item.code)}" ${isAdmin ? "" : "disabled"}></div>
+          <div><label>${t("Code")}</label><input data-it-code="${item.id}" value="${esc(item.code)}" dir="ltr" ${isAdmin ? "" : "disabled"}></div>
           ${item.parent_item_id
             // A part has no batch of its own: its units come from splitting
             // the piece it belongs to. Its count per piece is under that piece's Parts.
-            ? `<div><label>Per piece</label><p class="muted" style="margin:10px 0 0">${esc(batchLabel(item))}</p></div>`
-            : `<div><label>Batch qty</label><input data-it-qty="${item.id}" type="number" inputmode="numeric" min="1" value="${item.total_qty}" ${isAdmin ? "" : "disabled"}></div>`}
+            ? `<div><label>${t("Per piece")}</label><p class="muted" style="margin:10px 0 0">${esc(batchLabel(item))}</p></div>`
+            : `<div><label>${t("Batch qty")}</label><input data-it-qty="${item.id}" type="number" inputmode="numeric" min="1" value="${item.total_qty}" ${isAdmin ? "" : "disabled"}></div>`}
         </div>
-        <label>Description</label>
-        <input data-it-desc="${item.id}" value="${esc(item.description)}" ${isAdmin ? "" : "disabled"}>
-        <label>Dimensions</label>
-        <input data-it-dims="${item.id}" maxlength="255" value="${esc(item.dimensions || "")}"
-               placeholder="e.g. W 600 x D 450 x H 720 mm" ${isAdmin ? "" : "disabled"}>
+        <label>${t("Description")}</label>
+        <input data-it-desc="${item.id}" value="${esc(item.description)}" dir="auto" ${isAdmin ? "" : "disabled"}>
+        <label>${t("Dimensions")}</label>
+        <input data-it-dims="${item.id}" maxlength="255" value="${esc(item.dimensions || "")}" dir="auto"
+               placeholder="${esc(t("e.g. W 600 x D 450 x H 720 mm"))}" ${isAdmin ? "" : "disabled"}>
         ${projectField(item)}
         <div class="field-grid" data-it-labels="${item.id}">${editorLabels(item, item.project_id)}</div>
         ${isAdmin ? `
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-          <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
+          <button class="ghost" data-it-save="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Save")}</button>
         </div>`
-        : `<p class="muted" style="margin-top:10px">Changing these is an admin job. Creating
-        items, logging entries and bumping the revision are not.</p>`}
+        : `<p class="muted" style="margin-top:10px">${t("Changing these is an admin job. Creating items, logging entries and bumping the revision are not.")}</p>`}
 
         ${item.is_active ? partsEditor(item, items) : ""}
         ${item.is_active && isAdmin ? phaseMover(item, items) : ""}
 
-        <label style="margin-top:12px">Item icon</label>
+        <label style="margin-top:12px">${t("Item icon")}</label>
         <div style="display:flex;gap:10px;align-items:center">
-          ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : `<span class="muted">None yet.</span>`}
+          ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : `<span class="muted">${t("None yet.")}</span>`}
           <div style="flex:1">
             ${photoPicker(`icon:${item.id}`, {
-              camera: "Photograph it",
-              gallery: "From gallery",
-              single: `${item.icon_url ? "Replace" : "Set"} icon`,
-              offline: "Needs a connection",
+              camera: t("Photograph it"),
+              gallery: t("From gallery"),
+              single: item.icon_url ? t("Replace icon") : t("Set icon"),
+              offline: t("Needs a connection"),
             })}
           </div>
         </div>
         <p data-it-upload="${item.id}" class="muted" style="margin-top:6px" hidden></p>
 
-        <label style="margin-top:12px">Photos</label>
+        <label style="margin-top:12px">${t("Photos")}</label>
         <div data-it-photos="${item.id}" class="muted">${
-          editorPhotos.has(item.id) ? "" : "Open to load."
+          editorPhotos.has(item.id) ? "" : t("Loading…")
         }</div>
 
-        <label style="margin-top:12px">Drawing revision — currently ${esc(item.drawing_revision)}</label>
+        <label style="margin-top:12px">${esc(t("Drawing revision — currently {rev}", { rev: item.drawing_revision }))}</label>
         <div class="qty-row">
-          <input data-it-rev="${item.id}" placeholder="new rev, e.g. ${esc(nextRevision(item.drawing_revision))}"
-                 autocapitalize="characters" maxlength="32" style="flex:1;text-align:left;padding:10px">
-          <button class="ghost" data-it-bump="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Bump</button>
+          <input data-it-rev="${item.id}" placeholder="${esc(t("new rev, e.g. {rev}", { rev: nextRevision(item.drawing_revision) }))}"
+                 autocapitalize="characters" maxlength="32" style="flex:1;text-align:start;padding:10px">
+          <button class="ghost" data-it-bump="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Bump")}</button>
         </div>
-        <p class="muted" style="margin-top:4px">${inFlightQty(item)} pcs in flight were built to rev ${esc(item.drawing_revision)}.</p>
+        <p class="muted" style="margin-top:4px">${esc(t("{qty} in flight were built to rev {rev}.", { qty: pcs(inFlightQty(item)), rev: item.drawing_revision }))}</p>
 
         ${isAdmin ? `
         <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
           ${item.is_active
-            ? `<button class="ghost" data-it-archive="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Archive</button>`
-            : `<button class="ghost" data-it-restore="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Reactivate</button>`}
-          <button class="ghost" data-it-purge="${item.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>Delete for good</button>
+            ? `<button class="ghost" data-it-archive="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Archive")}</button>`
+            : `<button class="ghost" data-it-restore="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Reactivate")}</button>`}
+          <button class="ghost" data-it-purge="${item.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>${t("Delete for good")}</button>
         </div>
-        <p class="muted" style="margin-top:6px">Archiving hides the item everywhere and keeps its history;
-        an archived item can be reactivated. Deleting for good removes the item <em>and its logged
-        events</em>, and cannot be undone.</p>` : ""}
+        <p class="muted" style="margin-top:6px">${t("Archiving hides the item everywhere and keeps its history; an archived item can be reactivated. Deleting for good removes the item and its logged events, and cannot be undone.")}</p>` : ""}
       </div>`).join("");
 
   restoreView(lastSnapshot); // this list lands after render() restored the view
@@ -2891,10 +3003,10 @@ async function loadItemEditors() {
       if (projectId) body.project_id = projectId;
       try {
         await api(`/api/items/${id}`, { method: "PATCH", body: JSON.stringify(body) });
-        toast("Item updated");
+        toast(t("Item updated"));
         await sync();
       } catch (error) {
-        alert(error.body?.detail || "Could not update the item.");
+        alert(error.body?.detail || t("Could not update the item."));
       }
     };
   });
@@ -2909,7 +3021,7 @@ async function loadItemEditors() {
       try {
         await uploadImage(id, file, { kind: "icon", onProgress: status.set });
         status.done();
-        toast("Item icon updated");
+        toast(t("Item icon updated"));
         editorPhotos.delete(id); // the item just gained a photo
         await sync();
       } catch (error) {
@@ -2934,18 +3046,18 @@ async function loadItemEditors() {
       if (!revision) return;
       const affected = inFlightQty(item);
       const detail = affected
-        ? `${affected} pcs in flight were built to rev ${item.drawing_revision}.`
-        : "Nothing is in flight yet.";
-      if (!confirm(`Bump ${item.code} from rev ${item.drawing_revision} to ${revision}? ${detail}`)) return;
+        ? t("{qty} in flight were built to rev {rev}.", { qty: pcs(affected), rev: item.drawing_revision })
+        : t("Nothing is in flight yet.");
+      if (!confirm(`${t("Bump {code} from rev {from} to {to}?", { code: item.code, from: item.drawing_revision, to: revision })} ${detail}`)) return;
       try {
         await api(`/api/items/${id}/revision`, {
           method: "POST",
           body: JSON.stringify({ drawing_revision: revision }),
         });
-        toast(`${item.code} bumped to rev ${revision}`);
+        toast(t("{code} bumped to rev {rev}", { code: item.code, rev: revision }));
         await sync();
       } catch (error) {
-        alert(error.body?.detail || "Could not bump the revision.");
+        alert(error.body?.detail || t("Could not bump the revision."));
       }
     };
   });
@@ -2953,15 +3065,15 @@ async function loadItemEditors() {
   target.querySelectorAll("[data-it-archive]").forEach((button) => {
     button.onclick = async () => {
       const item = byId.get(button.dataset.itArchive);
-      if (!confirm(`Archive ${item.code}? It disappears from lists and reports; its history stays.`)) return;
+      if (!confirm(t("Archive {code}? It disappears from lists and reports; its history stays.", { code: item.code }))) return;
       try {
         const result = await api(`/api/items/${item.id}`, { method: "DELETE" });
-        toast(result.archived ? "Item archived (history kept)" : "Item deleted");
+        toast(result.archived ? t("Item archived (history kept)") : t("Item deleted"));
         await sync();
         if (result.archived) loadItemEditors();
         else navigate("#/office/items");
       } catch (error) {
-        alert(error.body?.detail || "Could not remove the item.");
+        alert(error.body?.detail || t("Could not remove the item."));
       }
     };
   });
@@ -2973,11 +3085,11 @@ async function loadItemEditors() {
         await api(`/api/items/${item.id}`, {
           method: "PATCH", body: JSON.stringify({ is_active: true }),
         });
-        toast(`${item.code} is back on the floor's lists`);
+        toast(t("{code} is back on the floor's lists", { code: item.code }));
         await sync();
         loadItemEditors();
       } catch (error) {
-        alert(error.body?.detail || "Could not reactivate the item.");
+        alert(error.body?.detail || t("Could not reactivate the item."));
       }
     };
   });
@@ -2989,19 +3101,19 @@ async function loadItemEditors() {
       // Typing the code, because this deletes the item's logged events along
       // with it and there is no undo behind it.
       const typed = prompt(
-        `Delete ${itemName(item)} for good?\n\nThis destroys the item and its ${events} logged event(s). ` +
-        `It cannot be undone — archiving is what you want for anything really built.\n\n` +
-        `Type ${item.code} to confirm:`
+        `${t("Delete {name} for good?", { name: itemName(item) })}\n\n` +
+        `${t("This destroys the item and its {n} logged event(s). It cannot be undone — archiving is what you want for anything really built.", { n: events })}\n\n` +
+        t("Type {code} to confirm:", { code: item.code })
       );
       if (typed === null) return;
-      if (typed.trim() !== item.code) { alert("The code did not match; nothing was deleted."); return; }
+      if (typed.trim() !== item.code) { alert(t("The code did not match; nothing was deleted.")); return; }
       try {
         const result = await api(`/api/items/${item.id}?purge=true`, { method: "DELETE" });
-        toast(`${item.code} deleted for good (${result.purged_events} event(s) destroyed)`);
+        toast(t("{code} deleted for good ({n} event(s) destroyed)", { code: item.code, n: result.purged_events }));
         await sync();
         navigate("#/office/items");
       } catch (error) {
-        alert(error.body?.detail || "Could not delete the item.");
+        alert(error.body?.detail || t("Could not delete the item."));
       }
     };
   });
@@ -3015,26 +3127,26 @@ function partsEditor(item, items) {
   const parts = items.filter((i) => i.parent_item_id === item.id && i.is_active);
   const busy = !S.online ? "disabled" : "";
   return `
-        <label style="margin-top:12px">Parts</label>
+        <label style="margin-top:12px">${t("Parts")}</label>
         ${parts.length ? parts.map((part) => `
         <div class="spread" style="gap:8px;padding:4px 0">
-          <a href="#/office/items/${part.id}" style="min-width:0;color:inherit"><strong>${esc(part.code)}</strong> <span class="muted">${esc(part.description)}</span></a>
+          <a href="#/office/items/${part.id}" style="min-width:0;color:inherit"><strong>${esc(part.code)}</strong> <span class="muted"><bdi>${esc(part.description)}</bdi></span></a>
           <span style="display:flex;gap:6px;align-items:center;flex:none">
             <input data-pt-per="${part.id}" type="number" inputmode="numeric" min="1" value="${part.per_unit}"
-                   aria-label="How many per piece" style="width:70px;padding:8px">
-            <span class="muted">per piece</span>
-            <button class="ghost" data-pt-save="${part.id}" style="width:auto;padding:8px 12px" ${busy}>Save</button>
+                   aria-label="${esc(t("How many per piece"))}" style="width:70px;padding:8px">
+            <span class="muted">${t("per piece")}</span>
+            <button class="ghost" data-pt-save="${part.id}" style="width:auto;padding:8px 12px" ${busy}>${t("Save")}</button>
           </span>
-        </div>`).join("") : `<p class="muted">None — it goes through the factory as one piece.</p>`}
+        </div>`).join("") : `<p class="muted">${t("None — it goes through the factory as one piece.")}</p>`}
         <div class="field-grid">
-          <div><label>New part's code</label><input data-pt-code="${item.id}" maxlength="64" value="${esc(item.code)}-"></div>
-          <div><label>Name</label><input data-pt-desc="${item.id}" maxlength="255" placeholder="e.g. Headboard"></div>
+          <div><label>${t("New part's code")}</label><input data-pt-code="${item.id}" maxlength="64" dir="ltr" value="${esc(item.code)}-"></div>
+          <div><label>${t("Name")}</label><input data-pt-desc="${item.id}" maxlength="255" dir="auto" placeholder="${esc(t("e.g. Headboard"))}"></div>
         </div>
         <div class="field-grid">
-          <div><label>How many per piece</label><input data-pt-n="${item.id}" type="number" inputmode="numeric" min="1" value="1"></div>
-          <div style="align-self:end"><button class="ghost" data-pt-add="${item.id}" style="padding:10px 16px" ${busy}>Add part</button></div>
+          <div><label>${t("How many per piece")}</label><input data-pt-n="${item.id}" type="number" inputmode="numeric" min="1" value="1"></div>
+          <div style="align-self:end"><button class="ghost" data-pt-add="${item.id}" style="padding:10px 16px" ${busy}>${t("Add part")}</button></div>
         </div>
-        ${item.state?.in_parts_qty ? `<p class="muted">${item.state.in_parts_qty} piece(s) are out in parts. Parts cannot be added or recounted until they are assembled back.</p>` : ""}`;
+        ${item.state?.in_parts_qty ? `<p class="muted">${t("{n} piece(s) are out in parts. Parts cannot be added or recounted until they are assembled back.", { n: item.state.in_parts_qty })}</p>` : ""}`;
 }
 
 function bindPartsEditor(target, byId) {
@@ -3044,18 +3156,18 @@ function bindPartsEditor(target, byId) {
       const id = button.dataset.ptAdd;
       const code = value("data-pt-code", id).trim();
       const perUnit = Number(value("data-pt-n", id));
-      if (!code || code === `${byId.get(id).code}-`) { alert("Give the part a code."); return; }
-      if (!Number.isInteger(perUnit) || perUnit < 1) { alert("How many per piece: a whole number, 1 or more."); return; }
+      if (!code || code === `${byId.get(id).code}-`) { alert(t("Give the part a code.")); return; }
+      if (!Number.isInteger(perUnit) || perUnit < 1) { alert(t("How many per piece: a whole number, 1 or more.")); return; }
       try {
         await api(`/api/items/${id}/parts`, {
           method: "POST",
           body: JSON.stringify({ code, description: value("data-pt-desc", id).trim(), per_unit: perUnit }),
         });
-        toast(`${code} added as a part of ${byId.get(id).code}`);
+        toast(t("{name} added as a part of {code}", { name: code, code: byId.get(id).code }));
         await sync();
         loadItemEditors();
       } catch (error) {
-        alert(error.body?.detail || "Could not add the part.");
+        alert(error.body?.detail || t("Could not add the part."));
       }
     };
   });
@@ -3063,14 +3175,14 @@ function bindPartsEditor(target, byId) {
     button.onclick = async () => {
       const id = button.dataset.ptSave;
       const perUnit = Number(value("data-pt-per", id));
-      if (!Number.isInteger(perUnit) || perUnit < 1) { alert("How many per piece: a whole number, 1 or more."); return; }
+      if (!Number.isInteger(perUnit) || perUnit < 1) { alert(t("How many per piece: a whole number, 1 or more.")); return; }
       try {
         await api(`/api/items/${id}/part`, { method: "PATCH", body: JSON.stringify({ per_unit: perUnit }) });
-        toast("Part updated");
+        toast(t("Part updated"));
         await sync();
         loadItemEditors();
       } catch (error) {
-        alert(error.body?.detail || "Could not change the part.");
+        alert(error.body?.detail || t("Could not change the part."));
       }
     };
   });
@@ -3085,28 +3197,28 @@ function phaseMover(item, items) {
   const phases = (S.ref?.phases || []).filter((ph) => ph.project_id === item.project_id && ph.is_active && ph.id !== item.phase_id);
   const options = [
     ...phases.map((ph) => `<option value="${ph.id}">${esc(ph.name)}</option>`),
-    ...(item.phase_id ? [`<option value="">No phase</option>`] : []),
+    ...(item.phase_id ? [`<option value="">${t("No phase")}</option>`] : []),
   ];
   if (!options.length) return "";
   const planned = item.state?.phase !== "production";
   const places = planned ? [] : (item.state?.positions || [])
-    .map((p) => ({ key: p.is_unstarted ? UNSTARTED : p.stage_id, name: p.stage_name, qty: p.qty - (p.sample_qty || 0) }))
+    .map((p) => ({ key: p.is_unstarted ? UNSTARTED : p.stage_id, name: p.is_unstarted ? t("Not started") : p.stage_name, qty: p.qty - (p.sample_qty || 0) }))
     .filter((p) => p.qty > 0);
   if (!planned && !places.length) return "";
   return `
-        <label style="margin-top:12px">Move some into another phase</label>
+        <label style="margin-top:12px">${t("Move some into another phase")}</label>
         <select data-ph-to="${item.id}">${options.join("")}</select>
         ${planned ? `
-        <label>How many of the planned ${item.total_qty}</label>
+        <label>${t("How many of the planned {n}", { n: item.total_qty })}</label>
         <input data-ph-take="${item.id}" data-ph-key="${UNSTARTED}" type="number" inputmode="numeric" min="0" max="${item.total_qty}" placeholder="0">
-        <p class="muted" style="margin-top:4px">Nothing is on the floor yet. The other phase's batch is released by this item's sample.</p>`
+        <p class="muted" style="margin-top:4px">${t("Nothing is on the floor yet. The other phase's batch is released by this item's sample.")}</p>`
         : places.map((p) => `
         <div class="spread" style="gap:8px;padding:3px 0">
-          <span class="muted">${esc(p.name)} · ${p.qty}</span>
+          <span class="muted"><bdi>${esc(p.name)}</bdi> · ${p.qty}</span>
           <input data-ph-take="${item.id}" data-ph-key="${p.key}" type="number" inputmode="numeric" min="0" max="${p.qty}"
-                 placeholder="0" aria-label="How many from ${esc(p.name)}" style="width:90px;padding:8px">
+                 placeholder="0" aria-label="${esc(t("How many from {place}", { place: p.name }))}" style="width:90px;padding:8px">
         </div>`).join("")}
-        <button class="ghost" data-ph-go="${item.id}" style="width:auto;padding:10px 16px;margin-top:6px" ${S.online ? "" : "disabled"}>Move</button>`;
+        <button class="ghost" data-ph-go="${item.id}" style="width:auto;padding:10px 16px;margin-top:6px" ${S.online ? "" : "disabled"}>${t("Move")}</button>`;
 }
 
 function bindPhaseMover(target, byId) {
@@ -3117,23 +3229,23 @@ function bindPhaseMover(target, byId) {
       const take = {};
       for (const input of target.querySelectorAll(`[data-ph-take="${id}"]`)) {
         const qty = Number(input.value || 0);
-        if (!Number.isInteger(qty) || qty < 0) { alert("Quantities are whole numbers."); return; }
+        if (!Number.isInteger(qty) || qty < 0) { alert(t("Quantities are whole numbers.")); return; }
         if (qty) take[input.dataset.phKey] = qty;
       }
       const total = Object.values(take).reduce((a, b) => a + b, 0);
-      if (!total) { alert("Say how many to move."); return; }
+      if (!total) { alert(t("Say how many to move.")); return; }
       const select = target.querySelector(`[data-ph-to="${id}"]`);
       const phaseName = select.options[select.selectedIndex]?.text || "";
-      if (!confirm(`Move ${total} of ${item.code} into ${phaseName}?`)) return;
+      if (!confirm(t("Move {n} of {code} into {phase}?", { n: total, code: item.code, phase: phaseName }))) return;
       try {
         const moved = await api(`/api/items/${id}/split-phase`, {
           method: "POST", body: JSON.stringify({ phase_id: select.value || null, take }),
         });
-        toast(`${total} moved into ${phaseName} (${itemName(moved.to)})`);
+        toast(t("{n} moved into {phase} ({name})", { n: total, phase: phaseName, name: itemName(moved.to) }));
         await sync();
         loadItemEditors();
       } catch (error) {
-        alert(error.body?.detail || "Could not move them.");
+        alert(error.body?.detail || t("Could not move them."));
       }
     };
   });
@@ -3147,29 +3259,27 @@ function officeProjects(body) {
 
   body.innerHTML = `
     <div class="card">
-      <h2>Edit projects</h2>
-      <p class="muted" style="margin-bottom:8px">New projects arrive with their items through
-      <a href="#/office/import">Import</a>.</p>
+      <h2>${t("Edit projects")}</h2>
+      <p class="muted" style="margin-bottom:8px">${t("New projects arrive with their items through")}
+      <a href="#/office/import">${t("Import")}</a>.</p>
       ${projects.map((p) => `
         <details data-panel="project:${p.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
           <summary style="cursor:pointer;padding:6px 0">
-            <strong>${esc(p.code)}</strong>${p.is_active ? "" : ` <span class="badge">archived</span>`}
-            <br><span class="muted">${esc(p.name)}${p.client ? ` · ${esc(p.client)}` : ""}</span>
+            <strong>${esc(p.code)}</strong>${p.is_active ? "" : ` <span class="badge">${t("archived")}</span>`}
+            <br><span class="muted"><bdi>${esc(p.name)}</bdi>${p.client ? ` · <bdi>${esc(p.client)}</bdi>` : ""}</span>
           </summary>
           <div style="padding:8px 0 12px">
-            <label>Name</label><input data-pr-name="${p.id}" value="${esc(p.name)}">
-            <label>Client</label><input data-pr-client="${p.id}" value="${esc(p.client || "")}">
+            <label>${t("Name")}</label><input data-pr-name="${p.id}" value="${esc(p.name)}" dir="auto">
+            <label>${t("Client")}</label><input data-pr-client="${p.id}" value="${esc(p.client || "")}" dir="auto">
             ${isAdmin ? `
             <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-              <button class="ghost" data-pr-save="${p.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
-              <button class="ghost" data-pr-toggle="${p.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${p.is_active ? "Archive" : "Reactivate"}</button>
+              <button class="ghost" data-pr-save="${p.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Save")}</button>
+              <button class="ghost" data-pr-toggle="${p.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${p.is_active ? t("Archive") : t("Reactivate")}</button>
             </div>
-            <p class="muted" style="margin-top:6px">Archiving a project archives its items with it. Their
-            history stays, and both can be reactivated. The code is fixed — it appears on drawings and
-            emails that outlive this app.</p>`
-            : `<p class="muted" style="margin-top:10px">Editing projects is an admin job.</p>`}
+            <p class="muted" style="margin-top:6px">${t("Archiving a project archives its items with it. Their history stays, and both can be reactivated. The code is fixed — it appears on drawings and emails that outlive this app.")}</p>`
+            : `<p class="muted" style="margin-top:10px">${t("Editing projects is an admin job.")}</p>`}
           </div>
-        </details>`).join("") || `<span class="muted">No projects yet.</span>`}
+        </details>`).join("") || `<span class="muted">${t("No projects yet.")}</span>`}
     </div>`;
 
   const patchProject = async (id, patch, doneMessage) => {
@@ -3178,7 +3288,7 @@ function officeProjects(body) {
       toast(doneMessage);
       await sync();
     } catch (error) {
-      alert(error.body?.detail || "Could not update the project.");
+      alert(error.body?.detail || t("Could not update the project."));
     }
   };
 
@@ -3190,7 +3300,7 @@ function officeProjects(body) {
       patchProject(id, {
         name,
         client: body.querySelector(`[data-pr-client="${id}"]`).value.trim() || null,
-      }, "Project updated");
+      }, t("Project updated"));
     };
   });
 
@@ -3198,23 +3308,23 @@ function officeProjects(body) {
     button.onclick = async () => {
       const project = projects.find((p) => p.id === button.dataset.prToggle);
       if (!project.is_active) {
-        patchProject(project.id, { is_active: true }, "Project reactivated");
+        patchProject(project.id, { is_active: true }, t("Project reactivated"));
         return;
       }
       // S.items is the active list, so this is what will be archived with it.
       const live = S.items.filter((i) => i.project_id === project.id).length;
       const question = live
-        ? `Archive ${project.code} and its ${live} active item${live === 1 ? "" : "s"}? They leave every list and report; their history stays, and they can be reactivated.`
-        : `Archive ${project.code}?`;
+        ? t("Archive {code} and its {items}? They leave every list and report; their history stays, and they can be reactivated.", { code: project.code, items: tn(live, "{n} active item", "{n} active items") })
+        : t("Archive {code}?", { code: project.code });
       if (!confirm(question)) return;
       try {
         const result = await api(`/api/projects/${project.id}?with_items=true`, { method: "DELETE" });
         toast(result.archived_items
-          ? `Project archived with ${result.archived_items} item${result.archived_items === 1 ? "" : "s"}`
-          : "Project archived");
+          ? t("Project archived with {items}", { items: tn(result.archived_items, "{n} item", "{n} items") })
+          : t("Project archived"));
         await sync();
       } catch (error) {
-        alert(error.body?.detail || "Could not archive the project.");
+        alert(error.body?.detail || t("Could not archive the project."));
       }
     };
   });
@@ -3229,8 +3339,8 @@ function labelSelect(list, selected, attrs, projectId) {
   const picked = rows.some((row) => row.id === selected) ? selected : null;
   return `
     <select ${attrs}>
-      <option value="">— none —</option>
-      ${rows.map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : " (retired)"}</option>`).join("")}
+      <option value="">${t("— none —")}</option>
+      ${rows.map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : ` ${t("(retired)")}`}</option>`).join("")}
     </select>`;
 }
 
@@ -3240,11 +3350,26 @@ function labelSelect(list, selected, attrs, projectId) {
    batch is for, and which phase of it. They are what the Area and Phase
    filters are made of. Renaming one re-labels every item filed under it;
    retiring one takes it off the pickers and leaves its items where they are. */
+/* Every sentence the page says about either list is written out whole here:
+   "an area" and "a phase" do not come out of one pattern in Arabic, any more
+   than they do in English. */
 const LABEL_LISTS = [
-  { list: "areas", field: "area_id", noun: "area", title: "Areas",
-    blurb: "The parts of a job: guest rooms, the spa, the all-day dining room.", example: "Guest rooms" },
-  { list: "phases", field: "phase_id", noun: "phase", title: "Phases",
-    blurb: "The phases a job is built and delivered in.", example: "Phase 1" },
+  { list: "areas", field: "area_id",
+    title: N_("Areas of {code}"),
+    blurb: N_("The parts of a job: guest rooms, the spa, the all-day dining room."),
+    example: N_("e.g. Guest rooms"),
+    none: N_("No areas yet."), add: N_("Add an area"),
+    updateFailed: N_("Could not update the area."), deleteFailed: N_("Could not delete the area."),
+    addFailed: N_("Could not add the area."),
+    deleteQuestion: N_("Delete {name}? It is removed from {code}'s areas for good.") },
+  { list: "phases", field: "phase_id",
+    title: N_("Phases of {code}"),
+    blurb: N_("The phases a job is built and delivered in."),
+    example: N_("e.g. Phase 1"),
+    none: N_("No phases yet."), add: N_("Add a phase"),
+    updateFailed: N_("Could not update the phase."), deleteFailed: N_("Could not delete the phase."),
+    addFailed: N_("Could not add the phase."),
+    deleteQuestion: N_("Delete {name}? It is removed from {code}'s phases for good.") },
 ];
 
 /* Filing many items at once: search, tick, search again, tick more, then put
@@ -3299,39 +3424,36 @@ function filingCard() {
   const current = (list, picked, any, none) => `
         <option value="">${any}</option>
         <option value="${NONE}" ${picked === NONE ? "selected" : ""}>${none}</option>
-        ${own(list).map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : " (retired)"}</option>`).join("")}`;
+        ${own(list).map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}${row.is_active ? "" : ` ${t("(retired)")}`}</option>`).join("")}`;
   const target = (list, picked) => `
-        <option value="${KEEP}">— leave as it is —</option>
-        <option value="${NONE}" ${picked === NONE ? "selected" : ""}>— none —</option>
+        <option value="${KEEP}">${t("— leave as it is —")}</option>
+        <option value="${NONE}" ${picked === NONE ? "selected" : ""}>${t("— none —")}</option>
         ${own(list).filter((row) => row.is_active).map((row) => `<option value="${row.id}" ${row.id === picked ? "selected" : ""}>${esc(row.name)}</option>`).join("")}`;
   return `
     <div class="card">
-      <h2>File items under an area or phase</h2>
-      <p class="muted" style="margin-bottom:8px">Search this project's items, tick them, choose where they
-      go, apply. The ticks stay while you search again, so one batch can be gathered from several searches.
-      Each ticked item gets a quantity box for filing into a phase: leave it empty to send the whole batch,
-      or type how many go — the rest stay in the phase they are in.</p>
+      <h2>${t("File items under an area or phase")}</h2>
+      <p class="muted" style="margin-bottom:8px">${t("Search this project's items, tick them, choose where they go, apply. The ticks stay while you search again, so one batch can be gathered from several searches. Each ticked item gets a quantity box for filing into a phase: leave it empty to send the whole batch, or type how many go — the rest stay in the phase they are in.")}</p>
       <input id="fl-q" type="search" value="${esc(filing.q)}" style="margin-bottom:8px"
-             placeholder="Search — several at once with commas: bed base, LF-03">
+             placeholder="${esc(t("Search — several at once with commas: bed base, LF-03"))}">
       <div class="filters">
-        <select id="fl-in-area" aria-label="Currently in area">${current("areas", filing.inArea, "In any area", "In no area")}</select>
-        <select id="fl-in-phase" aria-label="Currently in phase">${current("phases", filing.inPhase, "In any phase", "In no phase")}</select>
+        <select id="fl-in-area" aria-label="${esc(t("Currently in area"))}">${current("areas", filing.inArea, t("In any area"), t("In no area"))}</select>
+        <select id="fl-in-phase" aria-label="${esc(t("Currently in phase"))}">${current("phases", filing.inPhase, t("In any phase"), t("In no phase"))}</select>
       </div>
       <div class="spread" style="margin-bottom:6px;flex-wrap:wrap;gap:8px">
         <span class="muted" id="fl-count"></span>
         <span style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="ghost" id="fl-all" style="width:auto;padding:8px 14px">Tick all found</button>
-          <button class="ghost" id="fl-none" style="width:auto;padding:8px 14px">Untick everything</button>
+          <button class="ghost" id="fl-all" style="width:auto;padding:8px 14px">${t("Tick all found")}</button>
+          <button class="ghost" id="fl-none" style="width:auto;padding:8px 14px">${t("Untick everything")}</button>
         </span>
       </div>
       <label class="pick-row" style="border:0;min-height:0;padding:2px 0 8px">
         <input type="checkbox" id="fl-only" ${filing.onlyTicked ? "checked" : ""}>
-        <span class="muted">Show only what is ticked</span>
+        <span class="muted">${t("Show only what is ticked")}</span>
       </label>
       <div id="fl-results" class="pick-list"></div>
       <div class="field-grid" style="margin-top:12px">
-        <div><label for="fl-area">Set area to</label><select id="fl-area">${target("areas", filing.area)}</select></div>
-        <div><label for="fl-phase">Set phase to</label><select id="fl-phase">${target("phases", filing.phase)}</select></div>
+        <div><label for="fl-area">${t("Set area to")}</label><select id="fl-area">${target("areas", filing.area)}</select></div>
+        <div><label for="fl-phase">${t("Set phase to")}</label><select id="fl-phase">${target("phases", filing.phase)}</select></div>
       </div>
       <div style="height:10px"></div>
       <button class="primary" id="fl-go"></button>
@@ -3352,10 +3474,10 @@ function bindFiling(body) {
     const n = filing.ticked.size;
     const chosen = filing.area !== KEEP || filing.phase !== KEEP;
     const go = document.getElementById("fl-go");
-    go.textContent = !S.online ? "Filing needs a connection"
-      : !n ? "Tick the items to file"
-      : !chosen ? "Choose an area or a phase to set"
-      : `File ${n} item${n === 1 ? "" : "s"}`;
+    go.textContent = !S.online ? t("Filing needs a connection")
+      : !n ? t("Tick the items to file")
+      : !chosen ? t("Choose an area or a phase to set")
+      : tn(n, "File {n} item", "File {n} items");
     go.disabled = !S.online || !n || !chosen;
   };
   const paint = () => {
@@ -3363,7 +3485,8 @@ function bindFiling(body) {
     const shown = found.slice(0, FILING_SHOWN);
     const tickedHere = found.filter((item) => filing.ticked.has(item.id)).length;
     document.getElementById("fl-count").textContent =
-      `${found.length} found · ${filing.ticked.size} ticked${filing.ticked.size !== tickedHere ? ` (${tickedHere} of them here)` : ""}`;
+      t("{found} found · {ticked} ticked", { found: found.length, ticked: filing.ticked.size })
+      + (filing.ticked.size !== tickedHere ? ` ${t("({n} of them here)", { n: tickedHere })}` : "");
     // Every ticked item can be given a quantity: how many of it go into the
     // phase chosen below. Shown on the tick, not once the phase is picked --
     // the picker is under the list, and a box that only appears afterwards is
@@ -3375,16 +3498,16 @@ function bindFiling(body) {
           <input type="checkbox" data-fl-pick="${item.id}" ${filing.ticked.has(item.id) ? "checked" : ""}>
           <span style="min-width:0">
             <strong>${esc(item.code)}</strong> ${itemTags(item)}
-            <br><span class="muted">${esc(projectCode.get(item.project_id) || "")} · ${batchOf(item)} pcs${item.description ? ` · ${esc(item.description)}` : ""}</span>
+            <br><span class="muted">${esc(projectCode.get(item.project_id) || "")} · ${pcs(batchOf(item))}${item.description ? ` · <bdi>${esc(item.description)}</bdi>` : ""}</span>
           </span>
         </label>
         ${asking && filing.ticked.has(item.id) ? `
         <input data-fl-qty="${item.id}" type="number" inputmode="numeric" min="1" max="${batchOf(item)}"
-               value="${esc(filing.qty[item.id] ?? "")}" placeholder="all ${batchOf(item)}"
-               aria-label="How many of ${esc(item.code)} go into the phase" style="width:96px;flex:none;padding:8px">` : ""}
+               value="${esc(filing.qty[item.id] ?? "")}" placeholder="${esc(t("all {n}", { n: batchOf(item) }))}"
+               aria-label="${esc(t("How many of {code} go into the phase", { code: item.code }))}" style="width:96px;flex:none;padding:8px">` : ""}
       </div>`).join("")
-      + (found.length > shown.length ? `<p class="muted" style="padding:8px 0">Showing the first ${shown.length} of ${found.length}. Narrow the search to see the rest — "Tick all found" still takes all ${found.length}.</p>` : "")
-      || `<p class="muted" style="padding:8px 0">${filing.onlyTicked ? "Nothing is ticked." : "No items match."}</p>`;
+      + (found.length > shown.length ? `<p class="muted" style="padding:8px 0">${t("Showing the first {n} of {total}. Narrow the search to see the rest — \"Tick all found\" still takes all {total}.", { n: shown.length, total: found.length })}</p>` : "")
+      || `<p class="muted" style="padding:8px 0">${filing.onlyTicked ? t("Nothing is ticked.") : t("No items match.")}</p>`;
     label();
   };
 
@@ -3428,17 +3551,17 @@ function bindFiling(body) {
     if (!ids.length || (filing.area === KEEP && filing.phase === KEEP)) return;
     const payload = { item_ids: ids };
     const where = [];
-    for (const [key, list, field, noun] of [["area", "areas", "area_id", "area"], ["phase", "phases", "phase_id", "phase"]]) {
+    for (const [key, list, field, none] of [["area", "areas", "area_id", N_("no area")], ["phase", "phases", "phase_id", N_("no phase")]]) {
       if (filing[key] === KEEP) continue;
       payload[field] = filing[key] === NONE ? null : filing[key];
-      where.push(filing[key] === NONE ? `no ${noun}` : labelRow(list, filing[key])?.name || noun);
+      where.push(filing[key] === NONE ? t(none) : labelRow(list, filing[key])?.name || "?");
     }
     // Quantities, for the items not going whole. They only mean something
     // when a phase is being set.
     const part = [];
     const fail = (message) => { err.textContent = message; err.hidden = false; };
     if (filing.phase === KEEP && ids.some((id) => String(filing.qty[id] ?? "").trim())) {
-      return fail("A quantity is how many go into a phase. Choose the phase under “Set phase to”, or clear the quantities.");
+      return fail(t("A quantity is how many go into a phase. Choose the phase under “Set phase to”, or clear the quantities."));
     }
     if (filing.phase !== KEEP) {
       for (const id of ids) {
@@ -3446,23 +3569,25 @@ function bindFiling(body) {
         if (!typed) continue;
         const item = S.items.find((i) => i.id === id);
         const qty = Number(typed);
-        if (!Number.isInteger(qty) || qty < 1) return fail(`${item?.code || "An item"}: the quantity is a whole number, 1 or more — or leave it empty for all of it.`);
-        if (item && qty > batchOf(item)) return fail(`${item.code} is a batch of ${batchOf(item)}; it cannot give ${qty}.`);
+        if (!Number.isInteger(qty) || qty < 1) return fail(t("{code}: the quantity is a whole number, 1 or more — or leave it empty for all of it.", { code: item?.code || t("An item") }));
+        if (item && qty > batchOf(item)) return fail(t("{code} is a batch of {n}; it cannot give {qty}.", { code: item.code, n: batchOf(item), qty }));
         (payload.quantities ||= {})[id] = qty;
-        if (item && qty < batchOf(item)) part.push(`${qty} of ${item.code}`);
+        if (item && qty < batchOf(item)) part.push(t("{n} of {code}", { n: qty, code: item.code }));
       }
     }
     const whole = ids.length - part.length;
     const what = [
-      whole ? `${whole} item${whole === 1 ? "" : "s"}` : "",
-      part.length ? `${part.slice(0, 6).join(", ")}${part.length > 6 ? ` and ${part.length - 6} more` : ""}` : "",
-    ].filter(Boolean).join(", and ");
-    if (!confirm(`File ${what} under ${where.join(" and ")}?${part.length ? "\n\nWhere a quantity is given, the rest of that batch stays in the phase it is in." : ""}`)) return;
+      whole ? tn(whole, "{n} item", "{n} items") : "",
+      part.length ? `${part.slice(0, 6).join(t(", "))}${part.length > 6 ? ` ${t("and {n} more", { n: part.length - 6 })}` : ""}` : "",
+    ].filter(Boolean).join(t(", and "));
+    const whereText = where.join(t(" and "));
+    if (!confirm(`${t("File {what} under {where}?", { what, where: whereText })}${part.length ? `\n\n${t("Where a quantity is given, the rest of that batch stays in the phase it is in.")}` : ""}`)) return;
     const go = document.getElementById("fl-go");
     go.disabled = true;
     try {
       const done = await api("/api/items/assign", { method: "POST", body: JSON.stringify(payload) });
-      toast(`${done.updated} item${done.updated === 1 ? "" : "s"} filed under ${where.join(" and ")}${done.split ? ` — ${done.split} in part` : ""}`);
+      toast(t("{items} filed under {where}", { items: tn(done.updated, "{n} item", "{n} items"), where: whereText })
+        + (done.split ? ` — ${t("{n} in part", { n: done.split })}` : ""));
       // Done with this batch: start the next one clean, but keep the search --
       // the next thing is usually to look at what is left.
       filing.ticked.clear();
@@ -3476,8 +3601,8 @@ function bindFiling(body) {
     } catch (error) {
       const detail = error.body?.detail;
       err.textContent = typeof detail === "string" ? detail
-        : isNetworkError(error) ? "No connection — nothing was changed."
-        : "Could not file the items.";
+        : isNetworkError(error) ? t("No connection — nothing was changed.")
+        : t("Could not file the items.");
       err.hidden = false;
       label();
     }
@@ -3492,9 +3617,8 @@ function officeAreas(body) {
   if (!projects.length) {
     body.innerHTML = `
     <div class="card">
-      <h2>Areas &amp; phases</h2>
-      <p class="muted">Areas and phases belong to a project, and there is no active project yet.
-      Projects arrive through <a href="#/office/import">Import</a>.</p>
+      <h2>${t("Areas & phases")}</h2>
+      <p class="muted">${t("Areas and phases belong to a project, and there is no active project yet. Projects arrive through")} <a href="#/office/import">${t("Import")}</a>.</p>
     </div>`;
     return;
   }
@@ -3509,48 +3633,45 @@ function officeAreas(body) {
 
   body.innerHTML = `
     <div class="card">
-      <label for="lb-project" style="margin-top:0">Project</label>
+      <label for="lb-project" style="margin-top:0">${t("Project")}</label>
       <select id="lb-project">
         ${projects.map((pr) => `<option value="${pr.id}" ${pr.id === projectId ? "selected" : ""}>${esc(pr.code)} — ${esc(pr.name)}</option>`).join("")}
       </select>
-      <p class="muted" style="margin-top:6px">Each project has its own areas and phases. Everything on
-      this page is ${esc(project.code)}'s.</p>
-    </div>` + filingCard() + LABEL_LISTS.map(({ list, field, noun, title, blurb, example }) => {
+      <p class="muted" style="margin-top:6px">${esc(t("Each project has its own areas and phases. Everything on this page is {code}'s.", { code: project.code }))}</p>
+    </div>` + filingCard() + LABEL_LISTS.map(({ list, field, title, blurb, example, none, add }) => {
     const rows = (S.ref?.[list] || []).filter((row) => row.project_id === projectId);
     return `
     <div class="card">
-      <h2>${title} of ${esc(project.code)}</h2>
-      <p class="muted" style="margin-bottom:8px">${blurb} Every item of this project can be filed under
-      one, from the import file, its editor or the tool above, and the Items list and Reports can be
-      narrowed to it.</p>
+      <h2>${esc(t(title, { code: project.code }))}</h2>
+      <p class="muted" style="margin-bottom:8px">${t(blurb)} ${t("Every item of this project can be filed under one, from the import file, its editor or the tool above, and the Items list and Reports can be narrowed to it.")}</p>
       ${rows.map((row) => {
         const count = S.items.filter((item) => item[field] === row.id).length;
         return `
         <details data-panel="${list}:${row.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
           <summary style="cursor:pointer;padding:6px 0">
-            <strong>${esc(row.name)}</strong>${row.is_active ? "" : ` <span class="badge">retired</span>`}
-            <span class="muted"> · ${count} item${count === 1 ? "" : "s"} on the floor</span>
+            <strong>${esc(row.name)}</strong>${row.is_active ? "" : ` <span class="badge">${t("retired")}</span>`}
+            <span class="muted"> · ${tn(count, "{n} item on the floor", "{n} items on the floor")}</span>
           </summary>
           <div style="padding:8px 0 12px">
             <div class="field-grid">
-              <div><label>Name</label><input data-lb-name="${list}:${row.id}" maxlength="120" value="${esc(row.name)}"></div>
-              <div><label>Sort order</label><input data-lb-sort="${list}:${row.id}" type="number" inputmode="numeric" value="${row.sort_order}"></div>
+              <div><label>${t("Name")}</label><input data-lb-name="${list}:${row.id}" maxlength="120" value="${esc(row.name)}" dir="auto"></div>
+              <div><label>${t("Sort order")}</label><input data-lb-sort="${list}:${row.id}" type="number" inputmode="numeric" value="${row.sort_order}"></div>
             </div>
             <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-              <button class="ghost" data-lb-save="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
-              <button class="ghost" data-lb-toggle="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${row.is_active ? "Retire" : "Reactivate"}</button>
-              ${count ? "" : `<button class="ghost" data-lb-delete="${list}:${row.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>Delete</button>`}
+              <button class="ghost" data-lb-save="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Save")}</button>
+              <button class="ghost" data-lb-toggle="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${row.is_active ? t("Retire") : t("Reactivate")}</button>
+              ${count ? "" : `<button class="ghost" data-lb-delete="${list}:${row.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>${t("Delete")}</button>`}
             </div>
             <p class="muted" style="margin-top:6px">${count
-              ? "Retiring takes it off the pickers; the items filed under it stay there."
-              : "Nothing on the floor is filed under it, so it can be deleted outright."}</p>
+              ? t("Retiring takes it off the pickers; the items filed under it stay there.")
+              : t("Nothing on the floor is filed under it, so it can be deleted outright.")}</p>
           </div>
         </details>`;
-      }).join("") || `<p class="muted">No ${noun}s yet.</p>`}
-      <label style="margin-top:12px">Add ${noun === "area" ? "an" : "a"} ${noun}</label>
+      }).join("") || `<p class="muted">${t(none)}</p>`}
+      <label style="margin-top:12px">${t(add)}</label>
       <div class="qty-row">
-        <input data-lb-new="${list}" maxlength="120" placeholder="e.g. ${example}" style="flex:1;text-align:left;padding:10px">
-        <button class="ghost" data-lb-add="${list}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Add</button>
+        <input data-lb-new="${list}" maxlength="120" dir="auto" placeholder="${esc(t(example))}" style="flex:1;text-align:start;padding:10px">
+        <button class="ghost" data-lb-add="${list}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Add")}</button>
       </div>
       <p class="warn-text" data-lb-err="${list}" role="alert" hidden></p>
     </div>`;
@@ -3572,7 +3693,7 @@ function officeAreas(body) {
       toast(done);
       await sync(); // refreshes the lists, and the filters made from them
     } catch (error) {
-      refuse(error, `Could not update the ${meta(list).noun}.`);
+      refuse(error, t(meta(list).updateFailed));
     }
   };
 
@@ -3581,34 +3702,36 @@ function officeAreas(body) {
       const key = button.dataset.lbSave;
       const name = body.querySelector(`[data-lb-name="${key}"]`).value.trim();
       if (!name) return;
-      patch(key, { name, sort_order: Number(body.querySelector(`[data-lb-sort="${key}"]`).value) || 0 }, "Saved");
+      patch(key, { name, sort_order: Number(body.querySelector(`[data-lb-sort="${key}"]`).value) || 0 }, t("Saved"));
     };
   });
   body.querySelectorAll("[data-lb-toggle]").forEach((button) => {
     button.onclick = () => {
       const [list, id] = button.dataset.lbToggle.split(":");
       const row = labelRow(list, id);
-      const { field, noun } = meta(list);
+      const { field } = meta(list);
       const count = S.items.filter((item) => item[field] === id).length;
-      if (row.is_active && count && !confirm(
-        `Retire ${row.name}? ${count} item${count === 1 ? " is" : "s are"} filed under it and will stay there; it just cannot be picked for new ones.`)) return;
+      if (row.is_active && count && !confirm(tn(count,
+        "Retire {name}? {n} item is filed under it and will stay there; it just cannot be picked for new ones.",
+        "Retire {name}? {n} items are filed under it and will stay there; they just cannot be picked for new ones.",
+        { name: row.name }))) return;
       patch(button.dataset.lbToggle, { is_active: !row.is_active },
-        row.is_active ? `${row.name} retired` : `${row.name} is back on the list`);
+        row.is_active ? t("{name} retired", { name: row.name }) : t("{name} is back on the list", { name: row.name }));
     };
   });
   body.querySelectorAll("[data-lb-delete]").forEach((button) => {
     button.onclick = async () => {
       const [list, id] = button.dataset.lbDelete.split(":");
       const row = labelRow(list, id);
-      if (!confirm(`Delete ${row.name}? It is removed from ${project.code}'s ${list} for good.`)) return;
+      if (!confirm(t(meta(list).deleteQuestion, { name: row.name, code: project.code }))) return;
       try {
         await api(`/api/${list}/${id}`, { method: "DELETE" });
-        toast(`${row.name} deleted`);
+        toast(t("{name} deleted", { name: row.name }));
         await sync();
         if (body.isConnected) officeAreas(body);
       } catch (error) {
         // The server counts archived items too, which this phone does not hold.
-        refuse(error, `Could not delete the ${meta(list).noun}.`);
+        refuse(error, t(meta(list).deleteFailed));
       }
     };
   });
@@ -3628,10 +3751,10 @@ function officeAreas(body) {
         });
         input.value = "";
         dirtyFields.clear();
-        toast(`${name} added`);
+        toast(t("{name} added", { name }));
         await sync();
       } catch (error) {
-        err.textContent = typeof error.body?.detail === "string" ? error.body.detail : `Could not add the ${meta(list).noun}.`;
+        err.textContent = typeof error.body?.detail === "string" ? error.body.detail : t(meta(list).addFailed);
         err.hidden = false;
       }
     };
@@ -3659,14 +3782,14 @@ let workOrderKey = 0;
 
 /* The column switches, in the order the PDF prints them. */
 const WO_COLUMNS = [
-  ["show_picture", "Pictures"],
-  ["show_description", "Description"],
-  ["show_dimensions", "Dimensions"],
-  ["show_location", "Area & phase"],
+  ["show_picture", N_("Pictures")],
+  ["show_description", N_("Description")],
+  ["show_dimensions", N_("Dimensions")],
+  ["show_location", N_("Area & phase")],
 ];
 
 /* What the PDF can be printed in. */
-const WO_LANGUAGES = [["en", "English"], ["ar", "Arabic"], ["both", "English and Arabic"]];
+const WO_LANGUAGES = [["en", N_("English")], ["ar", N_("Arabic")], ["both", N_("English and Arabic")]];
 
 /* Every text field on a line, by the data attribute of the input that edits
    it. All of them are the work order's own wording. */
@@ -3674,6 +3797,9 @@ const WO_LINE_FIELDS = {
   woCode: "code", woRev: "drawing_revision", woDesc: "description", woDescAr: "description_ar",
   woDims: "dimensions", woQty: "qty", woArea: "area", woPhase: "phase",
 };
+
+/* "WO-0003 Rev 2": the number is the document's own and stays as printed. */
+const woLabel = (label, revision, gap = " ") => `${label}${gap}${t("Rev {n}", { n: revision })}`;
 
 /* An item's picture, as an image id: its icon URL ends in one. */
 const iconId = (item) => (item?.icon_url ? item.icon_url.split("/").pop() : null);
@@ -3723,9 +3849,8 @@ function officeWorkOrders(body) {
   if (!projects.length) {
     body.innerHTML = `
     <div class="card">
-      <h2>Work orders</h2>
-      <p class="muted">A work order releases a project's items to production, and there is no active
-      project yet. Projects arrive through <a href="#/office/import">Import</a>.</p>
+      <h2>${t("Work orders")}</h2>
+      <p class="muted">${t("A work order releases a project's items to production, and there is no active project yet. Projects arrive through")} <a href="#/office/import">${t("Import")}</a>.</p>
     </div>`;
     return;
   }
@@ -3740,23 +3865,21 @@ function officeWorkOrders(body) {
 
   body.innerHTML = `
     <div class="card">
-      <h2>Work orders</h2>
-      <p class="muted" style="margin-bottom:8px">A numbered document releasing a set of a project's items
-      to production, as a PDF with one row per item. It is a record of what was released: issuing one
-      changes nothing about the items themselves.</p>
-      <label for="wo-project">Project</label>
+      <h2>${t("Work orders")}</h2>
+      <p class="muted" style="margin-bottom:8px">${t("A numbered document releasing a set of a project's items to production, as a PDF with one row per item. It is a record of what was released: issuing one changes nothing about the items themselves.")}</p>
+      <label for="wo-project">${t("Project")}</label>
       <select id="wo-project">
         ${projects.map((pr) => `<option value="${pr.id}" ${pr.id === workOrders.project ? "selected" : ""}>${esc(pr.code)} — ${esc(pr.name)}</option>`).join("")}
       </select>
       <div style="height:10px"></div>
-      <button class="primary" id="wo-new" ${S.online ? "" : "disabled"}>${S.online ? `New work order for ${esc(project.code)}` : "Work orders need a connection"}</button>
+      <button class="primary" id="wo-new" ${S.online ? "" : "disabled"}>${S.online ? esc(t("New work order for {code}", { code: project.code })) : t("Work orders need a connection")}</button>
       ${issued ? `
-      <p style="margin-top:10px"><strong>${esc(issued.label)} Rev ${issued.revision}</strong> is issued.
-        <a href="${issued.pdf_url}" download>Download the PDF</a></p>` : ""}
+      <p style="margin-top:10px"><strong>${esc(woLabel(issued.label, issued.revision))}</strong> ${t("is issued.")}
+        <a href="${issued.pdf_url}" download>${t("Download the PDF")}</a></p>` : ""}
     </div>
     <div class="card">
-      <h2>Issued for ${esc(project.code)}</h2>
-      <div id="wo-list" class="muted">Loading…</div>
+      <h2>${esc(t("Issued for {code}", { code: project.code }))}</h2>
+      <div id="wo-list" class="muted">${t("Loading…")}</div>
     </div>`;
 
   document.getElementById("wo-project").onchange = (e) => {
@@ -3778,16 +3901,16 @@ function officeWorkOrders(body) {
     target.innerHTML = workOrders.list.map((row) => `
       <div style="padding:8px 0;border-bottom:1px solid var(--line)">
         <div class="spread">
-          <strong>${esc(row.label)} · Rev ${row.revision}</strong>
+          <strong>${esc(woLabel(row.label, row.revision, " · "))}</strong>
           <span class="muted">${fmtWhen(row.issued_at)}</span>
         </div>
         ${row.title ? `<div>${esc(row.title)}</div>` : ""}
-        <div class="muted">${row.line_count} item${row.line_count === 1 ? "" : "s"} · ${row.total_qty} pcs · issued by ${esc(row.issued_by || "?")}</div>
+        <div class="muted">${tn(row.line_count, "{n} item", "{n} items")} · ${pcs(row.total_qty)} · ${esc(t("issued by {name}", { name: row.issued_by || "?" }))}</div>
         <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
-          <a class="ghost button-link" href="${row.pdf_url}" download>Download PDF</a>
-          <button class="ghost" data-wo-open="${row.id}" style="width:auto;padding:8px 16px" ${S.online ? "" : "disabled"}>Open</button>
+          <a class="ghost button-link" href="${row.pdf_url}" download>${t("Download PDF")}</a>
+          <button class="ghost" data-wo-open="${row.id}" style="width:auto;padding:8px 16px" ${S.online ? "" : "disabled"}>${t("Open")}</button>
         </div>
-      </div>`).join("") || `<span class="muted">No work orders issued for this project yet.</span>`;
+      </div>`).join("") || `<span class="muted">${t("No work orders issued for this project yet.")}</span>`;
     target.querySelectorAll("[data-wo-open]").forEach((button) => {
       button.onclick = async () => {
         try {
@@ -3796,7 +3919,7 @@ function officeWorkOrders(body) {
           dirtyFields.clear();
           if (body.isConnected) officeWorkOrders(body);
         } catch (error) {
-          alert(error.body?.detail || "Could not open the work order.");
+          alert(error.body?.detail || t("Could not open the work order."));
         }
       };
     });
@@ -3811,7 +3934,7 @@ function officeWorkOrders(body) {
   }).catch(() => {
     const target = document.getElementById("wo-list");
     if (target && !(workOrders.listFor === asked && workOrders.list)) {
-      target.textContent = "Work orders need a connection.";
+      target.textContent = t("Work orders need a connection.");
     }
   });
 }
@@ -3829,60 +3952,57 @@ function workOrderEditor(body, projects) {
   body.innerHTML = `
     <div class="card">
       <div class="spread">
-        <h2>${draft.id ? `${esc(draft.label)} · Rev ${draft.revision}` : "New work order"}</h2>
+        <h2>${draft.id ? esc(woLabel(draft.label, draft.revision, " · ")) : t("New work order")}</h2>
         <span class="badge">${esc(project?.code || "")}</span>
       </div>
       <p class="muted" style="margin-bottom:8px">${draft.id
-        ? `Saving re-issues it as Rev ${draft.revision + 1}, with today's date and your name.`
-        : "It gets its number when it is issued."} What is written here is the work order's own:
-        it does not change the items, and later changes to the items do not change it.</p>
-      <label for="wo-title">Title</label>
-      <input id="wo-title" maxlength="160" value="${esc(draft.title)}" placeholder="e.g. Guest rooms — first release">
-      <label for="wo-notes">Notes</label>
-      <textarea id="wo-notes" maxlength="4000" rows="3" placeholder="Finishes, packing, anything production should read first">${esc(draft.notes)}</textarea>
-      <label for="wo-lang">Language of the PDF</label>
+        ? t("Saving re-issues it as Rev {n}, with today's date and your name.", { n: draft.revision + 1 })
+        : t("It gets its number when it is issued.")} ${t("What is written here is the work order's own: it does not change the items, and later changes to the items do not change it.")}</p>
+      <label for="wo-title">${t("Title")}</label>
+      <input id="wo-title" maxlength="160" dir="ltr" value="${esc(draft.title)}" placeholder="e.g. Guest rooms — first release">
+      <label for="wo-notes">${t("Notes")}</label>
+      <textarea id="wo-notes" maxlength="4000" rows="3" dir="ltr" placeholder="Finishes, packing, anything production should read first">${esc(draft.notes)}</textarea>
+      <label for="wo-lang">${t("Language of the PDF")}</label>
       <select id="wo-lang">
-        ${WO_LANGUAGES.map(([code, name]) => `<option value="${code}" ${code === draft.language ? "selected" : ""}>${name}</option>`).join("")}
+        ${WO_LANGUAGES.map(([code, name]) => `<option value="${code}" ${code === draft.language ? "selected" : ""}>${t(name)}</option>`).join("")}
       </select>
       <div id="wo-ar" ${draft.language === "en" ? "hidden" : ""}>
-        <label for="wo-title-ar">Title in Arabic</label>
+        <label for="wo-title-ar">${t("Title in Arabic")}</label>
         <input id="wo-title-ar" dir="rtl" lang="ar" maxlength="160" value="${esc(draft.title_ar)}">
-        <label for="wo-notes-ar">Notes in Arabic</label>
+        <label for="wo-notes-ar">${t("Notes in Arabic")}</label>
         <textarea id="wo-notes-ar" dir="rtl" lang="ar" maxlength="4000" rows="3">${esc(draft.notes_ar)}</textarea>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">
-          <button class="ghost" id="wo-translate" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Translate to Arabic</button>
+          <button class="ghost" id="wo-translate" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Translate to Arabic")}</button>
           <span class="muted" id="wo-tr-msg" role="status"></span>
         </div>
-        <p class="muted" style="margin-top:6px">Fills in the Arabic that is still empty — title, notes and each
-          line's description — as a draft from Claude. Read it and correct it like any other field: what is
-          in the boxes when you issue is what is printed. The text is sent to Anthropic to be translated.</p>
+        <p class="muted" style="margin-top:6px">${t("Fills in the Arabic that is still empty — title, notes and each line's description — as a draft from Claude. Read it and correct it like any other field: what is in the boxes when you issue is what is printed. The text is sent to Anthropic to be translated.")}</p>
       </div>
-      <label>Columns on the PDF</label>
+      <label>${t("Columns on the PDF")}</label>
       <div class="check-row">
         ${WO_COLUMNS.map(([key, name]) => `
-        <label class="pick-row" style="border:0;min-height:0;padding:4px 14px 4px 0">
-          <input type="checkbox" data-wo-col="${key}" ${draft[key] ? "checked" : ""}><span>${name}</span>
+        <label class="pick-row" style="border:0;min-height:0;padding-block:4px;padding-inline:0 14px">
+          <input type="checkbox" data-wo-col="${key}" ${draft[key] ? "checked" : ""}><span>${t(name)}</span>
         </label>`).join("")}
       </div>
-      <p class="muted">Code, drawing revision and quantity are always printed.</p>
+      <p class="muted">${t("Code, drawing revision and quantity are always printed.")}</p>
     </div>
 
     <div class="card">
-      <h2>Items on it <span class="muted" id="wo-count"></span></h2>
+      <h2>${t("Items on it")} <span class="muted" id="wo-count"></span></h2>
       <div id="wo-lines"></div>
     </div>
 
     <div class="card">
-      <h2>Add items</h2>
+      <h2>${t("Add items")}</h2>
       <input id="wo-q" type="search" value="${esc(workOrders.q)}" style="margin-bottom:8px"
-             placeholder="Search — several at once with commas: bed base, LF-03">
+             placeholder="${esc(t("Search — several at once with commas: bed base, LF-03"))}">
       <div class="filters">
-        <select id="wo-in-area" aria-label="In area">${inPicker("areas", workOrders.inArea, "In any area", "In no area")}</select>
-        <select id="wo-in-phase" aria-label="In phase">${inPicker("phases", workOrders.inPhase, "In any phase", "In no phase")}</select>
+        <select id="wo-in-area" aria-label="${esc(t("In area"))}">${inPicker("areas", workOrders.inArea, t("In any area"), t("In no area"))}</select>
+        <select id="wo-in-phase" aria-label="${esc(t("In phase"))}">${inPicker("phases", workOrders.inPhase, t("In any phase"), t("In no phase"))}</select>
       </div>
       <div class="spread" style="margin-bottom:6px;flex-wrap:wrap;gap:8px">
         <span class="muted" id="wo-found"></span>
-        <button class="ghost" id="wo-add-all" style="width:auto;padding:8px 14px">Add all found</button>
+        <button class="ghost" id="wo-add-all" style="width:auto;padding:8px 14px">${t("Add all found")}</button>
       </div>
       <div id="wo-results" class="pick-list"></div>
     </div>
@@ -3893,9 +4013,9 @@ function workOrderEditor(body, projects) {
       </div>
       <p class="warn-text" id="wo-err" role="alert" hidden></p>
       <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-        <button class="ghost" id="wo-cancel" style="width:auto;padding:10px 16px">${draft.id ? "Close without saving" : "Discard"}</button>
-        ${draft.id ? `<a class="ghost button-link" href="/api/work-orders/${draft.id}/pdf" download>Download Rev ${draft.revision} PDF</a>` : ""}
-        ${draft.id && isAdmin ? `<button class="ghost" id="wo-delete" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>Delete work order</button>` : ""}
+        <button class="ghost" id="wo-cancel" style="width:auto;padding:10px 16px">${draft.id ? t("Close without saving") : t("Discard")}</button>
+        ${draft.id ? `<a class="ghost button-link" href="/api/work-orders/${draft.id}/pdf" download>${t("Download Rev {n} PDF", { n: draft.revision })}</a>` : ""}
+        ${draft.id && isAdmin ? `<button class="ghost" id="wo-delete" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>${t("Delete work order")}</button>` : ""}
       </div>
     </div>`;
 
@@ -3906,11 +4026,11 @@ function workOrderEditor(body, projects) {
   const saveLabel = () => {
     const n = draft.lines.length;
     const pieces = draft.lines.reduce((sum, line) => sum + (Number(line.qty) || 0), 0);
-    document.getElementById("wo-count").textContent = n ? `(${n} · ${pieces} pcs)` : "";
+    document.getElementById("wo-count").textContent = n ? `(${n} · ${pcs(pieces)})` : "";
     const go = document.getElementById("wo-save");
-    go.textContent = !S.online ? "Issuing needs a connection"
-      : !n ? "Add the items to release"
-      : draft.id ? `Re-issue as Rev ${draft.revision + 1}` : `Issue work order (${n} item${n === 1 ? "" : "s"})`;
+    go.textContent = !S.online ? t("Issuing needs a connection")
+      : !n ? t("Add the items to release")
+      : draft.id ? t("Re-issue as Rev {n}", { n: draft.revision + 1 }) : t("Issue work order ({items})", { items: tn(n, "{n} item", "{n} items") });
     go.disabled = !S.online || !n;
   };
 
@@ -3918,65 +4038,65 @@ function workOrderEditor(body, projects) {
     $lines.innerHTML = draft.lines.map((line, index) => `
       <div class="wo-line" data-wo-line="${line.key}">
         <div class="wo-pic">
-          ${line.image_url ? `<img src="${line.image_url}" alt="">` : `<span class="muted">No picture</span>`}
+          ${line.image_url ? `<img src="${line.image_url}" alt="">` : `<span class="muted">${t("No picture")}</span>`}
           ${line.item_id ? `
-          <label class="ghost button-link wo-pic-btn">Change
+          <label class="ghost button-link wo-pic-btn">${t("Change")}
             <input type="file" accept="image/*" data-wo-pic="${line.key}" hidden ${S.online ? "" : "disabled"}>
           </label>` : ""}
-          ${line.image_id ? `<button class="ghost wo-pic-btn" data-wo-nopic="${line.key}">Remove</button>` : ""}
+          ${line.image_id ? `<button class="ghost wo-pic-btn" data-wo-nopic="${line.key}">${t("Remove")}</button>` : ""}
           <span class="muted" data-wo-picmsg="${line.key}" hidden></span>
         </div>
         <div class="wo-fields">
           <div class="spread">
-            <span class="muted">Line ${index + 1}${line.item_id ? "" : ` <span class="badge">item deleted</span>`}</span>
+            <span class="muted">${t("Line {n}", { n: index + 1 })}${line.item_id ? "" : ` <span class="badge">${t("item deleted")}</span>`}</span>
             <span style="white-space:nowrap">
-              <button class="ghost wo-move" data-wo-up="${line.key}" aria-label="Move up" ${index ? "" : "disabled"}>▲</button>
-              <button class="ghost wo-move" data-wo-down="${line.key}" aria-label="Move down" ${index < draft.lines.length - 1 ? "" : "disabled"}>▼</button>
-              <button class="ghost wo-move" data-wo-drop="${line.key}" aria-label="Take off the work order">✕</button>
+              <button class="ghost wo-move" data-wo-up="${line.key}" aria-label="${esc(t("Move up"))}" ${index ? "" : "disabled"}>▲</button>
+              <button class="ghost wo-move" data-wo-down="${line.key}" aria-label="${esc(t("Move down"))}" ${index < draft.lines.length - 1 ? "" : "disabled"}>▼</button>
+              <button class="ghost wo-move" data-wo-drop="${line.key}" aria-label="${esc(t("Take off the work order"))}">✕</button>
             </span>
           </div>
           <div class="field-grid">
-            <div><label>Code</label><input data-wo-code="${line.key}" maxlength="64" value="${esc(line.code)}"></div>
-            <div><label>Drawing revision</label><input data-wo-rev="${line.key}" maxlength="32" value="${esc(line.drawing_revision)}"></div>
+            <div><label>${t("Code")}</label><input data-wo-code="${line.key}" maxlength="64" dir="ltr" value="${esc(line.code)}"></div>
+            <div><label>${t("Drawing revision")}</label><input data-wo-rev="${line.key}" maxlength="32" dir="ltr" value="${esc(line.drawing_revision)}"></div>
           </div>
-          <label>Description</label>
-          <textarea data-wo-desc="${line.key}" maxlength="2000" rows="2">${esc(line.description)}</textarea>
+          <label>${t("Description")}</label>
+          <textarea data-wo-desc="${line.key}" maxlength="2000" rows="2" dir="ltr">${esc(line.description)}</textarea>
           ${draft.language === "en" ? "" : `
           <div class="spread" style="align-items:flex-end">
-            <label>Description in Arabic</label>
-            <button class="ghost wo-tr" data-wo-tr="${line.key}" ${S.online ? "" : "disabled"}>Translate</button>
+            <label>${t("Description in Arabic")}</label>
+            <button class="ghost wo-tr" data-wo-tr="${line.key}" ${S.online ? "" : "disabled"}>${t("Translate")}</button>
           </div>
           <textarea data-wo-desc-ar="${line.key}" dir="rtl" lang="ar" maxlength="2000" rows="2">${esc(line.description_ar)}</textarea>
-          <p class="warn-text" data-wo-stale="${line.key}" style="margin:4px 0 0" ${line.ar_stale ? "" : "hidden"}>The English was changed after this was translated. Check the Arabic, or press Translate.</p>`}
+          <p class="warn-text" data-wo-stale="${line.key}" style="margin:4px 0 0" ${line.ar_stale ? "" : "hidden"}>${t("The English was changed after this was translated. Check the Arabic, or press Translate.")}</p>`}
           <div class="field-grid">
-            <div><label>Dimensions</label><input data-wo-dims="${line.key}" maxlength="255" value="${esc(line.dimensions)}"></div>
-            <div><label>Quantity</label><input data-wo-qty="${line.key}" type="number" inputmode="numeric" min="1" value="${esc(line.qty)}"></div>
+            <div><label>${t("Dimensions")}</label><input data-wo-dims="${line.key}" maxlength="255" dir="auto" value="${esc(line.dimensions)}"></div>
+            <div><label>${t("Quantity")}</label><input data-wo-qty="${line.key}" type="number" inputmode="numeric" min="1" value="${esc(line.qty)}"></div>
           </div>
           <div class="field-grid">
-            <div><label>Area</label><input data-wo-area="${line.key}" maxlength="120" value="${esc(line.area)}"></div>
-            <div><label>Phase</label><input data-wo-phase="${line.key}" maxlength="120" value="${esc(line.phase)}"></div>
+            <div><label>${t("Area")}</label><input data-wo-area="${line.key}" maxlength="120" dir="auto" value="${esc(line.area)}"></div>
+            <div><label>${t("Phase")}</label><input data-wo-phase="${line.key}" maxlength="120" dir="auto" value="${esc(line.phase)}"></div>
           </div>
         </div>
-      </div>`).join("") || `<p class="muted">Nothing on it yet. Find the items below and add them.</p>`;
+      </div>`).join("") || `<p class="muted">${t("Nothing on it yet. Find the items below and add them.")}</p>`;
     saveLabel();
   };
 
   const paintResults = () => {
     const found = workOrderCandidates();
     const shown = found.slice(0, 100);
-    document.getElementById("wo-found").textContent = `${found.length} found`;
+    document.getElementById("wo-found").textContent = t("{n} found", { n: found.length });
     document.getElementById("wo-add-all").disabled = !found.length;
     $results.innerHTML = shown.map((item) => `
       <div class="pick-row" style="cursor:default">
         ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
         <span style="min-width:0;flex:1">
           <strong>${esc(item.code)}</strong> ${itemTags(item)}
-          <br><span class="muted">${item.total_qty} pcs${item.description ? ` · ${esc(item.description)}` : ""}</span>
+          <br><span class="muted">${pcs(item.total_qty)}${item.description ? ` · <bdi>${esc(item.description)}</bdi>` : ""}</span>
         </span>
-        <button class="ghost" data-wo-add="${item.id}" style="width:auto;padding:8px 14px;flex:none">Add</button>
+        <button class="ghost" data-wo-add="${item.id}" style="width:auto;padding:8px 14px;flex:none">${t("Add")}</button>
       </div>`).join("")
-      + (found.length > shown.length ? `<p class="muted" style="padding:8px 0">Showing the first ${shown.length} of ${found.length}. "Add all found" takes all ${found.length}.</p>` : "")
-      || `<p class="muted" style="padding:8px 0">${S.items.some((i) => i.project_id === draft.project_id) ? "Nothing more to add matches." : `${esc(projectCode)} has no items yet.`}</p>`;
+      + (found.length > shown.length ? `<p class="muted" style="padding:8px 0">${t("Showing the first {n} of {total}. \"Add all found\" takes all {total}.", { n: shown.length, total: found.length })}</p>` : "")
+      || `<p class="muted" style="padding:8px 0">${S.items.some((i) => i.project_id === draft.project_id) ? t("Nothing more to add matches.") : esc(t("{code} has no items yet.", { code: projectCode }))}</p>`;
   };
 
   const line = (key) => draft.lines.find((entry) => entry.key === key);
@@ -4010,7 +4130,7 @@ function workOrderEditor(body, projects) {
   const translate = async (jobs) => {
     if (translating) return;
     translating = true;
-    sayTr(`Translating ${jobs.length} text${jobs.length === 1 ? "" : "s"}…`);
+    sayTr(tn(jobs.length, "Translating {n} text…", "Translating {n} texts…"));
     try {
       const { translations } = await api("/api/work-orders/translate", {
         method: "POST", body: JSON.stringify({ texts: jobs.map((job) => job.text) }),
@@ -4020,12 +4140,12 @@ function workOrderEditor(body, projects) {
       document.getElementById("wo-title-ar").value = draft.title_ar;
       document.getElementById("wo-notes-ar").value = draft.notes_ar;
       paintLines();
-      sayTr(`Translated ${jobs.length}. Read it through before issuing.`);
+      sayTr(t("Translated {n}. Read it through before issuing.", { n: jobs.length }));
     } catch (error) {
       const detail = error.body?.detail;
       sayTr(typeof detail === "string" ? detail
-        : isNetworkError(error) ? "No connection — nothing was translated."
-        : "Could not translate.", true);
+        : isNetworkError(error) ? t("No connection — nothing was translated.")
+        : t("Could not translate."), true);
     } finally {
       translating = false;
     }
@@ -4041,7 +4161,7 @@ function workOrderEditor(body, projects) {
       }
     }
     if (!jobs.length) {
-      sayTr("Nothing to translate: every Arabic box that has English beside it is already filled. Clear a box to have it translated again.");
+      sayTr(t("Nothing to translate: every Arabic box that has English beside it is already filled. Clear a box to have it translated again."));
       return;
     }
     translate(jobs);
@@ -4052,7 +4172,7 @@ function workOrderEditor(body, projects) {
     if (data.woTr) {
       // One line, on request: this replaces what is there.
       const entry = line(data.woTr);
-      if (!entry.description.trim()) { sayTr("That line has no English description to translate.", true); return; }
+      if (!entry.description.trim()) { sayTr(t("That line has no English description to translate."), true); return; }
       translate([{ text: entry.description, put: (ar) => { entry.description_ar = ar; entry.ar_stale = false; } }]);
       return;
     }
@@ -4078,16 +4198,16 @@ function workOrderEditor(body, projects) {
     const target = line(key);
     const message = $lines.querySelector(`[data-wo-picmsg="${key}"]`);
     const say = (text, warn) => { if (message) { message.hidden = false; message.className = warn ? "warn-text" : "muted"; message.textContent = text; } };
-    say("Uploading…");
+    say(t("Uploading…"));
     try {
       const image = await uploadImage(target.item_id, file, {
         kind: "document",
-        onProgress: (fraction) => say(`Uploading… ${Math.round(fraction * 100)}%`),
+        onProgress: (fraction) => say(t("Uploading… {n}%", { n: Math.round(fraction * 100) })),
       });
       Object.assign(target, { image_id: image.id, image_url: image.url });
       paintLines();
     } catch (error) {
-      say(error.detail || "Upload failed.", true);
+      say(error.detail || t("Upload failed."), true);
     }
   };
 
@@ -4130,18 +4250,18 @@ function workOrderEditor(body, projects) {
   };
   document.getElementById("wo-cancel").onclick = () => {
     const touched = draft.lines.length || draft.title || draft.notes;
-    if (touched && !confirm(draft.id ? "Close without saving your changes?" : "Discard this work order?")) return;
+    if (touched && !confirm(draft.id ? t("Close without saving your changes?") : t("Discard this work order?"))) return;
     leave();
   };
   const remove = document.getElementById("wo-delete");
   if (remove) remove.onclick = async () => {
-    if (!confirm(`Delete ${draft.label}? The record goes for good. Its items are not touched.`)) return;
+    if (!confirm(t("Delete {label}? The record goes for good. Its items are not touched.", { label: draft.label }))) return;
     try {
       await api(`/api/work-orders/${draft.id}`, { method: "DELETE" });
-      toast(`${draft.label} deleted`);
+      toast(t("{name} deleted", { name: draft.label }));
       leave();
     } catch (error) {
-      alert(error.body?.detail || "Could not delete the work order.");
+      alert(error.body?.detail || t("Could not delete the work order."));
     }
   };
 
@@ -4151,9 +4271,9 @@ function workOrderEditor(body, projects) {
     err.hidden = true;
     if (!draft.lines.length) return;
     const bad = draft.lines.find((entry) => !Number.isInteger(Number(entry.qty)) || Number(entry.qty) < 1 || String(entry.qty).trim() === "");
-    if (bad) return fail(`${bad.code || "A line"}: the quantity must be a whole number, 1 or more.`);
+    if (bad) return fail(t("{code}: the quantity must be a whole number, 1 or more.", { code: bad.code || t("A line") }));
     const uncoded = draft.lines.findIndex((entry) => !String(entry.code).trim());
-    if (uncoded >= 0) return fail(`Line ${uncoded + 1} has no code.`);
+    if (uncoded >= 0) return fail(t("Line {n} has no code.", { n: uncoded + 1 }));
     const payload = {
       project_id: draft.project_id,
       title: draft.title.trim(),
@@ -4182,7 +4302,7 @@ function workOrderEditor(body, projects) {
       const saved = await api(draft.id ? `/api/work-orders/${draft.id}` : "/api/work-orders", {
         method: draft.id ? "PUT" : "POST", body: JSON.stringify(payload),
       });
-      toast(`${saved.label} Rev ${saved.revision} issued`);
+      toast(t("{label} issued", { label: woLabel(saved.label, saved.revision) }));
       localStorage.setItem("wo-language", saved.language);
       workOrders.issued = saved;
       workOrders.project = saved.project_id;
@@ -4191,8 +4311,8 @@ function workOrderEditor(body, projects) {
       const detail = error.body?.detail;
       fail(typeof detail === "string" ? detail
         : Array.isArray(detail) ? rejectReason(error)
-        : isNetworkError(error) ? "No connection — the work order was not issued."
-        : "Could not issue the work order.");
+        : isNetworkError(error) ? t("No connection — the work order was not issued.")
+        : t("Could not issue the work order."));
       saveLabel();
     }
   };
@@ -4206,23 +4326,20 @@ function workOrderEditor(body, projects) {
 function officeStages(body) {
   body.innerHTML = `
     <div class="card">
-      <h2>Stages &amp; stations</h2>
-      <p class="muted" style="margin-bottom:8px">Add a stage here and every item
-      can be logged at it straight away, on each phone's next sync — there is nothing else
-      to set up. Add stations if the stage has more than one booth or bench. Sort order is
-      only the order stages are listed in: units move between them freely.</p>
-      <div id="mg-stages" class="muted">Loading…</div>
+      <h2>${t("Stages & stations")}</h2>
+      <p class="muted" style="margin-bottom:8px">${t("Add a stage here and every item can be logged at it straight away, on each phone's next sync — there is nothing else to set up. Add stations if the stage has more than one booth or bench. Sort order is only the order stages are listed in: units move between them freely.")}</p>
+      <div id="mg-stages" class="muted">${t("Loading…")}</div>
       <details data-panel="new-stage" style="margin-top:12px">
-        <summary class="muted" style="cursor:pointer">New stage</summary>
+        <summary class="muted" style="cursor:pointer">${t("New stage")}</summary>
         <div class="field-grid" style="margin-top:8px">
-          <div><label for="ns-name">Name</label><input id="ns-name" placeholder="Glass shop"></div>
-          <div><label for="ns-sort">Sort order</label><input id="ns-sort" type="number" inputmode="numeric"></div>
+          <div><label for="ns-name">${t("Name")}</label><input id="ns-name" dir="auto" placeholder="${esc(t("Glass shop"))}"></div>
+          <div><label for="ns-sort">${t("Sort order")}</label><input id="ns-sort" type="number" inputmode="numeric"></div>
         </div>
-        <label for="ns-days">Flag as aging after (days — empty for never)</label>
+        <label for="ns-days">${t("Flag as aging after (days — empty for never)")}</label>
         <input id="ns-days" type="number" inputmode="numeric" min="1" max="365" value="3">
         <div id="ns-flags"></div>
         <div style="height:8px"></div>
-        <button class="primary" id="ns-go" ${S.online ? "" : "disabled"}>Add stage</button>
+        <button class="primary" id="ns-go" ${S.online ? "" : "disabled"}>${t("Add stage")}</button>
         <p class="warn-text" id="ns-err" hidden></p>
       </details>
     </div>`;
@@ -4234,22 +4351,22 @@ function officeStages(body) {
 function officeUsers(body) {
   body.innerHTML = `
     <div class="card">
-      <h2>Users</h2>
-      <div id="mg-users" class="muted">Loading…</div>
+      <h2>${t("Users")}</h2>
+      <div id="mg-users" class="muted">${t("Loading…")}</div>
       <details data-panel="new-user" style="margin-top:12px">
-        <summary class="muted" style="cursor:pointer">New user</summary>
+        <summary class="muted" style="cursor:pointer">${t("New user")}</summary>
         <div class="field-grid" style="margin-top:8px">
-          <div><label for="nu-username">Username</label><input id="nu-username" autocapitalize="none" autocomplete="off"></div>
-          <div><label for="nu-display">Display name</label><input id="nu-display" autocomplete="off"></div>
+          <div><label for="nu-username">${t("Username")}</label><input id="nu-username" autocapitalize="none" autocomplete="off" dir="ltr"></div>
+          <div><label for="nu-display">${t("Display name")}</label><input id="nu-display" autocomplete="off" dir="auto"></div>
         </div>
-        <label for="nu-pass">Password (min 8 characters)</label>
+        <label for="nu-pass">${t("Password (min 8 characters)")}</label>
         <input id="nu-pass" type="password" autocomplete="new-password">
         <label style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:14px;color:var(--text)">
           <input type="checkbox" id="nu-admin" style="width:22px;height:22px;flex:none">
-          Admin — can manage stages, users, and removals
+          ${t("Admin — can manage stages, users, and removals")}
         </label>
         <div style="height:8px"></div>
-        <button class="primary" id="nu-go" ${S.online ? "" : "disabled"}>Create user</button>
+        <button class="primary" id="nu-go" ${S.online ? "" : "disabled"}>${t("Create user")}</button>
         <p class="warn-text" id="nu-err" hidden></p>
       </details>
     </div>`;
@@ -4288,37 +4405,34 @@ function officeStatus(body) {
 
   body.innerHTML = `
     <div class="card">
-      <h2>Floor banner</h2>
-      <p class="muted" style="margin-bottom:10px">Shown at the top of the app to everyone
-      who is not an admin, offline included — the phones keep showing the last banner they
-      received. Neutral with no message shows nothing at all.</p>
+      <h2>${t("Floor banner")}</h2>
+      <p class="muted" style="margin-bottom:10px">${t("Shown at the top of the app to everyone who is not an admin, offline included — the phones keep showing the last banner they received. Neutral with no message shows nothing at all.")}</p>
       <div id="st-live" class="muted"></div>
-      <label>Colour</label>
+      <label>${t("Colour")}</label>
       <div class="seg" id="st-colors">
         ${BANNER_COLORS.map((c) => `
           <button data-id="${c}" class="${c === picked ? "on" : ""}" aria-pressed="${c === picked}">
-            ${c === "neutral" ? "Neutral" : c[0].toUpperCase() + c.slice(1)}
+            ${esc(bannerColorName(c))}
           </button>`).join("")}
       </div>
-      <label for="st-msg">Message (optional, 200 characters)</label>
-      <input id="st-msg" maxlength="200" placeholder="e.g. Paint booth 2 down until Thursday"
+      <label for="st-msg">${t("Message (optional, 200 characters)")}</label>
+      <input id="st-msg" maxlength="200" dir="auto" placeholder="${esc(t("e.g. Paint booth 2 down until Thursday"))}"
              value="${esc(bannerMsg ?? live.message ?? "")}">
       <div style="height:10px"></div>
       <button class="primary" id="st-go" ${S.online ? "" : "disabled"}>
-        ${S.online ? "Publish banner" : "Publishing needs a connection"}</button>
+        ${S.online ? t("Publish banner") : t("Publishing needs a connection")}</button>
       <p class="warn-text" id="st-err" hidden></p>
     </div>
 
     <div class="card">
-      <h2>Accounts</h2>
-      <p class="muted" style="margin-bottom:10px">Entries are counted against the person
-      they were logged for, and timed by when the work happened on the floor.</p>
-      <div id="st-users" class="muted">Loading…</div>
+      <h2>${t("Accounts")}</h2>
+      <p class="muted" style="margin-bottom:10px">${t("Entries are counted against the person they were logged for, and timed by when the work happened on the floor.")}</p>
+      <div id="st-users" class="muted">${t("Loading…")}</div>
     </div>
 
     <div class="card">
-      <h2>Database backups</h2>
-      <div id="st-backup" class="muted">Loading…</div>
+      <h2>${t("Database backups")}</h2>
+      <div id="st-backup" class="muted">${t("Loading…")}</div>
     </div>`;
 
   renderLiveBanner(live);
@@ -4351,10 +4465,10 @@ function officeStatus(body) {
       });
       bannerPick = null;
       bannerMsg = null;
-      toast("Banner published to the floor");
+      toast(t("Banner published to the floor"));
       sync(); // the banner reaches other phones through the reference payload
     } catch (error) {
-      err.textContent = error.body?.detail || "Could not publish the banner.";
+      err.textContent = error.body?.detail || t("Could not publish the banner.");
       err.hidden = false;
     }
   };
@@ -4367,9 +4481,9 @@ function renderLiveBanner(live) {
   if (!el) return;
   const showing = live.color !== "neutral" || !!live.message;
   el.innerHTML = showing
-    ? `<span class="badge">live</span> <strong>${esc(live.color)}</strong>${live.message ? ` — ${esc(live.message)}` : ""}
-       <br>set by ${esc(live.set_by || "someone")} ${live.set_at ? timeAgo(Date.parse(live.set_at)) : ""}`
-    : `<span class="badge">live</span> Nothing showing on the floor.`;
+    ? `<span class="badge">${t("live")}</span> <strong>${esc(bannerColorName(live.color))}</strong>${live.message ? ` — <span dir="auto">${esc(live.message)}</span>` : ""}
+       <br>${esc(t("set by {name}", { name: live.set_by || t("someone") }))} ${live.set_at ? timeAgo(Date.parse(live.set_at)) : ""}`
+    : `<span class="badge">${t("live")}</span> ${t("Nothing showing on the floor.")}`;
 }
 
 /* "never" beats a blank cell: an account that has not signed in since this
@@ -4378,11 +4492,9 @@ function renderLiveBanner(live) {
    the wall clock underneath because "3d ago" is not something to put in an
    email about it. */
 function whenCell(iso) {
-  if (!iso) return `<td class="muted">never</td>`;
+  if (!iso) return `<td class="muted">${t("never")}</td>`;
   const when = new Date(iso);
-  return `<td>${timeAgo(when.getTime())}<br><span class="muted">${
-    when.toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })
-  }</span></td>`;
+  return `<td>${timeAgo(when.getTime())}<br><span class="muted">${fmtWhen(when)}</span></td>`;
 }
 
 /* The backup job runs in its own container, and a failed night only ever
@@ -4398,26 +4510,26 @@ async function loadBackupStatus() {
   try {
     status = await api("/api/status/backup");
   } catch {
-    if (target.isConnected) target.textContent = "Backup status needs a connection.";
+    if (target.isConnected) target.textContent = t("Backup status needs a connection.");
     return;
   }
   if (!target.isConnected) return;
 
   if (!status.available) {
     target.className = "warn-text";
-    target.textContent = "Could not read the backup storage — check the server log.";
+    target.textContent = t("Could not read the backup storage — check the server log.");
   } else if (!status.count) {
     target.className = "warn-text";
-    target.textContent = "No backups in storage yet. The first is written about a minute after the stack starts.";
+    target.textContent = t("No backups in storage yet. The first is written about a minute after the stack starts.");
   } else if (!status.last_at) {
     target.className = "muted";
-    target.textContent = `${status.count} kept. Newest: ${status.last_key}`;
+    target.textContent = t("{n} kept. Newest: {key}", { n: status.count, key: status.last_key });
   } else {
     const when = new Date(status.last_at);
     const stale = Date.now() - when.getTime() > BACKUP_STALE_MS;
     target.className = stale ? "warn-text" : "";
-    target.textContent = `Last backup ${timeAgo(when.getTime())} (${fmtWhen(when)}) · ${status.count} kept`
-      + (stale ? " — the nightly backup has not run; check the backup container's log." : "");
+    target.textContent = t("Last backup {ago} ({when}) · {n} kept", { ago: timeAgo(when.getTime()), when: fmtWhen(when), n: status.count })
+      + (stale ? ` — ${t("the nightly backup has not run; check the backup container's log.")}` : "");
   }
 }
 
@@ -4429,7 +4541,7 @@ async function loadUserStatus() {
   try {
     ({ users } = await api("/api/status/users"));
   } catch {
-    target.textContent = "Account status needs a connection — it is counted from the log on the server.";
+    target.textContent = t("Account status needs a connection — it is counted from the log on the server.");
     return;
   }
   if (!target.isConnected) return;
@@ -4439,17 +4551,17 @@ async function loadUserStatus() {
     <div class="table-scroll">
     <table>
       <thead><tr>
-        <th scope="col">Person</th>
-        <th scope="col">Last sign-in</th>
-        <th scope="col">Last entry</th>
-        <th scope="col" class="num">Entries</th>
+        <th scope="col">${t("Person")}</th>
+        <th scope="col">${t("Last sign-in")}</th>
+        <th scope="col">${t("Last entry")}</th>
+        <th scope="col" class="num">${t("Entries")}</th>
       </tr></thead>
       <tbody>
         ${users.map((u) => `
           <tr>
             <td>
               <strong>${esc(u.display_name)}</strong>
-              ${u.is_admin ? ` <span class="badge">admin</span>` : ""}${u.is_active ? "" : ` <span class="badge">off</span>`}
+              ${u.is_admin ? ` <span class="badge">${t("admin")}</span>` : ""}${u.is_active ? "" : ` <span class="badge">${t("off")}</span>`}
               <br><span class="muted">${esc(u.username)}</span>
             </td>
             ${whenCell(u.last_login_at)}
@@ -4465,10 +4577,11 @@ async function loadUserStatus() {
 
 /* The behaviour flags a stage can carry. Labels only — nothing here branches
    on what any particular stage means. */
+/* [flag, what the checkbox says, what the stage's summary line says] */
 const STAGE_FLAGS = [
-  ["requires_station", "Has physical stations"],
-  ["requires_external_po", "External supplier (lead time, PO)"],
-  ["allows_partial_qty", "Allows partial quantities (off: a move in takes the whole lot)"],
+  ["requires_station", N_("Has physical stations"), N_("Has physical stations")],
+  ["requires_external_po", N_("External supplier (lead time, PO)"), N_("External supplier")],
+  ["allows_partial_qty", N_("Allows partial quantities (off: a move in takes the whole lot)"), N_("Allows partial quantities")],
 ];
 
 function flagCheckboxes(prefix, values) {
@@ -4476,7 +4589,7 @@ function flagCheckboxes(prefix, values) {
     <label style="display:flex;align-items:center;gap:10px;font-size:14px;color:var(--text);margin:6px 0">
       <input type="checkbox" data-flag="${prefix}:${key}" ${values[key] ? "checked" : ""}
              style="width:22px;height:22px;flex:none">
-      ${label}
+      ${t(label)}
     </label>`).join("");
 }
 
@@ -4498,47 +4611,47 @@ function renderStageAdmin() {
   target.innerHTML = stages.map((s) => {
     const stations = (S.ref?.stations || []).filter((st) => st.stage_id === s.id);
     const flagSummary = [
-      ...STAGE_FLAGS.filter(([k]) => s[k]).map(([, l]) => l.split(" — ")[0].split(" (")[0]),
-      s.max_days_in_state != null ? `ages at ${s.max_days_in_state}d` : "",
+      ...STAGE_FLAGS.filter(([k]) => s[k]).map(([, , short]) => t(short)),
+      s.max_days_in_state != null ? t("ages at {n}d", { n: s.max_days_in_state }) : "",
     ].filter(Boolean).join(" · ");
     return `
       <details data-panel="stage:${s.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
         <summary style="cursor:pointer;padding:6px 0">
-          <strong>${esc(s.name)}</strong>${s.is_active ? "" : ` <span class="badge">inactive</span>`}
-          <br><span class="muted">${esc(flagSummary || "no flags")}${stations.length ? ` · stations: ${stations.map((st) => esc(st.name) + (st.is_active ? "" : " (off)")).join(", ")}` : ""}</span>
+          <strong>${esc(s.name)}</strong>${s.is_active ? "" : ` <span class="badge">${t("inactive")}</span>`}
+          <br><span class="muted">${esc(flagSummary || t("no flags"))}${stations.length ? ` · ${t("stations:")} ${stations.map((st) => esc(st.name) + (st.is_active ? "" : ` ${t("(off)")}`)).join(t(", "))}` : ""}</span>
         </summary>
         <div style="padding:8px 0 12px">
           <div class="field-grid">
-            <div><label>Name</label><input data-stage-name="${s.id}" value="${esc(s.name)}"></div>
-            <div><label>Sort order</label><input data-stage-sort="${s.id}" type="number" inputmode="numeric" value="${s.sort_order}"></div>
+            <div><label>${t("Name")}</label><input data-stage-name="${s.id}" value="${esc(s.name)}" dir="auto"></div>
+            <div><label>${t("Sort order")}</label><input data-stage-sort="${s.id}" type="number" inputmode="numeric" value="${s.sort_order}"></div>
           </div>
-          <label>Flag as aging after (days — empty for never, e.g. outsourced)</label>
+          <label>${t("Flag as aging after (days — empty for never, e.g. outsourced)")}</label>
           <input data-stage-days="${s.id}" type="number" inputmode="numeric" min="1" max="365"
-                 placeholder="no threshold" value="${s.max_days_in_state ?? ""}">
+                 placeholder="${esc(t("no threshold"))}" value="${s.max_days_in_state ?? ""}">
           ${flagCheckboxes(s.id, s)}
           <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-            <button class="ghost" data-stage-save="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
-            <button class="ghost" data-stage-toggle="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${s.is_active ? "Deactivate" : "Reactivate"}</button>
+            <button class="ghost" data-stage-save="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Save")}</button>
+            <button class="ghost" data-stage-toggle="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${s.is_active ? t("Deactivate") : t("Reactivate")}</button>
           </div>
           ${stations.map((st) => `
           <div style="border:1px solid var(--line);border-radius:var(--radius);padding:8px 10px;margin-top:10px">
             <div class="field-grid">
-              <div><label>Station${st.is_active ? "" : ` <span class="badge">inactive</span>`}</label><input data-st-name="${st.id}" value="${esc(st.name)}"></div>
-              <div><label>Sort order</label><input data-st-sort="${st.id}" type="number" inputmode="numeric" value="${st.sort_order}"></div>
+              <div><label>${t("Station")}${st.is_active ? "" : ` <span class="badge">${t("inactive")}</span>`}</label><input data-st-name="${st.id}" value="${esc(st.name)}" dir="auto"></div>
+              <div><label>${t("Sort order")}</label><input data-st-sort="${st.id}" type="number" inputmode="numeric" value="${st.sort_order}"></div>
             </div>
             <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-              <button class="ghost" data-st-save="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
-              <button class="ghost" data-st-toggle="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${st.is_active ? "Deactivate" : "Reactivate"}</button>
+              <button class="ghost" data-st-save="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Save")}</button>
+              <button class="ghost" data-st-toggle="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${st.is_active ? t("Deactivate") : t("Reactivate")}</button>
             </div>
           </div>`).join("")}
-          <label style="margin-top:10px">Add station</label>
+          <label style="margin-top:10px">${t("Add station")}</label>
           <div class="qty-row">
-            <input data-station-name="${s.id}" placeholder="e.g. ${esc(s.name)} ${stations.length + 1}" style="flex:1;text-align:left;padding:10px">
-            <button class="ghost" data-station-add="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Add</button>
+            <input data-station-name="${s.id}" dir="auto" placeholder="${esc(t("e.g. {name}", { name: `${s.name} ${stations.length + 1}` }))}" style="flex:1;text-align:start;padding:10px">
+            <button class="ghost" data-station-add="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Add")}</button>
           </div>
         </div>
       </details>`;
-  }).join("") || `<span class="muted">No stages yet.</span>`;
+  }).join("") || `<span class="muted">${t("No stages yet.")}</span>`;
 
   const patchStage = async (stageId, body, doneMessage) => {
     try {
@@ -4546,7 +4659,7 @@ function renderStageAdmin() {
       toast(doneMessage);
       await sync(); // refreshes S.ref, re-renders the office view
     } catch (error) {
-      alert(error.body?.detail || "Could not update the stage.");
+      alert(error.body?.detail || t("Could not update the stage."));
     }
   };
 
@@ -4559,14 +4672,14 @@ function renderStageAdmin() {
         sort_order: Number(document.querySelector(`[data-stage-sort="${id}"]`).value) || 0,
         max_days_in_state: days ? Number(days) : null,
         ...readFlags(id),
-      }, "Stage updated");
+      }, t("Stage updated"));
     };
   });
   target.querySelectorAll("[data-stage-toggle]").forEach((button) => {
     button.onclick = () => {
       const stage = S.ref.stages.find((s) => s.id === button.dataset.stageToggle);
       patchStage(stage.id, { is_active: !stage.is_active },
-        stage.is_active ? "Stage deactivated" : "Stage reactivated");
+        stage.is_active ? t("Stage deactivated") : t("Stage reactivated"));
     };
   });
   const patchStation = async (stationId, body, doneMessage) => {
@@ -4575,7 +4688,7 @@ function renderStageAdmin() {
       toast(doneMessage);
       await sync();
     } catch (error) {
-      alert(error.body?.detail || "Could not update the station.");
+      alert(error.body?.detail || t("Could not update the station."));
     }
   };
 
@@ -4587,7 +4700,7 @@ function renderStageAdmin() {
       patchStation(id, {
         name,
         sort_order: Number(document.querySelector(`[data-st-sort="${id}"]`).value) || 0,
-      }, "Station updated");
+      }, t("Station updated"));
     };
   });
   target.querySelectorAll("[data-st-toggle]").forEach((button) => {
@@ -4599,9 +4712,9 @@ function renderStageAdmin() {
       // forbid it: a stage can legitimately lose its last machine.
       const lastActive = station.is_active && stage?.requires_station && !S.ref.stations.some(
         (st) => st.stage_id === station.stage_id && st.id !== station.id && st.is_active);
-      if (lastActive && !confirm(`${station.name} is the last active station at ${stage.name}. Entries logged there will carry no station until one is added back. Deactivate anyway?`)) return;
+      if (lastActive && !confirm(t("{station} is the last active station at {stage}. Entries logged there will carry no station until one is added back. Deactivate anyway?", { station: station.name, stage: stage.name }))) return;
       patchStation(station.id, { is_active: !station.is_active },
-        station.is_active ? "Station deactivated" : "Station reactivated");
+        station.is_active ? t("Station deactivated") : t("Station reactivated"));
     };
   });
   target.querySelectorAll("[data-station-add]").forEach((button) => {
@@ -4614,10 +4727,10 @@ function renderStageAdmin() {
           method: "POST",
           body: JSON.stringify({ stage_id: id, code: slugify(name), name }),
         });
-        toast("Station added");
+        toast(t("Station added"));
         await sync();
       } catch (error) {
-        alert(error.body?.detail || "Could not add the station.");
+        alert(error.body?.detail || t("Could not add the station."));
       }
     };
   });
@@ -4634,7 +4747,7 @@ function renderStageAdmin() {
     const err = document.getElementById("ns-err");
     err.hidden = true;
     const name = document.getElementById("ns-name").value.trim();
-    if (!name) { err.textContent = "The stage needs a name."; err.hidden = false; return; }
+    if (!name) { err.textContent = t("The stage needs a name."); err.hidden = false; return; }
     try {
       const days = document.getElementById("ns-days").value.trim();
       await api("/api/stages", {
@@ -4647,10 +4760,10 @@ function renderStageAdmin() {
           ...readFlags("new"),
         }),
       });
-      toast(`Stage ${name} added — items can be logged there now`);
+      toast(t("Stage {name} added — items can be logged there now", { name }));
       await sync();
     } catch (error) {
-      err.textContent = error.body?.detail || "Could not add the stage.";
+      err.textContent = error.body?.detail || t("Could not add the stage.");
       err.hidden = false;
     }
   };
@@ -4666,7 +4779,7 @@ async function loadUsers() {
   try {
     ({ users } = await api("/api/users"));
   } catch {
-    target.textContent = "User management needs a connection.";
+    target.textContent = t("User management needs a connection.");
     return;
   }
   if (!target.isConnected) return;
@@ -4676,23 +4789,23 @@ async function loadUsers() {
     <details data-panel="user:${u.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
       <summary style="cursor:pointer;padding:6px 0">
         <strong>${esc(u.display_name)}</strong> <span class="muted">${esc(u.username)}</span>
-        ${u.is_admin ? `<span class="badge">admin</span>` : ""}${u.is_active ? "" : ` <span class="badge">deactivated</span>`}
-        ${u.id === S.user?.id ? ` <span class="badge qty">you</span>` : ""}
+        ${u.is_admin ? `<span class="badge">${t("admin")}</span>` : ""}${u.is_active ? "" : ` <span class="badge">${t("deactivated")}</span>`}
+        ${u.id === S.user?.id ? ` <span class="badge qty">${t("you")}</span>` : ""}
       </summary>
       <div style="padding:8px 0 12px">
-        <label>Display name</label>
-        <input data-user-display="${u.id}" value="${esc(u.display_name)}">
-        <label>Reset password (signs them out everywhere)</label>
+        <label>${t("Display name")}</label>
+        <input data-user-display="${u.id}" value="${esc(u.display_name)}" dir="auto">
+        <label>${t("Reset password (signs them out everywhere)")}</label>
         <div class="qty-row">
           <input data-user-pass="${u.id}" type="password" autocomplete="new-password"
-                 placeholder="min 8 characters" style="flex:1;text-align:left;padding:10px">
-          <button class="ghost" data-user-reset="${u.id}" style="width:auto;padding:10px 16px">Reset</button>
+                 placeholder="${esc(t("min 8 characters"))}" style="flex:1;text-align:start;padding:10px">
+          <button class="ghost" data-user-reset="${u.id}" style="width:auto;padding:10px 16px">${t("Reset")}</button>
         </div>
         <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
-          <button class="ghost" data-user-save="${u.id}" style="width:auto;padding:10px 16px">Save name</button>
+          <button class="ghost" data-user-save="${u.id}" style="width:auto;padding:10px 16px">${t("Save name")}</button>
           ${u.id === S.user?.id ? "" : `
-          <button class="ghost" data-user-admin="${u.id}" style="width:auto;padding:10px 16px">${u.is_admin ? "Remove admin" : "Make admin"}</button>
-          <button class="ghost" data-user-active="${u.id}" style="width:auto;padding:10px 16px">${u.is_active ? "Deactivate" : "Reactivate"}</button>`}
+          <button class="ghost" data-user-admin="${u.id}" style="width:auto;padding:10px 16px">${u.is_admin ? t("Remove admin") : t("Make admin")}</button>
+          <button class="ghost" data-user-active="${u.id}" style="width:auto;padding:10px 16px">${u.is_active ? t("Deactivate") : t("Reactivate")}</button>`}
         </div>
       </div>
     </details>`).join("");
@@ -4703,7 +4816,7 @@ async function loadUsers() {
       toast(doneMessage);
       loadUsers();
     } catch (error) {
-      alert(error.body?.detail || "Could not update the user.");
+      alert(error.body?.detail || t("Could not update the user."));
     }
   };
 
@@ -4714,26 +4827,26 @@ async function loadUsers() {
   target.querySelectorAll("[data-user-save]").forEach((b) => {
     b.onclick = () => patchUser(b.dataset.userSave, {
       display_name: target.querySelector(`[data-user-display="${b.dataset.userSave}"]`).value.trim(),
-    }, "Name updated");
+    }, t("Name updated"));
   });
   target.querySelectorAll("[data-user-reset]").forEach((b) => {
     b.onclick = () => {
       const field = target.querySelector(`[data-user-pass="${b.dataset.userReset}"]`);
-      if (field.value.length < 8) { alert("Password needs at least 8 characters."); return; }
-      patchUser(b.dataset.userReset, { password: field.value }, "Password reset — their old sessions are signed out");
+      if (field.value.length < 8) { alert(t("Password needs at least 8 characters.")); return; }
+      patchUser(b.dataset.userReset, { password: field.value }, t("Password reset — their old sessions are signed out"));
     };
   });
   target.querySelectorAll("[data-user-admin]").forEach((b) => {
     const user = users.find((u) => u.id === b.dataset.userAdmin);
     b.onclick = () => patchUser(user.id, { is_admin: !user.is_admin },
-      user.is_admin ? "Admin removed" : "Now an admin");
+      user.is_admin ? t("Admin removed") : t("Now an admin"));
   });
   target.querySelectorAll("[data-user-active]").forEach((b) => {
     const user = users.find((u) => u.id === b.dataset.userActive);
     b.onclick = () => {
-      if (user.is_active && !confirm(`Deactivate ${user.display_name}? They are signed out on their next request; their logged events stay.`)) return;
+      if (user.is_active && !confirm(t("Deactivate {name}? They are signed out on their next request; their logged events stay.", { name: user.display_name }))) return;
       patchUser(user.id, { is_active: !user.is_active },
-        user.is_active ? "User deactivated" : "User reactivated");
+        user.is_active ? t("User deactivated") : t("User reactivated"));
     };
   });
 
@@ -4751,13 +4864,13 @@ async function loadUsers() {
           is_admin: document.getElementById("nu-admin").checked,
         }),
       });
-      toast(`User ${created.username} created`);
+      toast(t("User {name} created", { name: created.username }));
       loadUsers();
     } catch (error) {
       const detail = error.body?.detail;
       err.textContent = typeof detail === "string" ? detail
         : Array.isArray(detail) && detail.length ? `${(detail[0].loc || []).slice(1).join(".")}: ${detail[0].msg}`
-        : "Could not create the user.";
+        : t("Could not create the user.");
       err.hidden = false;
     }
   };
@@ -4806,10 +4919,8 @@ async function boot() {
     document.getElementById("topbar").hidden = false;
     $view.innerHTML = `
       <div class="card">
-        <h2>Storage unavailable</h2>
-        <p class="muted">This browser blocked the on-device database the app needs for
-        offline logging (private browsing does this). Entries cannot be queued safely —
-        close this tab and open the app in a normal browser window.</p>
+        <h2>${t("Storage unavailable")}</h2>
+        <p class="muted">${t("This browser blocked the on-device database the app needs for offline logging (private browsing does this). Entries cannot be queued safely — close this tab and open the app in a normal browser window.")}</p>
       </div>`;
     return;
   }

@@ -11,7 +11,9 @@ so nothing is configured here.
 
 from __future__ import annotations
 
+import os
 import shutil
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO
@@ -20,16 +22,33 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from app.config import get_settings
 
+# The suffix of a local file still being written (see LocalStorage.put).
+_PARTIAL = ".part"
+
 
 class LocalStorage:
     def __init__(self, root: Path) -> None:
         self.root = root
 
     def put(self, key: str, fileobj: BinaryIO, content_type: str | None = None) -> None:
+        """All of it or none of it: written beside the destination under
+        another name and moved into place once it is complete and on disk.
+        Written straight to its final name, a disk that filled halfway left a
+        truncated file there -- and for a database dump, a truncated file with
+        the newest name is "the latest backup" to everything that lists them.
+        """
         destination = self.root / key
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as out:
-            shutil.copyfileobj(fileobj, out)
+        partial = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}{_PARTIAL}")
+        try:
+            with partial.open("wb") as out:
+                shutil.copyfileobj(fileobj, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(partial, destination)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
 
     def response(self, key: str, media_type: str) -> Response | None:
         path = self.root / key
@@ -44,10 +63,20 @@ class LocalStorage:
         return path.read_bytes() if path.is_file() else None
 
     def list(self, prefix: str) -> list[str]:
+        return sorted(self.sizes(prefix))
+
+    def sizes(self, prefix: str) -> dict[str, int | None]:
+        """Every object under a prefix, with its size in bytes."""
         base = self.root / prefix
         if not base.is_dir():
-            return []
-        return sorted(f"{prefix}{p.name}" for p in base.iterdir() if p.is_file())
+            return {}
+        return {
+            f"{prefix}{p.name}": p.stat().st_size
+            for p in base.iterdir()
+            # A write that was killed mid-way leaves its partial behind; it is
+            # not an object.
+            if p.is_file() and not p.name.endswith(_PARTIAL)
+        }
 
     def delete(self, key: str) -> None:
         (self.root / key).unlink(missing_ok=True)
@@ -89,19 +118,25 @@ class S3Storage:
         return obj["Body"].read()
 
     def list(self, prefix: str) -> list[str]:
-        keys: list[str] = []
+        return sorted(self.sizes(prefix))
+
+    def sizes(self, prefix: str) -> dict[str, int | None]:
+        """Every object under a prefix, with its size in bytes (None where the
+        listing does not say)."""
+        found: dict[str, int | None] = {}
         token: str | None = None
+        strip = len(self.prefix)
         while True:
             kwargs = {"Bucket": self.bucket, "Prefix": self._key(prefix)}
             if token:
                 kwargs["ContinuationToken"] = token
             page = self.client.list_objects_v2(**kwargs)
-            keys.extend(o["Key"] for o in page.get("Contents", []))
+            for entry in page.get("Contents", []):
+                found[entry["Key"][strip:]] = entry.get("Size")
             if not page.get("IsTruncated"):
                 break
             token = page.get("NextContinuationToken")
-        strip = len(self.prefix)
-        return sorted(k[strip:] for k in keys)
+        return found
 
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=self._key(key))

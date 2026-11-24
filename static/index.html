@@ -15,27 +15,32 @@
   <noscript>
     <p style="padding:20px;font-family:sans-serif">Life Style Track needs JavaScript — it keeps
     working offline by queueing entries on this device, which a static page cannot do.</p>
+    <p dir="rtl" lang="ar" style="padding:0 20px 20px;font-family:sans-serif">يحتاج Life Style Track إلى
+    JavaScript — فهو يعمل دون اتصال بحفظ الإدخالات على هذا الجهاز، وهذا ما لا تستطيعه صفحة ثابتة.</p>
   </noscript>
   <header id="topbar" hidden>
     <h1>Life Style Track</h1>
     <button id="sync-pill" type="button" role="status" aria-live="polite"
-            title="Sync status — tap for details"><span class="dot" aria-hidden="true"></span><span id="sync-text">…</span></button>
+            title="Sync status — tap for details" data-i18n-title="Sync status — tap for details"><span class="dot" aria-hidden="true"></span><span id="sync-text">…</span></button>
   </header>
 
   <div id="status-banner" role="status" hidden></div>
 
   <div id="session-banner" hidden>
-    Session expired — logging still works and syncs after you <a href="#/login">sign in</a>.
+    <span data-i18n="Session expired — logging still works and syncs after you">Session expired — logging still works and syncs after you</span>
+    <a href="#/login" data-i18n="sign in">sign in</a>.
   </div>
 
   <main id="view"></main>
 
   <nav id="tabs" hidden>
-    <a href="#/items" data-tab="items">Items</a>
-    <a href="#/reports" data-tab="reports">Reports</a>
-    <a href="#/office" data-tab="office">Office</a>
+    <a href="#/items" data-tab="items" data-i18n="Items">Items</a>
+    <a href="#/reports" data-tab="reports" data-i18n="Reports">Reports</a>
+    <a href="#/office" data-tab="office" data-i18n="Office">Office</a>
   </nav>
 
+  <script src="/static/js/ar.js"></script>
+  <script src="/static/js/i18n.js"></script>
   <script src="/static/js/db.js"></script>
   <script src="/static/js/app.js"></script>
 </body>

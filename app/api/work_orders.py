@@ -28,8 +28,16 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/work-orders", tags=["work orders"])
 
 
-def _get(db: Session, work_order_id: uuid.UUID) -> WorkOrder:
-    work_order = db.get(WorkOrder, work_order_id, options=[selectinload(WorkOrder.lines)])
+def _get(db: Session, work_order_id: uuid.UUID, for_update: bool = False) -> WorkOrder:
+    """`for_update` when it is about to be re-issued or deleted: the row is
+    locked until the request commits, so two saves of one work order go one
+    after the other. Unlocked, both read revision N, both wrote their lines,
+    and the document came out with every line twice. (SQLite has no row locks
+    and ignores it.)"""
+    work_order = db.get(
+        WorkOrder, work_order_id, options=[selectinload(WorkOrder.lines)],
+        with_for_update=for_update,
+    )
     if work_order is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown work order")
     return work_order
@@ -99,7 +107,7 @@ def reissue(
     user: User = Depends(current_user),
 ) -> dict:
     """Save changes as the next revision, stamped with who and when."""
-    return _save(db, user, payload, _get(db, work_order_id))
+    return _save(db, user, payload, _get(db, work_order_id, for_update=True))
 
 
 @router.delete("/{work_order_id}")
@@ -108,7 +116,7 @@ def delete(
 ) -> dict:
     """Remove a work order that should not have been issued. Its number is not
     reused while a later one exists. Nothing about its items changes."""
-    work_order = _get(db, work_order_id)
+    work_order = _get(db, work_order_id, for_update=True)
     log.warning(
         "%s rev %d deleted by %s", work_orders.label(work_order), work_order.revision, admin.username
     )

@@ -18,6 +18,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.models import Event, StatusBanner, User
+from app.services.backups import dump_keys
 from app.storage import get_storage
 
 log = logging.getLogger(__name__)
@@ -95,6 +96,9 @@ def backup_status() -> dict:
     except Exception:  # storage unreachable must not take the status page down
         log.exception("could not list backups")
         return {"available": False, "count": 0, "last_key": None, "last_at": None}
+    # Only the backup job's own files: something else left in that folder is
+    # not "the last backup", whatever its name sorts as.
+    keys = dump_keys(keys)
     last_at = None
     last_key = keys[-1] if keys else None
     if last_key:
