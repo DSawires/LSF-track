@@ -51,6 +51,7 @@ def reference(db: Session = Depends(get_db, scope="function"), user: User = Depe
                 "id": str(s.id),
                 "code": s.code,
                 "name": s.name,
+                "name_ar": s.name_ar,
                 "sort_order": s.sort_order,
                 "is_active": s.is_active,
                 "requires_station": s.requires_station,
@@ -67,6 +68,7 @@ def reference(db: Session = Depends(get_db, scope="function"), user: User = Depe
                 "stage_id": str(s.stage_id),
                 "code": s.code,
                 "name": s.name,
+                "name_ar": s.name_ar,
                 "sort_order": s.sort_order,
                 "is_active": s.is_active,
             }

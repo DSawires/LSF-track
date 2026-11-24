@@ -426,6 +426,25 @@ function toast(message) {
 /* ------------------------------------------------------- derived helpers -- */
 
 function stageById(id) { return S.ref?.stages.find((s) => s.id === id); }
+
+/* A picture's small copy, for icons and grids: a few KB where the picture is a
+   few hundred. The server falls back to the whole picture for one stored
+   before thumbnails existed. */
+const thumbOf = (url) => (url ? `${url}/thumb` : url);
+
+/* After deleting a picture: this device must not go on serving it out of its
+   own image cache, where picture URLs are kept for good. Other devices hold a
+   copy until theirs trims -- the price of photos that load in a dead spot. */
+function forgetImage(url) {
+  for (const each of [url, thumbOf(url)]) {
+    navigator.serviceWorker?.controller?.postMessage({ type: "drop-image", url: each });
+  }
+}
+
+/* A stage's or station's name as this phone reads it: the Arabic one when the
+   phone is set to Arabic and the factory has given one, the name otherwise.
+   Names are data (rule 2), so they are never run through t(). */
+const localName = (row) => (row && LSF_I18N.lang() === "ar" && row.name_ar) || row?.name || "";
 function eventType(id) { return (S.ref?.event_types || []).find((t) => t.id === id); }
 function finishType() { return (S.ref?.event_types || []).find((t) => t.is_finish && t.is_active); }
 const activeStages = () =>
@@ -464,7 +483,7 @@ function batchLabel(item) {
 function placeName(key) {
   if (key === UNSTARTED) return t("Not started");
   if (key === DONE) return t("Done");
-  return stageById(key)?.name || "?";
+  return localName(stageById(key)) || "?";
 }
 
 /* An item is project + code + area + phase: the same code can be several
@@ -1082,7 +1101,7 @@ function viewItems() {
   // that is quietly missing things.
   const active = [
     projects.find((p) => p.id === filterProject)?.code,
-    stages.find((s) => s.id === filterStage)?.name,
+    localName(stages.find((s) => s.id === filterStage)),
     areas.find((a) => a.id === filterArea)?.name,
     phases.find((ph) => ph.id === filterPhase)?.name,
     filterProgress ? t(PROGRESS.find(([id]) => id === filterProgress)?.[1] || "") : "",
@@ -1107,7 +1126,7 @@ function viewItems() {
       </select>
       <select id="f-stage" aria-label="${esc(t("Stage"))}">
         <option value="">${t("All stages")}</option>
-        ${stages.map((s) => `<option value="${s.id}" ${s.id === filterStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
+        ${stages.map((s) => `<option value="${s.id}" ${s.id === filterStage ? "selected" : ""}>${esc(localName(s))}</option>`).join("")}
       </select>
       ${areas.length ? `
       <select id="f-area" aria-label="${esc(t("Area"))}">
@@ -1227,7 +1246,7 @@ function itemRow(item) {
     <div>
       <a class="item-head" href="#/items/${item.id}">
         <div style="display:flex;gap:10px;align-items:flex-start">
-          ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
+          ${item.icon_url ? `<img class="item-icon" src="${thumbOf(item.icon_url)}" alt="" loading="lazy">` : ""}
           <div style="flex:1;min-width:0">
             <div class="spread">
               <strong>${esc(item.code)}</strong>
@@ -1402,10 +1421,10 @@ function viewLogScreen(itemId, fromKey) {
   // another booth, not a move to nowhere.
   const targets = splitting
     // The parts start wherever they start: not started, or at a stage.
-    ? [{ key: UNSTARTED, label: t("Not started") }, ...activeStages().map((st) => ({ key: st.id, label: st.name }))]
+    ? [{ key: UNSTARTED, label: t("Not started") }, ...activeStages().map((st) => ({ key: st.id, label: localName(st) }))]
     : activeStages()
       .filter((st) => st.id !== logSel.from || st.requires_station)
-      .map((st) => ({ key: st.id, label: st.name }));
+      .map((st) => ({ key: st.id, label: localName(st) }));
   // Plain "Done": a tick in the label reads as "selected", which is what a
   // tick means on every other button of these pickers.
   if (!splitting && finish && !type?.is_rework && logSel.from !== DONE) targets.push({ key: DONE, label: t("Done") });
@@ -1465,7 +1484,7 @@ function viewLogScreen(itemId, fromKey) {
   $view.innerHTML = `
     <div class="card">
       <div style="display:flex;gap:12px;align-items:center">
-        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : ""}
+        ${item.icon_url ? `<img class="item-icon" src="${thumbOf(item.icon_url)}" alt="">` : ""}
         <div style="flex:1;min-width:0">
           <div class="spread">
             <h2>${esc(item.code)}</h2>
@@ -1496,7 +1515,7 @@ function viewLogScreen(itemId, fromKey) {
 
       ${seg("to", splitting ? t("The parts go to") : type?.is_rework ? t("Send back to") : t("Now at"), targets, logSel.to)}
 
-      ${stage?.requires_station ? seg("station", t("Station"), stations.map((st) => ({ key: st.id, label: st.name })), logSel.stationId) : ""}
+      ${stage?.requires_station ? seg("station", t("Station"), stations.map((st) => ({ key: st.id, label: localName(st) })), logSel.stationId) : ""}
 
       ${!splitting && type?.requires_reason_code ? `
       <label for="sel-reason">${t("Reason")}</label>
@@ -1775,7 +1794,7 @@ function assembleCard(item, parts) {
     return { part, options, sets: picked ? Math.floor(picked.qty / part.per_unit) : 0 };
   });
   const most = Math.min(...rows.map((r) => r.sets));
-  const targets = activeStages().map((st) => ({ key: st.id, label: st.name }));
+  const targets = activeStages().map((st) => ({ key: st.id, label: localName(st) }));
   if (finishType()) targets.push({ key: DONE, label: t("Done") });
   if (!targets.some((target) => target.key === sel.to)) sel.to = null;
   const stage = sel.to && sel.to !== DONE ? stageById(sel.to) : null;
@@ -1801,7 +1820,7 @@ function assembleCard(item, parts) {
       <p class="muted" style="margin:2px 0 0">${tn(sets, "enough for {n} piece", "enough for {n} pieces")}</p>`
       : `<p class="warn-text" style="margin:2px 0 0">${esc(t("None on the floor — split some {code} first.", { code: item.code }))}</p>`}`).join("")}
       ${seg("asm-to", t("The assembled pieces are now at"), targets, sel.to)}
-      ${stage?.requires_station ? seg("asm-station", t("Station"), stations.map((st) => ({ key: st.id, label: st.name })), sel.stationId) : ""}
+      ${stage?.requires_station ? seg("asm-station", t("Station"), stations.map((st) => ({ key: st.id, label: localName(st) })), sel.stationId) : ""}
       <label for="asm-qty">${t("Pieces assembled")}</label>
       <input id="asm-qty" type="number" inputmode="numeric" min="1" value="${esc(qty)}">
       <p class="muted" style="margin-top:5px">${tn(most, "The parts on hand make {n} piece.", "The parts on hand make {n} pieces.")}</p>
@@ -2014,7 +2033,7 @@ async function loadPhotos(item) {
           ${images.map((img) => `
             <div>
               <a href="${img.url}" target="_blank" rel="noopener" style="position:relative;display:block">
-                <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy"
+                <img src="${img.thumb_url || img.url}" alt="${esc(img.note || img.filename)}" loading="lazy"
                      style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;border:1px solid var(--line)">
                 ${img.kind === "icon" ? `<span class="badge" style="position:absolute;top:4px;inset-inline-start:4px;background:rgba(0,0,0,.55)">${t("icon")}</span>` : ""}
               </a>
@@ -2126,7 +2145,7 @@ const reportsView = { asked: 0, showAging: false };
 
 /* An aging row's place: the stage, as the factory named it, or "Not started"
    -- which the server says in English, so it is said here instead. */
-const agingWhere = (row) => (row.stage ? row.label : t("Not started"));
+const agingWhere = (row) => (row.stage ? localName(row.stage) : t("Not started"));
 
 /* The exceptions view's badges. These are the ledger's own fixed codes, not
    factory vocabulary; one it does not know yet is shown as the code. */
@@ -2203,7 +2222,7 @@ async function viewReports() {
       </select>
       <select id="r-stage" aria-label="${esc(t("Stage"))}">
         <option value="">${t("All stages")}</option>
-        ${stages.map((s) => `<option value="${s.id}" ${s.id === fStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
+        ${stages.map((s) => `<option value="${s.id}" ${s.id === fStage ? "selected" : ""}>${esc(localName(s))}</option>`).join("")}
       </select>
       ${areas.length ? `
       <select id="r-area" aria-label="${esc(t("Area"))}">
@@ -2227,19 +2246,19 @@ async function viewReports() {
       ${wip.stages.map((row) => `
         <button class="wip-row${row.stage.id === fStage ? " on" : ""}" data-wip-stage="${row.stage.id}" aria-pressed="${row.stage.id === fStage}">
           <span class="spread">
-            <strong>${esc(row.stage.name)}</strong>
+            <strong>${esc(localName(row.stage))}</strong>
             <span class="muted">${pcs(row.total_qty)} · ${tn(row.item_count, "{n} item", "{n} items")}${row.sample_qty ? ` · <span class="badge sample">${t("{n} sample", { n: row.sample_qty })}</span>` : ""}${row.reworked_qty ? ` · <span class="badge rework">${t("rework {n}", { n: row.reworked_qty })}</span>` : ""}</span>
           </span>
           <span class="bar-track" style="margin:4px 0"><span class="bar-fill" style="width:${(row.total_qty / maxQty) * 100}%"></span></span>
           ${row.stage.requires_station ? row.stations.map((s) =>
-            `<span class="muted">· ${s.station ? esc(s.station.name) : t("No station yet")}: ${s.total_qty}</span>`).join("") : ""}
+            `<span class="muted">· ${s.station ? `<bdi>${esc(localName(s.station))}</bdi>` : t("No station yet")}: ${s.total_qty}</span>`).join("") : ""}
         </button>`).join("") || `<p class="muted">${t("Nothing in progress.")}</p>`}
       ${wip.unstarted.qty ? `<p class="muted">${t("Not started: {qty} across {items}", { qty: pcs(wip.unstarted.qty), items: tn(wip.unstarted.item_count, "{n} item", "{n} items") })}</p>` : ""}
     </div>
 
     <div class="card" id="aging-card">
       <h2>${fStage
-        ? esc(t("Aging — days at {stage}", { stage: stages.find((s) => s.id === fStage)?.name || t("current stage") }))
+        ? esc(t("Aging — days at {stage}", { stage: localName(stages.find((s) => s.id === fStage)) || t("current stage") }))
         : t("Aging — days at current stage")}</h2>
       <div class="table-scroll">
       <table>
@@ -2728,7 +2747,7 @@ function itemLookup(target, items, projectCode) {
       <p class="muted" style="margin:0 0 4px">${found.length === pool.length ? tn(pool.length, "{n} item", "{n} items") : t("{n} of {total} items", { n: found.length, total: pool.length })}</p>
       ${found.slice(0, LOOKUP_SHOWN).map((item) => `
       <a class="lookup-row" href="#/office/items/${item.id}">
-        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
+        ${item.icon_url ? `<img class="item-icon" src="${thumbOf(item.icon_url)}" alt="" loading="lazy">` : ""}
         <span style="min-width:0;flex:1">
           <strong>${esc(item.code)}</strong>
           <span class="badge">${esc(projectCode.get(item.project_id) || t("no project"))}</span>
@@ -2788,7 +2807,7 @@ async function loadEditorPhotos(itemId, canDelete) {
         ${images.map((img) => `
           <div class="photo-tile">
             <a href="${img.url}" target="_blank" rel="noopener">
-              <img src="${img.url}" alt="${esc(img.note || img.filename)}" loading="lazy">
+              <img src="${img.thumb_url || img.url}" alt="${esc(img.note || img.filename)}" loading="lazy">
             </a>
             ${img.kind === "icon" ? `<span class="badge" style="position:absolute;bottom:4px;inset-inline-start:4px;background:rgba(0,0,0,.55)">${t("icon")}</span>` : ""}
             ${canDelete ? `<button class="drop" data-drop="${img.id}" aria-label="${esc(t("Delete this photo"))}"
@@ -2807,11 +2826,7 @@ async function loadEditorPhotos(itemId, canDelete) {
       if (!confirm(question)) return;
       try {
         await api(`/api/images/${image.id}`, { method: "DELETE" });
-        // The device that just deleted it must not keep serving it back out of
-        // its own image cache. Other devices hold a copy until theirs trims --
-        // image URLs name immutable bytes and are cached hard, which is the
-        // price of photos that load instantly in a dead spot.
-        navigator.serviceWorker?.controller?.postMessage({ type: "drop-image", url: image.url });
+        forgetImage(image.url);
         editorPhotos.delete(itemId);
         logScreenCache.fetchedAt = 0; // the log screen's copy is stale too
         toast(t("Photo deleted"));
@@ -2893,7 +2908,7 @@ async function loadItemEditors() {
   const piece = open.parent_item_id ? items.find((i) => i.id === open.parent_item_id) : null;
   target.innerHTML = [open].map((item) => `
       <div style="display:flex;gap:12px;align-items:center">
-        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : ""}
+        ${item.icon_url ? `<img class="item-icon" src="${thumbOf(item.icon_url)}" alt="">` : ""}
         <div style="flex:1;min-width:0">
           <h2 style="margin:0">${esc(item.code)}</h2>
           <div style="margin:3px 0">
@@ -2934,7 +2949,12 @@ async function loadItemEditors() {
 
         <label style="margin-top:12px">${t("Item icon")}</label>
         <div style="display:flex;gap:10px;align-items:center">
-          ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="">` : `<span class="muted">${t("None yet.")}</span>`}
+          ${item.icon_url ? `
+          <div class="photo-tile icon-tile">
+            <a href="${item.icon_url}" target="_blank" rel="noopener"><img class="item-icon" src="${thumbOf(item.icon_url)}" alt=""></a>
+            ${isAdmin ? `<button class="drop" data-drop-icon="${item.id}" aria-label="${esc(t("Delete the icon"))}"
+                    title="${esc(t("Delete the icon"))}" ${S.online ? "" : "disabled"}>✕</button>` : ""}
+          </div>` : `<span class="muted">${t("None yet.")}</span>`}
           <div style="flex:1">
             ${photoPicker(`icon:${item.id}`, {
               camera: t("Photograph it"),
@@ -3028,6 +3048,29 @@ async function loadItemEditors() {
         status.fail(error.detail);
       } finally {
         clearPicker(`icon:${id}`);
+      }
+    };
+  });
+
+  // The ✕ on the icon. The icon is the newest icon-kind picture, so deleting
+  // it brings back the one before, if there was one.
+  target.querySelectorAll("[data-drop-icon]").forEach((button) => {
+    button.onclick = async () => {
+      const item = byId.get(button.dataset.dropIcon);
+      if (!item?.icon_url) return;
+      if (!confirm(t("Delete the icon of {code}? The picture goes for good; an earlier icon, if there was one, takes its place.", { code: item.code }))) return;
+      button.disabled = true;
+      try {
+        await api(`/api/images/${iconId(item)}`, { method: "DELETE" });
+        forgetImage(item.icon_url);
+        editorPhotos.delete(item.id);
+        logScreenCache.fetchedAt = 0;
+        toast(t("Icon deleted"));
+        await sync(); // the item list is drawn with the icon
+        loadItemEditors();
+      } catch (error) {
+        button.disabled = !S.online;
+        alert(error.body?.detail || t("Could not delete the photo."));
       }
     };
   });
@@ -3202,7 +3245,7 @@ function phaseMover(item, items) {
   if (!options.length) return "";
   const planned = item.state?.phase !== "production";
   const places = planned ? [] : (item.state?.positions || [])
-    .map((p) => ({ key: p.is_unstarted ? UNSTARTED : p.stage_id, name: p.is_unstarted ? t("Not started") : p.stage_name, qty: p.qty - (p.sample_qty || 0) }))
+    .map((p) => ({ key: p.is_unstarted ? UNSTARTED : p.stage_id, name: p.is_unstarted ? t("Not started") : localName(stageById(p.stage_id)) || p.stage_name, qty: p.qty - (p.sample_qty || 0) }))
     .filter((p) => p.qty > 0);
   if (!planned && !places.length) return "";
   return `
@@ -4038,7 +4081,7 @@ function workOrderEditor(body, projects) {
     $lines.innerHTML = draft.lines.map((line, index) => `
       <div class="wo-line" data-wo-line="${line.key}">
         <div class="wo-pic">
-          ${line.image_url ? `<img src="${line.image_url}" alt="">` : `<span class="muted">${t("No picture")}</span>`}
+          ${line.image_url ? `<img src="${thumbOf(line.image_url)}" alt="">` : `<span class="muted">${t("No picture")}</span>`}
           ${line.item_id ? `
           <label class="ghost button-link wo-pic-btn">${t("Change")}
             <input type="file" accept="image/*" data-wo-pic="${line.key}" hidden ${S.online ? "" : "disabled"}>
@@ -4088,7 +4131,7 @@ function workOrderEditor(body, projects) {
     document.getElementById("wo-add-all").disabled = !found.length;
     $results.innerHTML = shown.map((item) => `
       <div class="pick-row" style="cursor:default">
-        ${item.icon_url ? `<img class="item-icon" src="${item.icon_url}" alt="" loading="lazy">` : ""}
+        ${item.icon_url ? `<img class="item-icon" src="${thumbOf(item.icon_url)}" alt="" loading="lazy">` : ""}
         <span style="min-width:0;flex:1">
           <strong>${esc(item.code)}</strong> ${itemTags(item)}
           <br><span class="muted">${pcs(item.total_qty)}${item.description ? ` · <bdi>${esc(item.description)}</bdi>` : ""}</span>
@@ -4333,8 +4376,10 @@ function officeStages(body) {
         <summary class="muted" style="cursor:pointer">${t("New stage")}</summary>
         <div class="field-grid" style="margin-top:8px">
           <div><label for="ns-name">${t("Name")}</label><input id="ns-name" dir="auto" placeholder="${esc(t("Glass shop"))}"></div>
-          <div><label for="ns-sort">${t("Sort order")}</label><input id="ns-sort" type="number" inputmode="numeric"></div>
+          <div><label for="ns-name-ar">${t("Name in Arabic")}</label><input id="ns-name-ar" dir="rtl" lang="ar" maxlength="120" placeholder="${esc(t("optional"))}"></div>
         </div>
+        <label for="ns-sort">${t("Sort order")}</label>
+        <input id="ns-sort" type="number" inputmode="numeric">
         <label for="ns-days">${t("Flag as aging after (days — empty for never)")}</label>
         <input id="ns-days" type="number" inputmode="numeric" min="1" max="365" value="3">
         <div id="ns-flags"></div>
@@ -4617,14 +4662,16 @@ function renderStageAdmin() {
     return `
       <details data-panel="stage:${s.id}" style="padding:4px 0;border-bottom:1px solid var(--line)">
         <summary style="cursor:pointer;padding:6px 0">
-          <strong>${esc(s.name)}</strong>${s.is_active ? "" : ` <span class="badge">${t("inactive")}</span>`}
-          <br><span class="muted">${esc(flagSummary || t("no flags"))}${stations.length ? ` · ${t("stations:")} ${stations.map((st) => esc(st.name) + (st.is_active ? "" : ` ${t("(off)")}`)).join(t(", "))}` : ""}</span>
+          <strong>${esc(localName(s))}</strong>${s.is_active ? "" : ` <span class="badge">${t("inactive")}</span>`}
+          <br><span class="muted">${esc(flagSummary || t("no flags"))}${stations.length ? ` · ${t("stations:")} ${stations.map((st) => `<bdi>${esc(localName(st))}</bdi>` + (st.is_active ? "" : ` ${t("(off)")}`)).join(t(", "))}` : ""}</span>
         </summary>
         <div style="padding:8px 0 12px">
           <div class="field-grid">
             <div><label>${t("Name")}</label><input data-stage-name="${s.id}" value="${esc(s.name)}" dir="auto"></div>
-            <div><label>${t("Sort order")}</label><input data-stage-sort="${s.id}" type="number" inputmode="numeric" value="${s.sort_order}"></div>
+            <div><label>${t("Name in Arabic")}</label><input data-stage-name-ar="${s.id}" value="${esc(s.name_ar || "")}" dir="rtl" lang="ar" maxlength="120" placeholder="${esc(t("optional"))}"></div>
           </div>
+          <label>${t("Sort order")}</label>
+          <input data-stage-sort="${s.id}" type="number" inputmode="numeric" value="${s.sort_order}">
           <label>${t("Flag as aging after (days — empty for never, e.g. outsourced)")}</label>
           <input data-stage-days="${s.id}" type="number" inputmode="numeric" min="1" max="365"
                  placeholder="${esc(t("no threshold"))}" value="${s.max_days_in_state ?? ""}">
@@ -4637,8 +4684,10 @@ function renderStageAdmin() {
           <div style="border:1px solid var(--line);border-radius:var(--radius);padding:8px 10px;margin-top:10px">
             <div class="field-grid">
               <div><label>${t("Station")}${st.is_active ? "" : ` <span class="badge">${t("inactive")}</span>`}</label><input data-st-name="${st.id}" value="${esc(st.name)}" dir="auto"></div>
-              <div><label>${t("Sort order")}</label><input data-st-sort="${st.id}" type="number" inputmode="numeric" value="${st.sort_order}"></div>
+              <div><label>${t("Name in Arabic")}</label><input data-st-name-ar="${st.id}" value="${esc(st.name_ar || "")}" dir="rtl" lang="ar" maxlength="120" placeholder="${esc(t("optional"))}"></div>
             </div>
+            <label>${t("Sort order")}</label>
+            <input data-st-sort="${st.id}" type="number" inputmode="numeric" value="${st.sort_order}">
             <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
               <button class="ghost" data-st-save="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Save")}</button>
               <button class="ghost" data-st-toggle="${st.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${st.is_active ? t("Deactivate") : t("Reactivate")}</button>
@@ -4646,7 +4695,7 @@ function renderStageAdmin() {
           </div>`).join("")}
           <label style="margin-top:10px">${t("Add station")}</label>
           <div class="qty-row">
-            <input data-station-name="${s.id}" dir="auto" placeholder="${esc(t("e.g. {name}", { name: `${s.name} ${stations.length + 1}` }))}" style="flex:1;text-align:start;padding:10px">
+            <input data-station-name="${s.id}" dir="auto" placeholder="${esc(t("e.g. {name}", { name: `${localName(s)} ${stations.length + 1}` }))}" style="flex:1;text-align:start;padding:10px">
             <button class="ghost" data-station-add="${s.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${t("Add")}</button>
           </div>
         </div>
@@ -4669,6 +4718,8 @@ function renderStageAdmin() {
       const days = document.querySelector(`[data-stage-days="${id}"]`).value.trim();
       patchStage(id, {
         name: document.querySelector(`[data-stage-name="${id}"]`).value.trim(),
+        // Empty clears it: the stage is then shown by its name in Arabic too.
+        name_ar: document.querySelector(`[data-stage-name-ar="${id}"]`).value.trim(),
         sort_order: Number(document.querySelector(`[data-stage-sort="${id}"]`).value) || 0,
         max_days_in_state: days ? Number(days) : null,
         ...readFlags(id),
@@ -4699,6 +4750,7 @@ function renderStageAdmin() {
       if (!name) return;
       patchStation(id, {
         name,
+        name_ar: document.querySelector(`[data-st-name-ar="${id}"]`).value.trim(),
         sort_order: Number(document.querySelector(`[data-st-sort="${id}"]`).value) || 0,
       }, t("Station updated"));
     };
@@ -4712,7 +4764,7 @@ function renderStageAdmin() {
       // forbid it: a stage can legitimately lose its last machine.
       const lastActive = station.is_active && stage?.requires_station && !S.ref.stations.some(
         (st) => st.stage_id === station.stage_id && st.id !== station.id && st.is_active);
-      if (lastActive && !confirm(t("{station} is the last active station at {stage}. Entries logged there will carry no station until one is added back. Deactivate anyway?", { station: station.name, stage: stage.name }))) return;
+      if (lastActive && !confirm(t("{station} is the last active station at {stage}. Entries logged there will carry no station until one is added back. Deactivate anyway?", { station: localName(station), stage: localName(stage) }))) return;
       patchStation(station.id, { is_active: !station.is_active },
         station.is_active ? t("Station deactivated") : t("Station reactivated"));
     };
@@ -4755,6 +4807,7 @@ function renderStageAdmin() {
         body: JSON.stringify({
           code: slugify(name),
           name,
+          name_ar: document.getElementById("ns-name-ar").value.trim(),
           sort_order: Number(document.getElementById("ns-sort").value) || 0,
           max_days_in_state: days ? Number(days) : null,
           ...readFlags("new"),

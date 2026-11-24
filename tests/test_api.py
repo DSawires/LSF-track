@@ -12,6 +12,7 @@ from app.db import utcnow
 from app.main import app
 from app.models import Event
 from tests.conftest import hours_ago
+from tests.pictures import close, decoded, picture
 
 
 def _event_body(factory, item, seq, qty, station_code=None, **extra):
@@ -373,7 +374,7 @@ def test_image_upload_roundtrip_and_format_sniff(world, client, tmp_path, monkey
     get_settings.cache_clear()
 
     factory, _stages, item = world
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    png = picture("PNG", size=(3000, 1500))
     up = client.post(
         f"/api/items/{item.id}/images",
         files={"file": ("shelf.png", png, "image/png")},
@@ -381,12 +382,21 @@ def test_image_upload_roundtrip_and_format_sniff(world, client, tmp_path, monkey
     )
     assert up.status_code == 201
     body = up.json()
-    assert body["content_type"] == "image/png"
+    # Kept as WebP, never as sent: the display copy at most 2048 px on its
+    # long edge, proportions kept, and a thumbnail beside it.
+    assert body["content_type"] == "image/webp"
     assert body["note"] == "veneer chip on corner"
 
     served = client.get(body["url"])
     assert served.status_code == 200
-    assert served.content == png
+    assert served.headers["content-type"] == "image/webp"
+    fmt, size, colour = decoded(served.content)
+    assert (fmt, size) == ("WEBP", (2048, 1024)) and close(colour, (200, 40, 40))
+    assert body["size_bytes"] == len(served.content)
+    thumb = client.get(body["thumb_url"])
+    assert thumb.status_code == 200
+    assert decoded(thumb.content)[:2] == ("WEBP", (320, 160))
+    assert "immutable" in thumb.headers["cache-control"]
 
     listed = client.get(f"/api/items/{item.id}/images").json()["images"]
     assert [i["id"] for i in listed] == [body["id"]]
@@ -397,6 +407,13 @@ def test_image_upload_roundtrip_and_format_sniff(world, client, tmp_path, monkey
         files={"file": ("evil.png", b"MZ\x90\x00" + b"\x00" * 64, "image/png")},
     )
     assert fake.status_code == 422
+    # So is one that starts like a picture but is not one.
+    broken = client.post(
+        f"/api/items/{item.id}/images",
+        files={"file": ("half.png", png[:40], "image/png")},
+    )
+    assert broken.status_code == 422
+    assert "not a readable image" in broken.json()["detail"]
     get_settings.cache_clear()
 
 
@@ -407,19 +424,20 @@ def test_deleting_an_image_removes_the_row_and_the_bytes(world, client, tmp_path
     get_settings.cache_clear()
 
     factory, _stages, item = world
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    png = picture()
     snag = client.post(
         f"/api/items/{item.id}/images",
         files={"file": ("chip.png", png, "image/png")},
         data={"kind": "snag"},
     ).json()
     on_disk = tmp_path / "uploads" / "images" / snag["id"]
-    assert on_disk.is_file()
+    thumb_on_disk = tmp_path / "uploads" / "images" / f"{snag['id']}.thumb"
+    assert on_disk.is_file() and thumb_on_disk.is_file()
 
     gone = client.delete(f"/api/images/{snag['id']}")
     assert gone.status_code == 200
     assert gone.json()["deleted"] is True
-    assert not on_disk.exists()
+    assert not on_disk.exists() and not thumb_on_disk.exists()
     assert client.get(f"/api/items/{item.id}/images").json()["images"] == []
     assert client.get(snag["url"]).status_code == 404
     # Deleting it twice is a 404, not a 500: the second tap of a slow button.
@@ -436,7 +454,7 @@ def test_deleting_an_icon_falls_back_to_the_previous_one(world, client, tmp_path
     get_settings.cache_clear()
 
     factory, _stages, item = world
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    png = picture()
     first = client.post(
         f"/api/items/{item.id}/images",
         files={"file": ("old.png", png, "image/png")},
@@ -467,7 +485,7 @@ def test_image_deletion_is_admin_only(world, client, factory, tmp_path, monkeypa
     get_settings.cache_clear()
 
     _factory, _stages, item = world
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    png = picture()
     snag = client.post(
         f"/api/items/{item.id}/images",
         files={"file": ("chip.png", png, "image/png")},
@@ -557,7 +575,7 @@ def test_icon_kind_surfaces_on_item_list(world, client, tmp_path, monkeypatch):
     get_settings.cache_clear()
 
     factory, _stages, item = world
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    png = picture()
 
     snag = client.post(
         f"/api/items/{item.id}/images",
@@ -775,14 +793,14 @@ def test_an_item_with_photos_can_be_deleted_for_good(world, client, tmp_path, mo
 
     get_settings.cache_clear()
     factory, _stages, item = world
-    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    png = picture()
     for kind in ("icon", "snag"):
         made = client.post(
             f"/api/items/{item.id}/images", files={"file": ("p.png", png, "image/png")}, data={"kind": kind}
         )
         assert made.status_code == 201
     stored = list((tmp_path / "uploads" / "images").iterdir())
-    assert len(stored) == 2
+    assert len(stored) == 4  # a display copy and a thumbnail each
 
     gone = client.delete(f"/api/items/{item.id}?purge=true")
     assert gone.status_code == 200 and gone.json()["deleted"] is True

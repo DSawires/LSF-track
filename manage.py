@@ -5,6 +5,7 @@
     python manage.py seed                    # idempotent vocabularies
     python manage.py create-user NAME [--admin]
     python manage.py demo                    # a small demo factory with history
+    python manage.py compress-images         # convert pictures stored before WebP
 
 Adding a stage needs no command here at all -- it is an INSERT into `stages`
 (plus its stations), exactly as CLAUDE.md describes. It is on the palette for the
@@ -319,6 +320,54 @@ def cmd_bootstrap(_args) -> None:
         print(f"bootstrap: created admin {username}")
 
 
+def cmd_compress_images(_args) -> None:
+    """Bring pictures stored before compression into line: each becomes the
+    WebP display copy and thumbnail an upload makes now, and the original is
+    replaced. A picture that already has its thumbnail is done and skipped,
+    so this can be stopped and run again; each picture is committed on its
+    own. One that cannot be decoded is left as it is and reported."""
+    import sqlalchemy as sa
+
+    from app.models import ItemImage
+    from app.services import images as pictures
+    from app.storage import get_storage
+
+    storage = get_storage()
+    present = set(storage.sizes("images/"))
+    done = skipped = failed = missing = 0
+    before = after = 0
+    with get_sessionmaker()() as db:
+        ids = list(db.scalars(sa.select(ItemImage.id).order_by(ItemImage.uploaded_at)))
+        for image_id in ids:
+            if pictures.thumb_key(image_id) in present:
+                skipped += 1
+                continue
+            data = storage.read(pictures.image_key(image_id))
+            if data is None:
+                missing += 1
+                continue
+            try:
+                prepared = pictures.prepare(data)
+            except pictures.Unreadable as error:
+                failed += 1
+                print(f"  {image_id}: left as it is ({error})")
+                continue
+            image = db.get(ItemImage, image_id)
+            image.size_bytes = pictures.store(storage, image_id, prepared)
+            image.content_type = pictures.STORED_TYPE
+            db.commit()
+            before += len(data)
+            after += image.size_bytes + len(prepared.thumb)
+            done += 1
+            if done % 50 == 0:
+                print(f"  {done} converted…")
+    mb = lambda n: f"{n / (1024 * 1024):.1f} MB"  # noqa: E731
+    print(
+        f"converted {done} ({mb(before)} -> {mb(after)}), already done {skipped}, "
+        f"unreadable {failed}, missing from storage {missing}"
+    )
+
+
 def cmd_demo(_args) -> None:
     from seeds.demo import run
 
@@ -360,6 +409,7 @@ def main() -> None:
     p_restore.set_defaults(func=cmd_restore)
 
     sub.add_parser("demo").set_defaults(func=cmd_demo)
+    sub.add_parser("compress-images").set_defaults(func=cmd_compress_images)
 
     args = parser.parse_args()
     args.func(args)

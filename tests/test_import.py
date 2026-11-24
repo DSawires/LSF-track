@@ -11,6 +11,7 @@ import io
 import sqlalchemy as sa
 
 from app.models import Item, Project
+from tests.pictures import close, decoded, picture
 
 HEADER = "project,project name,client,item,description,qty,sample qty,revision,stages\n"
 
@@ -158,8 +159,9 @@ def test_template_is_a_header_and_an_example_that_imports(client, factory):
 
 # -- pictures ------------------------------------------------------------------
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"png-bytes" * 20
-JPEG = b"\xff\xd8\xff\xe0" + b"jpeg-bytes" * 20
+RED, BLUE = (200, 40, 40), (40, 40, 200)
+PNG = picture("PNG", color=RED)
+JPEG = picture("JPEG", size=(400, 300), color=BLUE)
 EMF = b"\x01\x00\x00\x00" + b"not-a-picture-we-store" * 10
 
 _REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -284,15 +286,18 @@ def test_a_picture_on_an_items_row_becomes_its_icon(client, factory, tmp_path, m
     assert items["STOOL-1"]["icon_url"] is None
     served = client.get(items["CHAIR-1"]["icon_url"])
     assert served.status_code == 200
-    assert (served.content, served.headers["content-type"]) == (PNG, "image/png")
-    assert client.get(items["TABLE-1"]["icon_url"]).content == PNG  # the left-most
-    assert len(storage.list("images/")) == 2
+    assert served.headers["content-type"] == "image/webp"
+    fmt, _size, colour = decoded(served.content)
+    assert fmt == "WEBP" and close(colour, RED)
+    # The left-most, which is the red PNG and not the blue JPEG.
+    assert close(decoded(client.get(items["TABLE-1"]["icon_url"]).content)[2], RED)
+    assert len(storage.list("images/")) == 4  # a display copy and a thumbnail each
 
     # Stored like an icon uploaded by hand: listed on the item, under the
     # importer's name, replaceable and deletable from the item editor.
     listed = client.get(f"/api/items/{items['CHAIR-1']['id']}/images").json()["images"]
     assert [(i["kind"], i["content_type"], i["size_bytes"]) for i in listed] == [
-        ("icon", "image/png", len(PNG))
+        ("icon", "image/webp", len(served.content))
     ]
 
 
@@ -301,12 +306,13 @@ def test_a_picture_that_cannot_be_used_is_left_out_and_said_so(client, factory, 
     from app.services import imports
 
     storage = _use_tmp_storage(tmp_path, monkeypatch)
-    monkeypatch.setattr(imports, "MAX_PICTURE_BYTES", 150)
+    assert len(JPEG) > len(PNG) + 1
+    monkeypatch.setattr(imports, "MAX_PICTURE_BYTES", len(PNG) + 1)
     factory.db.commit()
     content = _xlsx(ITEM_ROWS, pictures=[
         (2, 4, EMF[:100], False),     # what Excel stores for some pasted drawings
-        (3, 4, JPEG, False),          # 204 bytes: over the (patched) cap
-        (4, 4, PNG[:120], False),     # fine
+        (3, 4, JPEG, False),          # over the (patched) cap
+        (4, 4, PNG, False),           # fine
     ])
 
     body = _upload(client, content, commit=True).json()
@@ -314,8 +320,22 @@ def test_a_picture_that_cannot_be_used_is_left_out_and_said_so(client, factory, 
     assert [i["has_picture"] for i in body["items"]] == [False, False, True]
     assert any("row(s) 2" in n and "left out" in n for n in body["notes"])
     assert any("row(s) 3" in n and "larger than" in n for n in body["notes"])
-    assert len(storage.list("images/")) == 1
+    assert len(storage.list("images/")) == 2
     assert _item(factory, "CHAIR-1") is not None  # the items all arrived
+
+
+def test_a_picture_that_will_not_decode_is_left_out_at_preview(client, factory, tmp_path, monkeypatch):
+    """Looks like a PNG, is not one. Caught when the file is read, so the
+    preview says so and the commit never trips on it."""
+    storage = _use_tmp_storage(tmp_path, monkeypatch)
+    factory.db.commit()
+    content = _xlsx(ITEM_ROWS, pictures=[(2, 4, PNG[:40], False), (3, 4, PNG, False)])
+
+    preview = _upload(client, content).json()
+    assert [i["has_picture"] for i in preview["items"]] == [False, True, False]
+    assert any("row(s) 2" in n and "could not be read" in n for n in preview["notes"])
+    assert _upload(client, content, commit=True).json()["committed"] is True
+    assert len(storage.list("images/")) == 2
 
 
 def test_pictures_placed_inside_cells_are_named_as_unreadable(client, factory, tmp_path, monkeypatch):
@@ -346,6 +366,7 @@ def test_a_failed_import_leaves_no_picture_files_behind(factory, tmp_path, monke
     from app.services.imports import (
         ImportPlan, Picture, PlannedItem, PlannedProject, commit_import,
     )
+    from app.services.images import prepare
 
     storage = _use_tmp_storage(tmp_path, monkeypatch)
     factory.item("TAKEN-1", 5)  # created by someone else between preview and commit
@@ -356,7 +377,7 @@ def test_a_failed_import_leaves_no_picture_files_behind(factory, tmp_path, monke
     for row, code in ((2, "FRESH-1"), (3, "TAKEN-1")):
         plan.items.append(PlannedItem(
             row=row, project_code="PRJ", code=code, description="", qty=1, sample_qty=1,
-            revision="A", picture=Picture(data=PNG, content_type="image/png"),
+            revision="A", picture=Picture(prepared=prepare(PNG)),
         ))
 
     from app.services.items import ItemSetupError

@@ -41,6 +41,7 @@ def _stage_payload(stage: Stage) -> dict:
         "id": str(stage.id),
         "code": stage.code,
         "name": stage.name,
+        "name_ar": stage.name_ar,
         "sort_order": stage.sort_order,
         "is_active": stage.is_active,
         "requires_station": stage.requires_station,
@@ -62,6 +63,7 @@ def create_stage(
     stage = Stage(
         code=payload.code,
         name=payload.name.strip(),
+        name_ar=payload.name_ar,
         sort_order=payload.sort_order,
         requires_station=payload.requires_station,
         requires_external_po=payload.requires_external_po,
@@ -96,6 +98,7 @@ def _station_payload(station: Station) -> dict:
         "stage_id": str(station.stage_id),
         "code": station.code,
         "name": station.name,
+        "name_ar": station.name_ar,
         "sort_order": station.sort_order,
         "is_active": station.is_active,
     }
@@ -115,6 +118,7 @@ def create_station(
         stage_id=payload.stage_id,
         code=payload.code,
         name=payload.name.strip(),
+        name_ar=payload.name_ar,
         sort_order=payload.sort_order,
     )
     db.add(station)

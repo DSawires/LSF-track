@@ -51,7 +51,8 @@ from sqlalchemy.orm import Session
 
 from app.db import utcnow
 from app.models import Area, Item, ItemImage, Phase, Project, User
-from app.services.images import image_key, sniff
+from app.services import images as pictures_store
+from app.services.images import Prepared, Unreadable, prepare, sniff
 from app.services.items import ItemSetupError, identity_taken, lock_project
 from app.storage import get_storage
 
@@ -98,10 +99,10 @@ class ImportFileError(Exception):
 
 @dataclass
 class Picture:
-    """A picture lifted out of the file, already checked to be one."""
+    """A picture lifted out of the file, already decoded: what will be stored
+    of it, never the bytes the spreadsheet carried."""
 
-    data: bytes
-    content_type: str
+    prepared: Prepared
 
 
 @dataclass
@@ -328,6 +329,7 @@ def read_pictures(content: bytes) -> tuple[dict[int, Picture], list[str]]:
 
             skipped_format: list[int] = []
             skipped_size: list[int] = []
+            skipped_unreadable: list[int] = []
             for kind, drawing_part in _relationships(archive, sheet_part).values():
                 if not kind.endswith("/drawing") or drawing_part not in names:
                     continue
@@ -352,11 +354,17 @@ def read_pictures(content: bytes) -> tuple[dict[int, Picture], list[str]]:
                         skipped_size.append(row)
                         continue
                     data = archive.read(target)
-                    content_type = sniff(data[:16])
-                    if content_type is None:
+                    if sniff(data[:16]) is None:
                         skipped_format.append(row)
                         continue
-                    pictures[row] = (column, Picture(data=data, content_type=content_type))
+                    # Decoded here, at preview, so a picture that cannot be
+                    # used is a note now and never a failed commit later.
+                    try:
+                        prepared = prepare(data)
+                    except Unreadable:
+                        skipped_unreadable.append(row)
+                        continue
+                    pictures[row] = (column, Picture(prepared=prepared))
 
             def rows(numbers: list[int]) -> str:
                 listed = ", ".join(str(n) for n in sorted(set(numbers))[:12])
@@ -366,6 +374,11 @@ def read_pictures(content: bytes) -> tuple[dict[int, Picture], list[str]]:
                 notes.append(
                     f"Pictures on row(s) {rows(skipped_format)} are not JPEG, PNG, WebP, GIF or "
                     "HEIC and were left out."
+                )
+            if skipped_unreadable:
+                notes.append(
+                    f"Pictures on row(s) {rows(skipped_unreadable)} could not be read as images "
+                    "and were left out."
                 )
             if skipped_size:
                 notes.append(
@@ -695,17 +708,16 @@ def commit_import(db: Session, plan: ImportPlan, user: User) -> None:
             db.add(item)
             if planned.picture is not None:
                 image_id = uuid.uuid4()
-                key = image_key(image_id)
-                storage.put(key, io.BytesIO(planned.picture.data), planned.picture.content_type)
-                stored.append(key)
+                stored.append(image_id)
+                size = pictures_store.store(storage, image_id, planned.picture.prepared)
                 db.add(
                     ItemImage(
                         id=image_id,
                         item_id=item.id,
                         kind="icon",
                         filename=f"{planned.code} (import)"[:255],
-                        content_type=planned.picture.content_type,
-                        size_bytes=len(planned.picture.data),
+                        content_type=pictures_store.STORED_TYPE,
+                        size_bytes=size,
                         uploaded_by_user_id=user.id,
                         uploaded_at=moment,
                     )
@@ -715,11 +727,11 @@ def commit_import(db: Session, plan: ImportPlan, user: User) -> None:
         # All-or-nothing reaches the pictures too: the items are about to be
         # rolled back, so files already written must not be left behind with
         # no row that will ever name them.
-        for key in stored:
+        for image_id in stored:
             try:
-                storage.delete(key)
+                pictures_store.remove(storage, image_id)
             except Exception:  # best effort; the original failure is what matters
-                log.exception("could not remove %s after a failed import", key)
+                log.exception("could not remove picture %s after a failed import", image_id)
         raise
 
 

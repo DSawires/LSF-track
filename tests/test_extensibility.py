@@ -166,6 +166,36 @@ def _project_id(client) -> str:
     return client.get("/api/reference").json()["projects"][0]["id"]
 
 
+def test_stages_and_stations_carry_an_optional_arabic_name(world, client):
+    """The name a phone set to Arabic shows. It rides along with the stage and
+    station everywhere the name does, and an empty box clears it back to none."""
+    factory, _stages, _item = world
+
+    stage = client.post("/api/stages", json={
+        "code": "glass_shop", "name": "Glass shop", "name_ar": "  ورشة الزجاج ", "requires_station": True,
+    })
+    assert stage.status_code == 201
+    stage = stage.json()
+    assert stage["name_ar"] == "ورشة الزجاج"
+    station = client.post("/api/stations", json={
+        "stage_id": stage["id"], "code": "glass_shop_1", "name": "Glass shop 1",
+    }).json()
+    assert station["name_ar"] is None  # optional: the plain name is shown instead
+
+    renamed = client.patch(f"/api/stations/{station['id']}", json={"name_ar": "زجاج 1"})
+    assert renamed.json()["name_ar"] == "زجاج 1"
+
+    ref = client.get("/api/reference").json()
+    assert next(s for s in ref["stages"] if s["id"] == stage["id"])["name_ar"] == "ورشة الزجاج"
+    assert next(s for s in ref["stations"] if s["id"] == station["id"])["name_ar"] == "زجاج 1"
+
+    cleared = client.patch(f"/api/stages/{stage['id']}", json={"name_ar": ""})
+    assert cleared.json()["name_ar"] is None
+    assert cleared.json()["name"] == "Glass shop"
+    too_long = client.patch(f"/api/stages/{stage['id']}", json={"name_ar": "ا" * 121})
+    assert too_long.status_code == 422
+
+
 def test_stage_admin_endpoints_require_admin(factory, client):
     """Floor engineers log events; only admins reshape the factory."""
     import sqlalchemy as sa

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -260,6 +260,16 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
 
 
+def _blank_is_none(value: str | None) -> str | None:
+    value = (value or "").strip()
+    return value or None
+
+
+# A stage's or station's name in Arabic. Optional; an empty box clears it, and
+# the plain name is shown in its place.
+ArabicName = Annotated[str | None, Field(max_length=120), AfterValidator(_blank_is_none)]
+
+
 class StageCreate(BaseModel):
     """A new stage, added at runtime by an admin — no deploy, no migration.
 
@@ -269,6 +279,7 @@ class StageCreate(BaseModel):
 
     code: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9_]+$")
     name: str = Field(min_length=1, max_length=120)
+    name_ar: ArabicName = None
     sort_order: int = 0
     requires_station: bool = False
     requires_external_po: bool = False
@@ -281,6 +292,7 @@ class StageUpdate(BaseModel):
     """Everything but the code, which is the stage's identity."""
 
     name: str | None = Field(default=None, min_length=1, max_length=120)
+    name_ar: ArabicName = None
     sort_order: int | None = None
     is_active: bool | None = None
     requires_station: bool | None = None
@@ -296,11 +308,13 @@ class StationCreate(BaseModel):
     stage_id: uuid.UUID
     code: str = Field(min_length=1, max_length=48, pattern=r"^[a-z0-9_]+$")
     name: str = Field(min_length=1, max_length=120)
+    name_ar: ArabicName = None
     sort_order: int = 0
 
 
 class StationUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
+    name_ar: ArabicName = None
     sort_order: int | None = None
     is_active: bool | None = None
 

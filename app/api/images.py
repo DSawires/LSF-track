@@ -1,10 +1,12 @@
 """Item photos.
 
-Files land on disk under LSF_UPLOAD_DIR named by their row id (never by the
-client's filename), and are only ever served back by id through an authenticated
-endpoint with the stored content type. The magic-byte sniff means a renamed
-executable doesn't get stored as a "photo" even if the phone lies about the
-content type.
+Files land in storage named by their row id (never by the client's filename),
+and are only ever served back by id through an authenticated endpoint. What is
+stored is not what was sent: every picture is decoded and re-encoded as a WebP
+display copy and a thumbnail, upright and without its metadata, and the
+original is dropped (app/services/images.py). A file that cannot be decoded is
+refused, so a renamed executable never becomes a "photo" whatever the phone
+claims it is.
 
 Uploads are an online-only convenience, like the office screens. The offline
 guarantee covers the logging path; queueing multi-megabyte blobs in IndexedDB
@@ -13,7 +15,6 @@ would put the sync queue's reliability at risk for the sake of a nice-to-have.
 
 from __future__ import annotations
 
-import tempfile
 import uuid
 
 import sqlalchemy as sa
@@ -25,8 +26,7 @@ from app.db import get_db
 from app.deps import current_user, require_admin
 from app.models import Item, ItemImage, User, WorkOrderLine
 from app.schemas import ImageNoteUpdate
-from app.services.images import image_key as _image_key
-from app.services.images import sniff as _sniff
+from app.services import images as pictures
 from app.storage import get_storage
 
 router = APIRouter(prefix="/api", tags=["images"])
@@ -47,6 +47,7 @@ def _image_payload(image: ItemImage) -> dict:
         "note": image.note,
         "uploaded_at": image.uploaded_at.isoformat(),
         "url": f"/api/images/{image.id}",
+        "thumb_url": f"/api/images/{image.id}/thumb",
     }
 
 
@@ -70,34 +71,33 @@ def upload_image(
 
     settings = get_settings()
     head = file.file.read(16)
-    content_type = _sniff(head)
-    if content_type is None:
+    if pictures.sniff(head) is None:
         raise HTTPException(422, "not a recognised image format")
 
+    # Read with the cap enforced as it goes: the whole of an oversized file is
+    # never held, and nothing reaches storage before it is known to fit.
+    received = bytearray(head)
+    while chunk := file.file.read(64 * 1024):
+        received += chunk
+        if len(received) > settings.max_upload_bytes:
+            raise HTTPException(
+                413,
+                f"image exceeds {settings.max_upload_bytes // (1024 * 1024)}MB",
+            )
+    try:
+        prepared = pictures.prepare(bytes(received))
+    except pictures.Unreadable as error:
+        raise HTTPException(422, f"not a readable image: {error}") from None
+
     image_id = uuid.uuid4()
-    size = 0
-    # Spooled locally first so the size cap is enforced before a byte reaches
-    # the storage backend; small photos never touch disk at all.
-    with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as spool:
-        spool.write(head)
-        size = len(head)
-        while chunk := file.file.read(64 * 1024):
-            size += len(chunk)
-            if size > settings.max_upload_bytes:
-                raise HTTPException(
-                    413,
-                    f"image exceeds {settings.max_upload_bytes // (1024 * 1024)}MB",
-                )
-            spool.write(chunk)
-        spool.seek(0)
-        get_storage().put(_image_key(image_id), spool, content_type)
+    size = pictures.store(get_storage(), image_id, prepared)
 
     image = ItemImage(
         id=image_id,
         item_id=item_id,
         kind=kind,
         filename=(file.filename or "photo")[:255],
-        content_type=content_type,
+        content_type=pictures.STORED_TYPE,
         size_bytes=size,
         uploaded_by_user_id=user.id,
         note=note.strip()[:255] or None,
@@ -169,7 +169,7 @@ def delete_image(
         .values(image_id=None)
         .execution_options(synchronize_session=False)
     )
-    get_storage().delete(_image_key(image.id))
+    pictures.remove(get_storage(), image.id)
     db.delete(image)
     db.flush()
     return {"deleted": True, "item_id": str(image.item_id)}
@@ -181,12 +181,36 @@ def serve_image(
     db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ):
+    return _serve(db, image_id, thumb=False)
+
+
+@router.get("/images/{image_id}/thumb")
+def serve_thumbnail(
+    image_id: uuid.UUID,
+    db: Session = Depends(get_db, scope="function"),
+    user: User = Depends(current_user),
+):
+    """The small copy, for icons and photo grids. A picture stored before
+    thumbnails existed has none until `manage.py compress-images` has run,
+    and is served whole in the meantime."""
+    return _serve(db, image_id, thumb=True)
+
+
+def _serve(db: Session, image_id: uuid.UUID, thumb: bool):
     image = db.get(ItemImage, image_id)
     if image is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown image")
-    response = get_storage().response(_image_key(image.id), image.content_type)
+    storage = get_storage()
+    response = storage.response(pictures.thumb_key(image.id), pictures.STORED_TYPE) if thumb else None
+    if response is None:
+        response = storage.response(pictures.image_key(image.id), image.content_type)
     if response is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "file missing from storage")
+    if thumb and image.content_type != pictures.STORED_TYPE:
+        # The whole picture standing in for a thumbnail not made yet: not to be
+        # cached as if it were the thumbnail for good.
+        response.headers["Cache-Control"] = "private, no-cache"
+        return response
     # An image id names immutable bytes: replacing an icon uploads a new id and
     # the latest wins. So the browser may cache a given URL forever.
     response.headers["Cache-Control"] = "private, max-age=31536000, immutable"

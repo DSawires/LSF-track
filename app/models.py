@@ -54,6 +54,9 @@ class Stage(Base):
     id: Mapped[uuid.UUID] = _pk()
     code: Mapped[str] = mapped_column(sa.String(48), unique=True, index=True)
     name: Mapped[str] = mapped_column(sa.String(120))
+    # The same name in Arabic, shown when a phone is set to Arabic. Optional:
+    # without it the stage is shown by `name` in both languages.
+    name_ar: Mapped[str | None] = mapped_column(sa.String(120), nullable=True)
     sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 
@@ -81,6 +84,7 @@ class Station(Base):
     stage_id: Mapped[uuid.UUID] = mapped_column(sa.ForeignKey("stages.id"), index=True)
     code: Mapped[str] = mapped_column(sa.String(48), unique=True, index=True)
     name: Mapped[str] = mapped_column(sa.String(120))
+    name_ar: Mapped[str | None] = mapped_column(sa.String(120), nullable=True)  # see Stage.name_ar
     sort_order: Mapped[int] = mapped_column(sa.Integer, default=0)
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
 

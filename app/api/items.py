@@ -747,9 +747,11 @@ def _destroy_item(db: Session, item: Item) -> None:
         .values(item_id=None, image_id=None)
         .execution_options(synchronize_session=False)
     )
+    from app.services import images as pictures
+
     storage = get_storage()
     for image in db.scalars(sa.select(ItemImage).where(ItemImage.item_id == item.id)):
-        storage.delete(f"images/{image.id}")
+        pictures.remove(storage, image.id)
         db.delete(image)
     for step in db.scalars(sa.select(ItemStep).where(ItemStep.item_id == item.id)):
         db.delete(step)

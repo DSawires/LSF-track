@@ -15,7 +15,10 @@ dependencies = [
     "openpyxl>=3.1",
     # Work order PDFs. Pillow reads the pictures (and the logo) that go on them.
     "reportlab>=4.2",
+    # Pillow also re-encodes every uploaded photo as WebP (app/services/images.py).
     "pillow>=10.4",
+    # iPhone photos arrive as HEIC, which Pillow cannot decode on its own.
+    "pillow-heif>=1.0",
     # Arabic on those PDFs: letter shaping and right-to-left ordering, both
     # pure Python (see app/services/arabic.py).
     "arabic-reshaper>=3.0",

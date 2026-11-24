@@ -526,6 +526,10 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 
 /* One photo in the item editor: thumbnail, and the button that destroys it. */
 .photo-tile { position: relative; }
+/* The item icon in its editor: the same ✕, sized to the 64 px icon. */
+.icon-tile { flex: none; }
+.photo-tile.icon-tile img { width: 64px; height: 64px; }
+.icon-tile .drop { top: -8px; inset-inline-end: -8px; width: 30px; min-height: 30px; font-size: 14px; }
 
 .photo-tile img {
   width: 100%;

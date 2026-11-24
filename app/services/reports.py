@@ -27,6 +27,7 @@ def _stage_payload(stage) -> dict:
         "id": str(stage.id),
         "code": stage.code,
         "name": stage.name,
+        "name_ar": stage.name_ar,
         "sort_order": stage.sort_order,
         "requires_station": stage.requires_station,
         "requires_external_po": stage.requires_external_po,
@@ -148,7 +149,8 @@ def wip_report(
                 key,
                 {
                     "station": (
-                        {"id": str(station.id), "code": station.code, "name": station.name}
+                        {"id": str(station.id), "code": station.code, "name": station.name,
+                         "name_ar": station.name_ar}
                         if station
                         else None
                     ),
@@ -237,7 +239,8 @@ def aging_report(
                 "sample_qty": bucket.sample_qty,
                 "reworked_qty": bucket.reworked_qty,
                 "stations": [
-                    {"id": str(s.id), "code": s.code, "name": s.name} for s in stations if s
+                    {"id": str(s.id), "code": s.code, "name": s.name, "name_ar": s.name_ar}
+                    for s in stations if s
                 ],
                 "since": bucket.oldest_arrived_at.isoformat(),
                 "days_in_state": _days_since(bucket.oldest_arrived_at, now),

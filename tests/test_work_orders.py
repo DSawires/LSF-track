@@ -311,9 +311,15 @@ def test_the_pdf_prints_the_logo_the_lines_and_the_columns_asked_for(client, job
 def test_a_bad_picture_or_odd_text_never_stops_a_work_order(client, job, tmp_path, monkeypatch):
     _use_tmp_storage(tmp_path, monkeypatch)
     factory, bed, bench, _table = job
-    # Passes the upload's first-bytes check, but is not a picture anyone can draw.
-    broken = _upload(client, bed, data=b"\x89PNG\r\n\x1a\n" + b"not really a png" * 8)
+    # Uploads are decoded now, so a broken picture can only be one already in
+    # storage -- an original from before compression that never converted.
+    broken = _upload(client, bed)
     vanished = _upload(client, bench)
+    import io as _io
+
+    from app.storage import get_storage
+
+    get_storage().put(f"images/{broken}", _io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"not really a png" * 8))
     made = _issue(client, factory, [
         _line(bed, image_id=broken, description="طاولة جانبية <b>& co</b> → 600×450", dimensions="Ø 450"),
         _line(bench, image_id=vanished),
