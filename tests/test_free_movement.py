@@ -116,6 +116,58 @@ def test_moving_more_than_rests_at_the_source_is_a_validation_error(shop):
     assert _where(factory.db, item) == {"unstarted": 14, "paint": 6}
 
 
+def test_a_refusal_says_how_many_are_there_and_where(shop):
+    """The reason is read on a phone, by the engineer deciding between Retry
+    and Discard: the place by its name, what is there, what the entry moves.
+    The stage in it is one added at runtime -- the wording knows no stage."""
+    factory, item = shop
+
+    def refusal(**move):
+        with pytest.raises(EventRejected) as refused:
+            factory.move(item, **move)
+        return refused.value.reason
+
+    factory.move(item, "gilding", 6, at=days_ago(5))
+    assert refusal(to="paint", qty=9, frm="gilding", at=days_ago(4), station_code="paint_1") == (
+        "only 6 are at Gilding, and this entry moves 9"
+    )
+    assert refusal(to="paint", qty=15, at=days_ago(4), station_code="paint_1") == (
+        "only 14 are still not started, and this entry moves 15"
+    )
+    # Nothing there at all, and one unit there.
+    assert refusal(to="gilding", qty=2, frm="paint", at=days_ago(4)) == (
+        "none are at Paint, and this entry moves 2"
+    )
+    factory.move(item, None, 1, frm="gilding", at=days_ago(3))
+    assert refusal(
+        to="gilding", qty=2, frm="done", at=days_ago(2), event_type="rework_return",
+        reason_code_id=_reason(factory).id,
+    ) == "only 1 is in Done, and this entry moves 2"
+
+    # Dated before an entry already in the log that moved one of the same
+    # units on. All six were at gilding on that day, so this entry fits on its
+    # own -- it is the later one that would be left with nothing to move.
+    with pytest.raises(EventRejected) as refused:
+        factory.move(item, "paint", 6, frm="gilding", at=days_ago(4), station_code="paint_1")
+    assert "dated after this one" in refused.value.reason
+    assert _where(factory.db, item) == {"unstarted": 14, "gilding": 5, "done": 1}
+
+
+def test_a_refusal_during_the_sample_says_what_the_batch_is_waiting_for(factory):
+    """Moving the batch before its sample is Done is the usual way to get this
+    refusal, and "only 1 is not started" does not explain itself."""
+    item = factory.item("SMP-1", 40, sample_qty=1)
+    with pytest.raises(EventRejected) as refused:
+        factory.move(item, "carpentry", 40, at=days_ago(2), station_code="carpentry_1")
+    assert refused.value.reason == (
+        "only 1 is still not started, and this entry moves 40; "
+        "the batch is released when the sample is Done"
+    )
+    # Once the sample is done the batch is there, and the same entry goes in.
+    factory.move(item, None, 1, at=days_ago(3))
+    factory.move(item, "carpentry", 40, at=days_ago(2), station_code="carpentry_1")
+
+
 def test_an_entry_must_say_where_its_units_come_from(shop):
     factory, item = shop
 

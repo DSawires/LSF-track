@@ -58,7 +58,7 @@ def clear_session(response: Response) -> None:
 def current_user(
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> User:
     settings = get_settings()
     token = request.cookies.get(COOKIE_NAME)

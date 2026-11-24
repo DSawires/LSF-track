@@ -33,7 +33,7 @@ def login(
     payload: LoginRequest,
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
 ) -> dict:
     username = payload.username.strip().lower()
     # Real client IP relies on uvicorn's --proxy-headers when behind the compose

@@ -376,7 +376,7 @@ def test_a_selection_of_items_is_filed_in_one_go(client, factory):
 
     # Only what is sent changes: the area is set, each item's phase is left alone.
     done = _assign(client, beds[:3] + [chair], area_id=rooms)
-    assert done.status_code == 200 and done.json() == {"updated": 4}
+    assert done.status_code == 200 and done.json() == {"updated": 4, "split": 0}
     assert filed() == {
         "BED-0": ("Guest rooms", "Phase 1"), "BED-1": ("Guest rooms", "Phase 1"),
         "BED-2": ("Guest rooms", "Phase 1"), "BED-3": (None, "Phase 1"),
@@ -520,7 +520,7 @@ def test_filing_a_selection_stays_inside_one_project(client, factory):
     cleared = client.post("/api/items/assign", json={
         "item_ids": [str(here.id), str(there.id)], "area_id": None,
     })
-    assert cleared.status_code == 200 and cleared.json() == {"updated": 2}
+    assert cleared.status_code == 200 and cleared.json() == {"updated": 2, "split": 0}
 
 
 def test_an_unused_area_or_phase_can_be_deleted_and_a_used_one_cannot(client, factory):

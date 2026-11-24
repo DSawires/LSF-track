@@ -33,7 +33,7 @@ router = APIRouter(prefix="/api", tags=["reference"])
 
 
 @router.get("/reference")
-def reference(db: Session = Depends(get_db), user: User = Depends(current_user)) -> dict:
+def reference(db: Session = Depends(get_db, scope="function"), user: User = Depends(current_user)) -> dict:
     stages = list(db.scalars(sa.select(Stage).order_by(Stage.sort_order, Stage.code)))
     stations = list(db.scalars(sa.select(Station).order_by(Station.sort_order, Station.code)))
     event_types = list(db.scalars(sa.select(EventType).order_by(EventType.sort_order)))

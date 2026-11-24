@@ -59,7 +59,7 @@ def _event_payload(event: Event) -> dict:
 @router.post("", status_code=status.HTTP_201_CREATED)
 def post_event(
     payload: EventCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """Idempotent on the client-generated id: replaying is safe and returns 201
@@ -91,7 +91,7 @@ def _occurred_sort_key(entry: EventCreate) -> datetime:
 @router.post("/batch")
 def post_batch(
     payload: EventBatch,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """Drain a sync queue in one request.

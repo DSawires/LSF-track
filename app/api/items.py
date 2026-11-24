@@ -90,7 +90,7 @@ def _item_payload(item: Item, icon_url: str | None = None) -> dict:
 
 @router.get("")
 def list_items(
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
     project_id: uuid.UUID | None = None,
     area_id: uuid.UUID | None = None,
@@ -153,7 +153,7 @@ def list_items(
 @router.get("/{item_id}")
 def get_item(
     item_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     item = db.get(Item, item_id)
@@ -170,7 +170,7 @@ def get_item(
 @router.get("/{item_id}/events")
 def item_events(
     item_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
     limit: int = 20,
     offset: int = 0,
@@ -266,7 +266,7 @@ def _area_and_phase(
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_item(
     payload: ItemCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """Create an item and hand it to the floor in one step.
@@ -356,7 +356,7 @@ def create_item(
 @router.post("/assign")
 def assign_items(
     payload: ItemsAssign,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """File a selection of items under an area and/or a phase in one go.
@@ -367,6 +367,12 @@ def assign_items(
     end up the same batch as another -- two ticked items collapsing into one
     identity, or one landing on an item that was not ticked -- nothing changes
     and the answer names them.
+
+    `quantities` files part of a batch: that many of the item go into the
+    phase, as their own batch under the same code (joining the one already
+    there, if there is one), and the rest stay where they are. Only units that
+    have not started can be sent this way -- there is no saying, from a list,
+    which stage the others should come from; the item's own page asks.
     """
     sent = payload.model_fields_set & {"area_id", "phase_id"}
     if not sent:
@@ -404,12 +410,44 @@ def assign_items(
     for project_id in sorted(projects, key=str):
         lock_project(db, project_id)
 
+    # Items going into the phase in part. Everything about them is checked
+    # here, before anything moves.
+    partial: dict[uuid.UUID, int] = {}
+    if payload.quantities:
+        if "phase_id" not in sent:
+            raise HTTPException(422, "a quantity is how many go into a phase; choose the phase")
+        if set(payload.quantities) - set(ids):
+            raise HTTPException(422, "a quantity was given for an item that is not ticked")
+        states = reports.item_state(db, list(payload.quantities))
+        for item in items:
+            qty = payload.quantities.get(item.id)
+            if qty is None:
+                continue
+            state = states.get(str(item.id))
+            batch = state["batch_qty"] if state else item.total_qty
+            if qty > batch:
+                raise HTTPException(
+                    422, f"nothing was changed: {item.code} is a batch of {batch}; it cannot give {qty}"
+                )
+            if qty == batch:
+                continue   # all of it: an ordinary move
+            waiting = state["production_unstarted_qty"] if state else item.total_qty
+            if qty > waiting:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"nothing was changed: only {waiting} of {item.code} have not started. Units "
+                    "already on the floor are moved from the item's own page (Office → Items), "
+                    "where you say which stage they come from.",
+                )
+            partial[item.id] = qty
+
     def target(item: Item) -> tuple:
         return (
             item.project_id,
             item.code,
             payload.area_id if "area_id" in sent else item.area_id,
-            payload.phase_id if "phase_id" in sent else item.phase_id,
+            # An item going in part stays in its phase; what goes is split off below.
+            payload.phase_id if "phase_id" in sent and item.id not in partial else item.phase_id,
         )
 
     # Everything else that shares a project and code with the selection: the
@@ -450,6 +488,16 @@ def assign_items(
     except parts_service.PartsError as exc:
         db.rollback()
         raise HTTPException(exc.status, f"nothing was changed: {exc}")
+    for item in items:
+        if item.id not in partial:
+            continue
+        try:
+            parts_service.split_phase(
+                db, item, payload.phase_id, {parts_service.UNSTARTED: partial[item.id]}, admin
+            )
+        except parts_service.PartsError as exc:
+            db.rollback()
+            raise HTTPException(exc.status, f"nothing was changed: {item.code}: {exc}")
     log.info(
         "%d item(s) filed by %s: %s",
         len(items),
@@ -460,14 +508,14 @@ def assign_items(
             if key in sent
         ),
     )
-    return {"updated": len(items)}
+    return {"updated": len(items), "split": len(partial)}
 
 
 @router.patch("/{item_id}")
 def update_item(
     item_id: uuid.UUID,
     payload: ItemUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """Correct an item's office-side facts: code, description, project, batch
@@ -591,7 +639,7 @@ def update_item(
 def remove_item(
     item_id: uuid.UUID,
     purge: bool = False,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """Archive an item with history; hard-delete one that never saw the floor.
@@ -704,7 +752,7 @@ def _known(db: Session, item_id: uuid.UUID) -> Item:
 def add_part(
     item_id: uuid.UUID,
     payload: PartCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """Give an item a part. Any engineer, like adding an item: a part is an
@@ -724,7 +772,7 @@ def add_part(
 def change_part(
     item_id: uuid.UUID,
     payload: PartUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """How many of a part go into one piece, and what it is called. Refused
@@ -742,7 +790,7 @@ def change_part(
 def split_phase(
     item_id: uuid.UUID,
     payload: PhaseSplit,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """Move some of a batch into another phase of its project. Admin, like
@@ -767,7 +815,7 @@ def split_phase(
 def revision(
     item_id: uuid.UUID,
     payload: RevisionBumpRequest,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     item = db.get(Item, item_id)

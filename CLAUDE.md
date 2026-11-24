@@ -317,7 +317,11 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
 - Event logging: pre-selected fields, under fifteen seconds, one-handed on a phone.
   Tap a batch on the item card (that is "from"), pick where it went — any
   stage, or Done — and log. The stage picked last time from that place starts
-  out selected. No state picker
+  out selected. No state picker. A stage with stations asks which one: the
+  station this phone used last at that stage starts out selected, a lone
+  station is taken as read, and otherwise the engineer picks (`usualStation`)
+  — never "the first in the list". Every screen opens at its top; the item
+  list alone comes back where it was left, so logging does not lose the place
 - The item cards show queued entries at once: `localPlaces()` in
   `static/js/app.js` applies the phone's unsynced queue on top of the server's
   last answer, so a batch moved in a dead spot can be tapped and moved on
@@ -358,7 +362,10 @@ The shipped product (v1 scope plus additions blessed 2026-08-16):
   separate alternatives), tick, search again — the ticks are kept — then set
   an area and/or a phase on everything ticked. `POST /api/items/assign` does
   it all-or-nothing: if any two items would become the same batch, nothing
-  changes
+  changes. Each ticked item also takes a quantity (`quantities`): fewer than
+  the batch splits that many not-started units into the phase
+  (`parts.split_phase`) and leaves the rest where they are; parts are not
+  offered here, they follow their piece
 - Taking work off the floor (admin): archive an item, or a project together
   with its items — each archive is an event, and both can be reactivated.
   Finished jobs should be archived: every active item is replayed by every
@@ -443,6 +450,13 @@ fixed rather than patched around.
   not when settings load — the backup container runs its own entrypoint, never
   serves a request, and must not lose a night's dump over a key it never signs
   anything with.
+- Every endpoint asks for its session as `Depends(get_db, scope="function")`,
+  never a bare `Depends(get_db)`. The scope is what makes the commit run
+  before the response is sent; FastAPI's default runs it after, and then a
+  commit that fails (database restarting, full disk) has already told the
+  phone "stored" — and the phone has cleared the entry. With the scope it is
+  a 5xx and the entry stays queued. `tests/test_durability.py` fails on any
+  route that declares it the other way.
 - The login throttle is in-memory and per-process: correct at one uvicorn
   worker (the shipped configuration). Adding `--workers N` needs a shared
   store for it first.

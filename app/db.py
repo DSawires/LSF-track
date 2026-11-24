@@ -85,6 +85,16 @@ def dispose_engine() -> None:
 
 
 def get_db() -> Iterator[Session]:
+    """One session per request, committed when the endpoint returns.
+
+    Always asked for as `Depends(get_db, scope="function")`. The scope is what
+    makes the commit below run *before* the response is sent: with FastAPI's
+    default it runs after, and a commit that then fails leaves the client
+    holding a success for rows that were never stored. For `POST /events` that
+    is a lost entry -- the phone clears its queue on that answer. With the
+    function scope a failed commit is a 5xx, and the phone keeps the entry and
+    tries again. tests/test_durability.py checks every route declares it.
+    """
     session = get_sessionmaker()()
     try:
         yield session

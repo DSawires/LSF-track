@@ -170,14 +170,14 @@ def test_a_split_or_assembly_that_does_not_add_up_is_refused_whole(client, bed):
         _row(factory, bed.id, 30, link, at, out="unstarted"),
         _row(factory, frame["id"], 30, link, at, inbound=True),
         _row(factory, legs["id"], 120, link, at, inbound=True),
-    ], "cannot support")
+    ], "only 10 are still not started, and this entry moves 30")
     # Assembling parts that were never split off.
     link = uuid.uuid4()
     refused([
         _row(factory, frame["id"], 1, link, at, out="unstarted"),
         _row(factory, legs["id"], 4, link, at, out="unstarted"),
         _row(factory, bed.id, 1, link, at, inbound=True, to="assembly"),
-    ], "cannot support")
+    ], "none are still not started")
     assert _state(factory, bed.id)["in_parts_qty"] == 0
     assert _at(_state(factory, frame["id"])) == {}
 
@@ -397,3 +397,62 @@ def test_a_new_item_can_be_split_across_phases_as_it_is_added(client, factory):
     twice = client.post("/api/items", json={**body, "code": "LF-12", "total_qty": 2, "phase_quantities": [
         {"phase_id": str(one.id), "qty": 1}, {"phase_id": str(one.id), "qty": 1}]})
     assert twice.status_code == 422
+
+
+def test_filing_items_into_a_phase_can_take_part_of_each_batch(client, factory):
+    from app.models import Area, Phase
+
+    one, two = factory.label(Phase, "Phase 1"), factory.label(Phase, "Phase 2")
+    rooms = factory.label(Area, "Guest rooms")
+    bed = factory.item("LF-01", 216, sample_qty=1, phase="Phase 1")      # sample not done
+    bench = factory.item("LF-03", 100, phase="Phase 1")                  # released, 40 on the floor
+    table = factory.item("SP-03", 17, phase="Phase 1")                   # goes whole
+    factory.move(bench, "carpentry", 40, station_code="carpentry_1")
+    factory.db.commit()
+
+    filed = client.post("/api/items/assign", json={
+        "item_ids": [str(bed.id), str(bench.id), str(table.id)],
+        "phase_id": str(two.id), "area_id": str(rooms.id),
+        "quantities": {str(bed.id): 66, str(bench.id): 25, str(table.id): 17},
+    })
+    assert filed.status_code == 200, filed.text
+    assert filed.json() == {"updated": 3, "split": 2}
+
+    rows = client.get("/api/items").json()["items"]
+    by = {(row["code"], row["phase_id"]): row for row in rows}
+    # 66 of the 216 went; the rest stayed in phase 1. Both are in the area set.
+    assert (by[("LF-01", str(one.id))]["total_qty"], by[("LF-01", str(two.id))]["total_qty"]) == (150, 66)
+    assert by[("LF-01", str(two.id))]["sample_item_id"] == str(bed.id)
+    assert {by[("LF-01", str(p.id))]["area_id"] for p in (one, two)} == {str(rooms.id)}
+    # Released: 25 of the 60 not started moved as units; the 40 at carpentry stayed.
+    assert _at(by[("LF-03", str(one.id))]["state"]) == {"unstarted": 35, "carpentry": 40}
+    assert _at(by[("LF-03", str(two.id))]["state"]) == {"unstarted": 25}
+    # The whole batch asked for: the item itself moves, as before.
+    assert ("SP-03", str(one.id)) not in by and by[("SP-03", str(two.id))]["id"] == str(table.id)
+
+    # A second helping joins the batch already in phase 2.
+    again = client.post("/api/items/assign", json={
+        "item_ids": [str(bed.id)], "phase_id": str(two.id), "quantities": {str(bed.id): 50},
+    })
+    assert again.status_code == 200, again.text
+    rows = {(r["code"], r["phase_id"]): r for r in client.get("/api/items").json()["items"]}
+    assert (rows[("LF-01", str(one.id))]["total_qty"], rows[("LF-01", str(two.id))]["total_qty"]) == (100, 116)
+
+    def refused(body, code, word):
+        answer = client.post("/api/items/assign", json=body)
+        assert answer.status_code == code and word in answer.json()["detail"], answer.text
+
+    # All or nothing: one bad quantity and nothing in the request happens.
+    before = client.get("/api/items").json()["items"]
+    refused({"item_ids": [str(bed.id), str(bench.id)], "phase_id": str(two.id),
+             "quantities": {str(bed.id): 10, str(bench.id): 36}}, 409, "only 35 of LF-03 have not started")
+    refused({"item_ids": [str(bed.id)], "phase_id": str(two.id),
+             "quantities": {str(bed.id): 101}}, 422, "batch of 100")
+    refused({"item_ids": [str(bed.id)], "area_id": str(rooms.id),
+             "quantities": {str(bed.id): 5}}, 422, "choose the phase")
+    refused({"item_ids": [str(bed.id)], "phase_id": str(one.id),
+             "quantities": {str(bed.id): 5}}, 422, "in that phase already")
+    after = client.get("/api/items").json()["items"]
+    assert [(r["id"], r["total_qty"], r["phase_id"]) for r in before] == [(r["id"], r["total_qty"], r["phase_id"]) for r in after]
+    assert client.post("/api/items/assign", json={
+        "item_ids": [str(bed.id)], "phase_id": str(two.id), "quantities": {str(bed.id): 0}}).status_code == 422

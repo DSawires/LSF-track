@@ -207,6 +207,17 @@ class ItemsAssign(BaseModel):
     item_ids: list[uuid.UUID] = Field(min_length=1, max_length=5000)
     area_id: uuid.UUID | None = None
     phase_id: uuid.UUID | None = None
+    # How many of an item go into the phase, for the items that are not going
+    # whole: 66 of the 216. The rest stay in the phase they are in. An item
+    # left out, or given its whole batch, moves as it always did.
+    quantities: dict[uuid.UUID, int] = Field(default_factory=dict, max_length=5000)
+
+    @field_validator("quantities")
+    @classmethod
+    def _whole_and_positive(cls, quantities: dict) -> dict:
+        if any(qty < 1 for qty in quantities.values()):
+            raise ValueError("a quantity is a whole number, 1 or more")
+        return quantities
 
 
 class LabelCreate(BaseModel):

@@ -244,9 +244,12 @@ function renderPill() {
   const rejected = S.pending.filter((q) => q._status === "rejected").length;
   $pill.classList.toggle("offline", !S.online || S.needsLogin);
   $pill.classList.toggle("pending", pending > 0 || rejected > 0);
+  // A refused entry needs someone to act; a pending one only needs signal.
+  // They must not look alike.
+  $pill.classList.toggle("rejected", rejected > 0);
   const parts = [];
   if (pending) parts.push(`${pending} pending`);
-  if (rejected) parts.push(`${rejected} rejected`);
+  if (rejected) parts.push(`${rejected} not accepted`);
   if (!S.online) parts.push("offline");
   else if (S.needsLogin) parts.push("sign-in needed");
   parts.push(S.lastSync ? `synced ${timeAgo(S.lastSync)}` : "never synced");
@@ -287,6 +290,20 @@ function timeAgo(timestamp) {
   const hours = Math.round(minutes / 60);
   return hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
 }
+
+/* "5 Nov, 03:49": the day first and the month by name, so a date cannot be read
+   two ways (11/5 is November to one reader and May to the next), and no
+   seconds. The year only when it is not this one. */
+function fmtWhen(value) {
+  const when = new Date(value);
+  if (Number.isNaN(when.getTime())) return "";
+  const options = { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+  if (when.getFullYear() !== new Date().getFullYear()) options.year = "numeric";
+  return when.toLocaleString("en-GB", options);
+}
+
+/* "1 pc", "40 pcs". */
+const pcs = (n) => `${n} ${Number(n) === 1 ? "pc" : "pcs"}`;
 
 window.addEventListener("online", () => { S.online = true; sync(); });
 window.addEventListener("offline", () => { S.online = false; renderPill(); });
@@ -388,7 +405,7 @@ function batchLabel(item) {
     const piece = pieceOf(item);
     return `×${item.per_unit} per ${piece ? piece.code : "piece"}`;
   }
-  return `${item.state?.batch_qty ?? item.total_qty} pcs`;
+  return pcs(item.state?.batch_qty ?? item.total_qty);
 }
 
 function placeName(key) {
@@ -584,6 +601,10 @@ function pendingCountFor(itemId) {
   return S.pending.filter((q) => q._status === "pending" && q.item_id === itemId).length;
 }
 
+function rejectedCountFor(itemId) {
+  return S.pending.filter((q) => q._status === "rejected" && q.item_id === itemId).length;
+}
+
 /* "Carpentry", "Not started", with the sample called out: until it is done,
    the sample is the only thing on the floor for that item. */
 function whereLabel(p) {
@@ -698,8 +719,20 @@ function viewFingerprint(hash) {
 
 let renderedFingerprint = null;
 
+/* Every view is drawn into the one scrolling element, so where it is scrolled
+   to has to be decided on each change of screen, or the new screen inherits
+   the old one's offset: a batch tapped far down the list opened its log screen
+   part-way down, with the item's name off the top. A screen opens at its top.
+   The item list is the exception -- it is what people come back to after every
+   entry, and it comes back where they left it. */
+let renderedHash = null;
+const listScroll = { top: 0 };
+const isItemList = (hash) => hash === "#/items" || hash === "#/items/";
+
 function render(background = false) {
   const hash = location.hash || "#/items";
+  const moved = renderedHash !== null && hash !== renderedHash;
+  if (moved && isItemList(renderedHash)) listScroll.top = $view.scrollTop;
   document.getElementById("topbar").hidden = false;
   document.getElementById("tabs").hidden = S.needsLogin && !S.user;
   // Before every early return below: the banner lives in the shell, not the
@@ -745,6 +778,8 @@ function render(background = false) {
   // call that back much later — by which time the user may have scrolled and
   // would not thank us for putting them back.
   if (background && lastSnapshot.scrollTop) $view.scrollTop = lastSnapshot.scrollTop;
+  if (moved) $view.scrollTop = isItemList(hash) ? listScroll.top : 0;
+  renderedHash = hash;
   renderedFingerprint = fingerprint;
 }
 
@@ -816,9 +851,9 @@ function viewSyncStatus() {
     const what = [
       type?.name || "entry",
       from && to ? `${placeName(from)} → ${placeName(to)}` : to ? placeName(to) : "",
-      q.qty ? `${q.qty} pcs` : "",
+      q.qty ? pcs(q.qty) : "",
     ].filter(Boolean).join(" · ");
-    return { code: item ? itemName(item) : "unknown item", what, when: new Date(q._queued_at || Date.now()).toLocaleString() };
+    return { code: item ? itemName(item) : "unknown item", what, when: fmtWhen(q._queued_at || Date.now()) };
   };
 
   const entryRow = (q, actions) => {
@@ -849,14 +884,16 @@ function viewSyncStatus() {
 
     <div class="card">
       <h2>Waiting to sync (${pending.length})</h2>
-      ${pending.map((q) => entryRow(q, false)).join("") || `<p class="muted">Nothing waiting — everything has reached the server.</p>`}
+      ${pending.map((q) => entryRow(q, false)).join("") || `<p class="muted">${rejected.length
+        ? "Nothing waiting — but see below: not everything was accepted."
+        : "Nothing waiting — everything has reached the server."}</p>`}
       <p class="muted" style="margin-top:8px">${S.lastSync ? `Last synced ${timeAgo(S.lastSync)}.` : "Never synced from this device."}${S.online ? "" : " Currently offline; entries are safe here until the network returns."}</p>
     </div>
 
     ${rejected.length ? `
     <div class="card">
-      <h2>Rejected by the server (${rejected.length})</h2>
-      <p class="muted" style="margin-bottom:6px">These did not go in. Retry if the situation has changed (e.g. the entry it depends on has since synced); discard if the entry was a mistake.</p>
+      <h2>Not accepted (${rejected.length})</h2>
+      <p class="muted" style="margin-bottom:6px">These are not in the log. Retry if things have changed since — the entry it depends on may have synced from another phone. Discard it if it was a mistake, and log it again correctly.</p>
       ${rejected.map((q) => entryRow(q, true)).join("")}
     </div>` : ""}`;
 
@@ -920,7 +957,8 @@ function viewItems() {
   // invisibly: its option is gone from the select, but the stored id still hides
   // every other item.
   const filterProject = validFilter("f-project", projects);
-  const filterStage = sessionStorage.getItem("f-stage") || "";
+  // The same goes for a stage taken off the floor.
+  const filterStage = validFilter("f-stage", stages);
   const inProject = S.items.filter((item) => !filterProject || item.project_id === filterProject);
   const areas = labelOptions("areas", "area_id", inProject, "No area", filterProject);
   const phases = labelOptions("phases", "phase_id", inProject, "No phase", filterProject);
@@ -945,15 +983,37 @@ function viewItems() {
     S.items.filter((item) => !pieceOf(item) && matches(item, text)).map(itemRow).join("")
     || `<p class="muted">No items match.</p>`;
 
+  // Search is how a batch is found among a few hundred; the filters are the
+  // slower second tool, and five dropdowns above every list cost a quarter of
+  // a phone screen. They fold away behind one button, and what is switched on
+  // stays in sight while they are folded -- a filter nobody can see is a list
+  // that is quietly missing things.
+  const active = [
+    projects.find((p) => p.id === filterProject)?.code,
+    stages.find((s) => s.id === filterStage)?.name,
+    areas.find((a) => a.id === filterArea)?.name,
+    phases.find((ph) => ph.id === filterPhase)?.name,
+    PROGRESS.find(([id]) => id === filterProgress)?.[1],
+  ].filter(Boolean);
+  const filtersOpen = sessionStorage.getItem("f-open") === "1";
+
   $view.innerHTML = `
-    <input id="f-q" type="search" placeholder="Search code or description"
-           value="${esc(sessionStorage.getItem("f-q") || "")}" style="margin-bottom:8px">
-    <div class="filters">
-      <select id="f-project">
+    <div class="find-row">
+      <input id="f-q" type="search" placeholder="Search code or description"
+             value="${esc(sessionStorage.getItem("f-q") || "")}">
+      <button class="ghost${active.length ? " on" : ""}" id="f-toggle" aria-expanded="${filtersOpen}" aria-controls="f-panel">Filters${active.length ? ` · ${active.length}` : ""}</button>
+    </div>
+    ${active.length && !filtersOpen ? `
+    <div class="filter-summary">
+      <span class="muted">Showing only ${esc(active.join(" · "))}</span>
+      <button class="ghost" id="f-clear">Show all</button>
+    </div>` : ""}
+    <div class="filters" id="f-panel" ${filtersOpen ? "" : "hidden"}>
+      <select id="f-project" aria-label="Project">
         <option value="">All projects</option>
         ${projects.map((p) => `<option value="${p.id}" ${p.id === filterProject ? "selected" : ""}>${esc(p.code)}</option>`).join("")}
       </select>
-      <select id="f-stage">
+      <select id="f-stage" aria-label="Stage">
         <option value="">All stages</option>
         ${stages.map((s) => `<option value="${s.id}" ${s.id === filterStage ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
       </select>
@@ -976,6 +1036,20 @@ function viewItems() {
       ${list((sessionStorage.getItem("f-q") || "").toLowerCase())}
     </div>`;
 
+  document.getElementById("f-toggle").onclick = () => {
+    sessionStorage.setItem("f-open", filtersOpen ? "0" : "1"); render();
+  };
+  const $clear = document.getElementById("f-clear");
+  if ($clear) $clear.onclick = () => {
+    for (const id of ["f-project", "f-stage", "f-area", "f-phase", "f-progress"]) {
+      sessionStorage.removeItem(id);
+      // Emptied here too: the re-render carries a field's value across, and
+      // would put the old choice back into a dropdown that no longer filters.
+      const select = document.getElementById(id);
+      if (select) select.value = "";
+    }
+    render();
+  };
   document.getElementById("f-project").onchange = (e) => {
     sessionStorage.setItem("f-project", e.target.value); render();
   };
@@ -999,7 +1073,7 @@ function viewItems() {
 function placeRows(item, places, done) {
   return places.map((p) => `
     <a class="pos-row" href="#/items/${item.id}/${p.key}"
-       aria-label="Move ${p.qty} pcs of ${esc(item.code)} from ${esc(whereLabel(p))}">
+       aria-label="Move ${pcs(p.qty)} of ${esc(item.code)} from ${esc(whereLabel(p))}">
       <span class="muted" style="min-width:0">${esc(whereLabel(p))}${p.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</span>
       <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
         <span class="badge qty">${p.qty}</span>${p.key === UNSTARTED ? "" : p.days_in_state == null ? `
@@ -1009,7 +1083,7 @@ function placeRows(item, places, done) {
       </span>
     </a>`).join("") + (done ? `
       <a class="pos-row" href="#/items/${item.id}/${DONE}" style="border-left:2px solid var(--good)"
-         aria-label="${done} pcs of ${esc(item.code)} done">
+         aria-label="${pcs(done)} of ${esc(item.code)} done">
         <span class="muted">Done</span>
         <span style="white-space:nowrap;display:flex;align-items:center;gap:6px">
           <span class="badge qty" style="color:var(--good)">${done}</span>
@@ -1045,6 +1119,7 @@ function itemRow(item) {
   // The card speaks for the piece and every part under it.
   const family = familyOf(item);
   const pending = family.reduce((sum, member) => sum + pendingCountFor(member.id), 0);
+  const rejected = family.reduce((sum, member) => sum + rejectedCountFor(member.id), 0);
   const piece = pieceOf(item);
   const waits = !!item.state?.waits_on_sample;
   const sampler = waits ? S.items.find((i) => i.id === item.sample_item_id) : null;
@@ -1076,6 +1151,12 @@ function itemRow(item) {
           </div>
         </div>
       </a>
+      ${rejected ? `
+      <a class="reject-row" href="#/sync">
+        <span>${rejected} ${rejected === 1 ? "entry was" : "entries were"} not accepted — see why</span>
+        <span class="chev" aria-hidden="true">›</span>
+      </a>` : ""}
+      ${pending ? `<div class="card-flags"><span class="badge pending">${pending} not synced yet</span></div>` : ""}
       ${lines}
       ${placeRows(item, [], done)}
       ${inParts ? `
@@ -1089,7 +1170,6 @@ function itemRow(item) {
         ${places.length ? `<a href="#/items/${item.id}/split">Split into parts</a>` : ""}
         ${parts.length && partsOnFloor ? `<a href="#/items/${item.id}/assemble">Assemble</a>` : ""}
       </div>` : ""}
-      ${pending ? `<div style="margin-top:4px"><span class="badge pending">${pending} pending</span></div>` : ""}
     </div>`;
 }
 
@@ -1102,7 +1182,20 @@ const logSel = {
   qty: null, note: "", _arrival: null,
   // "move", or "split": the units at `from` become their parts at `to`.
   mode: "move",
+  // Whether the "from" picker is unfolded (see viewLogScreen).
+  fromOpen: false,
 };
+
+/* The station a stage's picker starts on: the one this phone used last at that
+   stage, if it is still on offer, or the only one there is. Otherwise none --
+   the engineer says which. Starting on "the first in the list" filled the log
+   with a station nobody chose, and station counts are what load balancing is
+   read from. */
+function usualStation(stage, stations) {
+  const remembered = localStorage.getItem(`station:${stage.id}`);
+  if (stations.some((st) => st.id === remembered)) return remembered;
+  return stations.length === 1 ? stations[0].id : null;
+}
 
 /* The assembly form on an item with parts: which place each part is taken
    from, where the finished pieces go, how many. */
@@ -1190,6 +1283,11 @@ function viewLogScreen(itemId, fromKey) {
     logSel.typeId = plainType?.id || null;
     logSel.stationId = null;
     logSel.qty = null;
+    // A note typed on another item and abandoned there is not about this one.
+    logSel.note = "";
+    // The batch was chosen by tapping it on the card, so the picker for it
+    // starts folded to one line; with no batch chosen it starts open.
+    logSel.fromOpen = !logSel.from;
   }
   // Splitting takes pieces that are still pieces: never finished ones.
   const splitting = logSel.mode === "split";
@@ -1214,7 +1312,9 @@ function viewLogScreen(itemId, fromKey) {
     : activeStages()
       .filter((st) => st.id !== logSel.from || st.requires_station)
       .map((st) => ({ key: st.id, label: st.name }));
-  if (!splitting && finish && !type?.is_rework && logSel.from !== DONE) targets.push({ key: DONE, label: "Done ✓" });
+  // Plain "Done": a tick in the label reads as "selected", which is what a
+  // tick means on every other button of these pickers.
+  if (!splitting && finish && !type?.is_rework && logSel.from !== DONE) targets.push({ key: DONE, label: "Done" });
   if (!targets.some((t) => t.key === logSel.to)) {
     const usual = logSel.from && !splitting ? usualDestination(logSel.from) : null;
     logSel.to = targets.some((t) => t.key === usual) ? usual : null;
@@ -1227,8 +1327,10 @@ function viewLogScreen(itemId, fromKey) {
     ? S.ref.stations.filter((st) => st.stage_id === stage.id && st.is_active)
     : [];
   if (stage?.requires_station && !stations.some((st) => st.id === logSel.stationId)) {
-    logSel.stationId = localStorage.getItem(`station:${stage.id}`) || stations[0]?.id || null;
+    logSel.stationId = usualStation(stage, stations);
   }
+  // A stage with booths needs to know which one, unless it has none to offer.
+  const needsStation = !!stage?.requires_station && stations.length > 0 && !logSel.stationId;
   const available = source?.qty || 0;
   const reasons = (S.ref.reason_codes || []).filter((r) => r.is_active);
   // Keep the tracked selection valid: a re-render must not silently reset the
@@ -1238,11 +1340,29 @@ function viewLogScreen(itemId, fromKey) {
     logSel.reasonId = reasons[0]?.id || null;
   }
   const sampleQty = item.state?.sample_qty || 0;
-  const seg = (id, label, options, picked) => `
+  const seg = (id, label, options, picked, compact = false) => `
       <label id="lbl-${id}">${label}</label>
-      <div class="seg" id="seg-${id}" role="group" aria-labelledby="lbl-${id}">
+      <div class="seg${compact ? " compact" : ""}" id="seg-${id}" role="group" aria-labelledby="lbl-${id}">
         ${options.map((o) => `<button data-id="${o.key}" class="${o.key === picked ? "on" : ""}" aria-pressed="${o.key === picked}">${esc(o.label)}</button>`).join("")}
       </div>`;
+  // Where the units are taken from. Tapping a batch on the card already said
+  // which, so it is one line here with a way to change it -- the full picker
+  // took the top third of the screen to ask a question that had been answered,
+  // and pushed the quantity below the fold.
+  const fromLabel = splitting ? "Split the pieces at" : "From";
+  const fromPicker = logSel.fromOpen || !source
+    ? seg("from", fromLabel, sources.map((s) => ({ key: s.key, label: `${s.label} · ${s.qty}` })), logSel.from)
+    : `
+      <label id="lbl-from">${fromLabel}</label>
+      <div class="picked-row" role="group" aria-labelledby="lbl-from">
+        <strong>${esc(source.label)} · ${source.qty}</strong>
+        ${sources.length > 1 ? `<button class="ghost" id="from-change">Change</button>` : ""}
+      </div>`;
+  const goLabel = splitting && !parts.length ? "Name the parts first"
+    : !logSel.to ? (splitting ? "Pick where the parts go" : "Pick where it went")
+    : needsStation ? "Pick the station"
+    : splitting ? "Split into parts" : "Log entry";
+  const goReady = !!logSel.to && !needsStation && !(splitting && !parts.length);
 
   // "Assemble" on the card arrives here for the assembly form: it goes first.
   const assembleFirst = fromKey === "assemble";
@@ -1273,10 +1393,10 @@ function viewLogScreen(itemId, fromKey) {
       <p class="muted">Nothing here to move — ${item.state?.in_parts_qty ? `the pieces of ${esc(item.code)} are out in parts` : `every unit of ${esc(item.code)} is Done`}.</p>` : `
       ${parts.length || splitting ? seg("mode", "What happened", [{ key: "move", label: "Moved" }, { key: "split", label: "Split into parts" }], logSel.mode) : ""}
 
-      ${seg("from", splitting ? "Split the pieces at" : "From", sources.map((s) => ({ key: s.key, label: `${s.label} · ${s.qty}` })), logSel.from)}
+      ${fromPicker}
       ${splitting ? splitPartsBlock(item, parts) : ""}
 
-      ${!splitting && shownTypes.length > 1 ? seg("type", "Entry type", shownTypes.map((t) => ({ key: t.id, label: t.name })), logSel.typeId) : ""}
+      ${!splitting && shownTypes.length > 1 ? seg("type", "Entry type", shownTypes.map((t) => ({ key: t.id, label: t.name })), logSel.typeId, true) : ""}
       ${logSel.from === DONE ? `<p class="muted" style="margin-top:6px">Taking a finished piece back out of Done is rework, and needs its reason.</p>` : ""}
 
       ${seg("to", splitting ? "The parts go to" : type?.is_rework ? "Send back to" : "Now at", targets, logSel.to)}
@@ -1311,7 +1431,7 @@ function viewLogScreen(itemId, fromKey) {
 
       <div style="height:12px" aria-hidden="true"></div>
       <div class="action-sticky">
-        <button class="primary" id="log-go" ${logSel.to && !(splitting && !parts.length) ? "" : "disabled"}>${splitting && !parts.length ? "Name the parts first" : !logSel.to ? (splitting ? "Pick where the parts go" : "Pick where it went") : splitting ? "Split into parts" : "Log entry"}</button>
+        <button class="primary" id="log-go" ${goReady ? "" : "disabled"}>${goLabel}</button>
       </div>`}
     </div>
     ${assembleFirst ? "" : assembleHtml}
@@ -1338,10 +1458,13 @@ function viewLogScreen(itemId, fromKey) {
 
   const rerender = () => viewLogScreen(itemId, fromKey);
   wireSeg("seg-from", (key) => {
-    // A different batch: where it goes and how many start over.
-    Object.assign(logSel, { from: key, to: null, stationId: null, qty: null });
+    // A different batch: where it goes and how many start over. Chosen, so
+    // the picker folds back to its one line.
+    Object.assign(logSel, { from: key, to: null, stationId: null, qty: null, fromOpen: false });
     rerender();
   });
+  const $fromChange = document.getElementById("from-change");
+  if ($fromChange) $fromChange.onclick = () => { logSel.fromOpen = true; rerender(); };
   wireSeg("seg-type", (id) => { logSel.typeId = id; rerender(); });
   wireSeg("seg-mode", (key) => { Object.assign(logSel, { mode: key, to: null, stationId: null }); rerender(); });
 
@@ -1423,8 +1546,9 @@ function viewLogScreen(itemId, fromKey) {
     document.getElementById("qty-plus").onclick = () => { $qty.value = Number($qty.value) + 1; warn(); };
     document.getElementById("qty-warn").hidden = Number($qty.value) <= available;
 
-    document.getElementById("log-go").onclick = async () => {
-      if (!logSel.to || (splitting && !parts.length)) return;
+    const $go = document.getElementById("log-go");
+    $go.onclick = async () => {
+      if (!goReady) return;
       // A whole number of pieces, at least one. Anything else used to be
       // queued as typed and only refused by the server at the next sync -- or,
       // for an empty box, quietly logged as 1.
@@ -1434,6 +1558,9 @@ function viewLogScreen(itemId, fromKey) {
         $qty.focus();
         return;
       }
+      // One tap, one entry: a second tap landing while the first is still
+      // being written would queue the move twice.
+      $go.disabled = true;
       const at = new Date().toISOString();
       const station = stage?.requires_station ? logSel.stationId : null;
       const logged = splitting ? await logEvents(((link) => [
@@ -1464,7 +1591,7 @@ function viewLogScreen(itemId, fromKey) {
         supersedes_event_id: null,
         user_id: S.user?.id || null,
       });
-      if (!logged) return;
+      if (!logged) { $go.disabled = false; return; }
       // Remember the habit, not rework: sending work back is the exception.
       if (!type?.is_rework && !splitting) localStorage.setItem(`next:${logSel.from}`, logSel.to);
       Object.assign(logSel, { note: "", qty: null, _arrival: null, mode: "move" });
@@ -1548,11 +1675,12 @@ function assembleCard(item, parts) {
   });
   const most = Math.min(...rows.map((r) => r.sets));
   const targets = activeStages().map((st) => ({ key: st.id, label: st.name }));
-  if (finishType()) targets.push({ key: DONE, label: "Done ✓" });
+  if (finishType()) targets.push({ key: DONE, label: "Done" });
   if (!targets.some((t) => t.key === sel.to)) sel.to = null;
   const stage = sel.to && sel.to !== DONE ? stageById(sel.to) : null;
   const stations = stage ? S.ref.stations.filter((st) => st.stage_id === stage.id && st.is_active) : [];
-  if (stage?.requires_station && !stations.some((st) => st.id === sel.stationId)) sel.stationId = stations[0]?.id || null;
+  if (stage?.requires_station && !stations.some((st) => st.id === sel.stationId)) sel.stationId = usualStation(stage, stations);
+  const needsStation = !!stage?.requires_station && stations.length > 0 && !sel.stationId;
   const qty = sel.qty ?? Math.max(most, 1);
   const seg = (id, label, options, picked) => `
       <label id="lbl-${id}">${label}</label>
@@ -1579,7 +1707,7 @@ function assembleCard(item, parts) {
       <p class="muted" style="margin-top:5px">The parts on hand make ${most} piece${most === 1 ? "" : "s"}.</p>
       <p class="warn-text" id="asm-warn" ${Number(qty) > most ? "" : "hidden"}>More than the parts on hand make — the server will refuse it until they are there.</p>
       <div style="height:12px" aria-hidden="true"></div>
-      <button class="primary" id="asm-go" ${sel.to && rows.every((r) => r.options.length) ? "" : "disabled"}>${sel.to ? "Assemble" : "Pick where the pieces go"}</button>
+      <button class="primary" id="asm-go" ${sel.to && !needsStation && rows.every((r) => r.options.length) ? "" : "disabled"}>${!sel.to ? "Pick where the pieces go" : needsStation ? "Pick the station" : "Assemble"}</button>
     </div>`;
 }
 
@@ -1589,7 +1717,12 @@ function bindAssemble(item, parts, rerender) {
     select.onchange = (e) => { sel.from[select.dataset.asmFrom] = e.target.value; rerender(); };
   });
   wireSeg("seg-asm-to", (key) => { sel.to = key; sel.stationId = null; rerender(); });
-  wireSeg("seg-asm-station", (id) => { sel.stationId = id; rerender(); });
+  wireSeg("seg-asm-station", (id) => {
+    sel.stationId = id;
+    // Remembered per stage, like the log form's.
+    if (sel.to && sel.to !== DONE) localStorage.setItem(`station:${sel.to}`, id);
+    rerender();
+  });
   const $qty = document.getElementById("asm-qty");
   if (!$qty) return;
   $qty.oninput = () => { sel.qty = $qty.value; };
@@ -1846,7 +1979,7 @@ async function loadRecent(item) {
       const label = [
         type?.name || "event",
         from && to ? `${from} → ${to}` : to,
-        e.qty ? `${e.qty} pcs` : "",
+        e.qty ? pcs(e.qty) : "",
         e.state_name || "", // rows logged before states were removed
       ].filter(Boolean).join(" · ");
       const voided = !!e.superseded || queuedVoids.has(e.id);
@@ -1855,7 +1988,7 @@ async function loadRecent(item) {
       const canVoid = correctionType && type?.moves_quantity && !voided && !e.link_id;
       return `
         <div class="spread" style="padding:6px 0;border-bottom:1px solid var(--line)">
-          <span><span${voided ? ` style="text-decoration:line-through;opacity:.6"` : ""}>${esc(label)}</span>${voided ? ` <span class="badge">voided</span>` : ""}<br><span class="muted">${new Date(e.occurred_at).toLocaleString()}</span>${e.note ? `<br><span class="muted">“${esc(e.note)}”</span>` : ""}</span>
+          <span><span${voided ? ` style="text-decoration:line-through;opacity:.6"` : ""}>${esc(label)}</span>${voided ? ` <span class="badge">voided</span>` : ""}<br><span class="muted">${fmtWhen(e.occurred_at)}</span>${e.note ? `<br><span class="muted">“${esc(e.note)}”</span>` : ""}</span>
           ${canVoid ? `<button class="ghost" data-void="${e.id}">Void</button>` : ""}
         </div>`;
     }).join("") || "No entries yet.";
@@ -1886,11 +2019,20 @@ async function loadRecent(item) {
 
 /* -------------------------------------------------------------- reports -- */
 
+/* Which request for the reports is the latest, and whether the last tap asked
+   to be taken to the aging table once it is drawn. */
+const reportsView = { asked: 0, showAging: false };
+
 async function viewReports() {
   const projects = (S.ref?.projects || []).filter((p) => p.is_active !== false);
   const stages = (S.ref?.stages || []).filter((s) => s.is_active);
   const fProject = validFilter("r-project", projects);
-  const fStage = sessionStorage.getItem("r-stage") || "";
+  const fStage = validFilter("r-stage", stages);
+  // The answer is drawn seconds later on a slow link. By then the engineer may
+  // be on another screen, or have changed a filter again: only the newest
+  // request, on this screen, may draw.
+  const asked = ++reportsView.asked;
+  const current = () => asked === reportsView.asked && (location.hash || "").startsWith("#/reports");
   const fDays = sessionStorage.getItem("r-days") || "";
   // The reports are computed on the server, which narrows by area and phase
   // before it replays anything. No "none" here: that is a question for the list.
@@ -1924,11 +2066,12 @@ async function viewReports() {
       fetchReport("/api/reports/exceptions"),
     ]);
   } catch {
-    $view.innerHTML = `<p class="muted">Reports need a connection — they are computed from the full log on the server.</p>`;
+    if (current()) $view.innerHTML = `<p class="muted">Reports need a connection — they are computed from the full log on the server.</p>`;
     return;
   }
+  if (!current()) return;
   const staleNote = cachedFrom
-    ? `<p class="warn-text" style="margin-bottom:8px">Offline — showing last-known reports${cachedFrom !== "1" ? ` from ${new Date(cachedFrom).toLocaleString()}` : ""}.</p>`
+    ? `<p class="warn-text" style="margin-bottom:8px">Offline — showing last-known reports${cachedFrom !== "1" ? ` from ${fmtWhen(cachedFrom)}` : ""}.</p>`
     : "";
 
   const maxQty = Math.max(1, ...wip.stages.map((s) => s.total_qty));
@@ -1962,36 +2105,38 @@ async function viewReports() {
 
     <div class="card">
       <h2>WIP by stage</h2>
+      <p class="muted" style="margin:-4px 0 10px">Tap a stage to see what is sitting there.</p>
       ${wip.stages.map((row) => `
-        <div style="margin-bottom:12px">
-          <div class="spread">
+        <button class="wip-row${row.stage.id === fStage ? " on" : ""}" data-wip-stage="${row.stage.id}" aria-pressed="${row.stage.id === fStage}">
+          <span class="spread">
             <strong>${esc(row.stage.name)}</strong>
-            <span class="muted">${row.total_qty} pcs · ${row.item_count} item${row.item_count === 1 ? "" : "s"}${row.sample_qty ? ` · <span class="badge sample">${row.sample_qty} sample</span>` : ""}${row.reworked_qty ? ` · <span class="badge rework">rework ${row.reworked_qty}</span>` : ""}</span>
-          </div>
-          <div class="bar-track" style="margin:4px 0"><div class="bar-fill" style="width:${(row.total_qty / maxQty) * 100}%"></div></div>
+            <span class="muted">${pcs(row.total_qty)} · ${row.item_count} item${row.item_count === 1 ? "" : "s"}${row.sample_qty ? ` · <span class="badge sample">${row.sample_qty} sample</span>` : ""}${row.reworked_qty ? ` · <span class="badge rework">rework ${row.reworked_qty}</span>` : ""}</span>
+          </span>
+          <span class="bar-track" style="margin:4px 0"><span class="bar-fill" style="width:${(row.total_qty / maxQty) * 100}%"></span></span>
           ${row.stage.requires_station ? row.stations.map((s) =>
-            `<div class="muted">· ${s.station ? esc(s.station.name) : "No station yet"}: ${s.total_qty}</div>`).join("") : ""}
-        </div>`).join("") || `<p class="muted">Nothing in progress.</p>`}
-      ${wip.unstarted.qty ? `<p class="muted">Not started: ${wip.unstarted.qty} pcs across ${wip.unstarted.item_count} items</p>` : ""}
+            `<span class="muted">· ${s.station ? esc(s.station.name) : "No station yet"}: ${s.total_qty}</span>`).join("") : ""}
+        </button>`).join("") || `<p class="muted">Nothing in progress.</p>`}
+      ${wip.unstarted.qty ? `<p class="muted">Not started: ${pcs(wip.unstarted.qty)} across ${wip.unstarted.item_count} item${wip.unstarted.item_count === 1 ? "" : "s"}</p>` : ""}
     </div>
 
-    <div class="card">
-      <h2>Aging — days at current stage</h2>
+    <div class="card" id="aging-card">
+      <h2>Aging — days at ${fStage ? esc(stages.find((s) => s.id === fStage)?.name || "current stage") : "current stage"}</h2>
       <div class="table-scroll">
       <table>
         <thead><tr><th scope="col">Item</th><th scope="col">Where</th><th scope="col" class="num">Qty</th><th scope="col" class="num">Days</th></tr></thead>
         <tbody>
           ${aging.rows.map((row) => `
             <tr>
-              <td><a href="#/items/${row.item.id}" style="color:inherit">${esc(row.item.code)}</a>${
-                row.item.area || row.item.phase ? `<br><span class="muted">${esc([row.item.area, row.item.phase].filter(Boolean).join(" · "))}</span>` : ""}</td>
+              <td><a class="cell-link" href="#/items/${row.item.id}">${esc(row.item.code)}${
+                row.item.area || row.item.phase ? `<br><span class="muted">${esc([row.item.area, row.item.phase].filter(Boolean).join(" · "))}</span>` : ""}</a></td>
               <td>${esc(row.label)}${row.sample_qty ? ` <span class="badge sample">sample</span>` : ""}${row.reworked_qty ? ` <span class="badge rework">R</span>` : ""}</td>
               <td class="num">${row.qty}</td>
-              <td class="num" style="${row.overdue ? "color:var(--warn);font-weight:700" : ""}">${row.days_in_state.toFixed(1)}${row.overdue ? " ⚠" : ""}</td>
+              <td class="num${row.overdue ? " overdue" : ""}">${row.days_in_state.toFixed(1)}${row.overdue ? " ⚠" : ""}</td>
             </tr>`).join("")}
         </tbody>
       </table>
       </div>
+      ${aging.rows.length ? "" : `<p class="muted" style="margin-top:8px">Nothing matches.</p>`}
     </div>
 
     ${exceptions.rows.length ? `
@@ -2008,6 +2153,23 @@ async function viewReports() {
   for (const id of ["r-project", "r-stage", "r-area", "r-phase", "r-days"]) {
     const select = document.getElementById(id);
     if (select) select.onchange = (e) => { sessionStorage.setItem(id, e.target.value); render(); };
+  }
+  // A stage's bar is the way into it: tap it and the aging table below is that
+  // stage's batches, oldest first. Tap it again for every stage.
+  $view.querySelectorAll("[data-wip-stage]").forEach((button) => {
+    button.onclick = () => {
+      const id = button.dataset.wipStage;
+      sessionStorage.setItem("r-stage", id === fStage ? "" : id);
+      // The dropdown is carried across a re-render by its value; keep it in step.
+      const select = document.getElementById("r-stage");
+      if (select) select.value = id === fStage ? "" : id;
+      reportsView.showAging = id !== fStage;
+      render();
+    };
+  });
+  if (reportsView.showAging) {
+    reportsView.showAging = false;
+    document.getElementById("aging-card")?.scrollIntoView({ block: "start" });
   }
 }
 
@@ -2688,7 +2850,7 @@ async function loadItemEditors() {
           ${item.is_active
             ? `<button class="ghost" data-it-archive="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Archive</button>`
             : `<button class="ghost" data-it-restore="${item.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Reactivate</button>`}
-          <button class="ghost" data-it-purge="${item.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn)" ${S.online ? "" : "disabled"}>Delete for good</button>
+          <button class="ghost" data-it-purge="${item.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>Delete for good</button>
         </div>
         <p class="muted" style="margin-top:6px">Archiving hides the item everywhere and keeps its history;
         an archived item can be reactivated. Deleting for good removes the item <em>and its logged
@@ -3097,7 +3259,11 @@ const filing = {
   // `project` is the one the whole Areas & phases page is showing.
   q: "", project: "", inArea: "", inPhase: "", onlyTicked: false,
   ticked: new Set(), area: KEEP, phase: KEEP,
+  // How many of a ticked item go into the phase, as typed; blank is all of it.
+  qty: {},
 };
+// The batch as it stands, units moved between phases included.
+const batchOf = (item) => item.state?.batch_qty ?? item.total_qty;
 const FILING_SHOWN = 300; // rows painted; ticking "all" still takes every match
 
 /* A search box that takes several things at once. Commas separate alternatives
@@ -3120,6 +3286,8 @@ function filingMatches() {
   const matches = filingMatcher(filing.q);
   return S.items.filter((item) =>
     item.project_id === filing.project
+    // A part is filed with the piece it belongs to, and follows it.
+    && !item.parent_item_id
     && matchesLabel(item, "area_id", filing.inArea)
     && matchesLabel(item, "phase_id", filing.inPhase)
     && (!filing.onlyTicked || filing.ticked.has(item.id))
@@ -3140,7 +3308,9 @@ function filingCard() {
     <div class="card">
       <h2>File items under an area or phase</h2>
       <p class="muted" style="margin-bottom:8px">Search this project's items, tick them, choose where they
-      go, apply. The ticks stay while you search again, so one batch can be gathered from several searches.</p>
+      go, apply. The ticks stay while you search again, so one batch can be gathered from several searches.
+      Each ticked item gets a quantity box for filing into a phase: leave it empty to send the whole batch,
+      or type how many go — the rest stay in the phase they are in.</p>
       <input id="fl-q" type="search" value="${esc(filing.q)}" style="margin-bottom:8px"
              placeholder="Search — several at once with commas: bed base, LF-03">
       <div class="filters">
@@ -3194,14 +3364,25 @@ function bindFiling(body) {
     const tickedHere = found.filter((item) => filing.ticked.has(item.id)).length;
     document.getElementById("fl-count").textContent =
       `${found.length} found · ${filing.ticked.size} ticked${filing.ticked.size !== tickedHere ? ` (${tickedHere} of them here)` : ""}`;
+    // Every ticked item can be given a quantity: how many of it go into the
+    // phase chosen below. Shown on the tick, not once the phase is picked --
+    // the picker is under the list, and a box that only appears afterwards is
+    // a box nobody finds.
+    const asking = true;
     $results.innerHTML = shown.map((item) => `
-      <label class="pick-row">
-        <input type="checkbox" data-fl-pick="${item.id}" ${filing.ticked.has(item.id) ? "checked" : ""}>
-        <span style="min-width:0">
-          <strong>${esc(item.code)}</strong> ${itemTags(item)}
-          <br><span class="muted">${esc(projectCode.get(item.project_id) || "")} · ${item.total_qty} pcs${item.description ? ` · ${esc(item.description)}` : ""}</span>
-        </span>
-      </label>`).join("")
+      <div class="pick-row" style="cursor:default">
+        <label style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;margin:0;cursor:pointer">
+          <input type="checkbox" data-fl-pick="${item.id}" ${filing.ticked.has(item.id) ? "checked" : ""}>
+          <span style="min-width:0">
+            <strong>${esc(item.code)}</strong> ${itemTags(item)}
+            <br><span class="muted">${esc(projectCode.get(item.project_id) || "")} · ${batchOf(item)} pcs${item.description ? ` · ${esc(item.description)}` : ""}</span>
+          </span>
+        </label>
+        ${asking && filing.ticked.has(item.id) ? `
+        <input data-fl-qty="${item.id}" type="number" inputmode="numeric" min="1" max="${batchOf(item)}"
+               value="${esc(filing.qty[item.id] ?? "")}" placeholder="all ${batchOf(item)}"
+               aria-label="How many of ${esc(item.code)} go into the phase" style="width:96px;flex:none;padding:8px">` : ""}
+      </div>`).join("")
       + (found.length > shown.length ? `<p class="muted" style="padding:8px 0">Showing the first ${shown.length} of ${found.length}. Narrow the search to see the rest — "Tick all found" still takes all ${found.length}.</p>` : "")
       || `<p class="muted" style="padding:8px 0">${filing.onlyTicked ? "Nothing is ticked." : "No items match."}</p>`;
     label();
@@ -3211,7 +3392,8 @@ function bindFiling(body) {
   $results.onchange = (e) => {
     const id = e.target?.dataset?.flPick;
     if (!id) return;
-    if (e.target.checked) filing.ticked.add(id); else filing.ticked.delete(id);
+    if (e.target.checked) filing.ticked.add(id);
+    else { filing.ticked.delete(id); delete filing.qty[id]; }
     // Repainting is cheap and keeps the count, the list and the button honest
     // together; the box that was ticked keeps its place because the order is
     // the same.
@@ -3219,19 +3401,25 @@ function bindFiling(body) {
     paint();
     $results.scrollTop = top;
   };
+  // Typing a quantity changes nothing on screen, so nothing is repainted
+  // and the box keeps its focus.
+  $results.oninput = (e) => {
+    const id = e.target?.dataset?.flQty;
+    if (id) filing.qty[id] = e.target.value;
+  };
   document.getElementById("fl-q").oninput = (e) => { filing.q = e.target.value; paint(); };
   for (const [id, key] of [["fl-in-area", "inArea"], ["fl-in-phase", "inPhase"]]) {
     document.getElementById(id).onchange = (e) => { filing[key] = e.target.value; paint(); };
   }
-  for (const [id, key] of [["fl-area", "area"], ["fl-phase", "phase"]]) {
-    document.getElementById(id).onchange = (e) => { filing[key] = e.target.value; label(); };
-  }
+  document.getElementById("fl-area").onchange = (e) => { filing.area = e.target.value; label(); };
+  // Choosing a phase is what brings up the quantity boxes.
+  document.getElementById("fl-phase").onchange = (e) => { filing.phase = e.target.value; paint(); };
   document.getElementById("fl-only").onchange = (e) => { filing.onlyTicked = e.target.checked; paint(); };
   document.getElementById("fl-all").onclick = () => {
     for (const item of filingMatches()) filing.ticked.add(item.id);
     paint();
   };
-  document.getElementById("fl-none").onclick = () => { filing.ticked.clear(); filing.onlyTicked = false; document.getElementById("fl-only").checked = false; paint(); };
+  document.getElementById("fl-none").onclick = () => { filing.ticked.clear(); filing.qty = {}; filing.onlyTicked = false; document.getElementById("fl-only").checked = false; paint(); };
 
   document.getElementById("fl-go").onclick = async () => {
     const err = document.getElementById("fl-err");
@@ -3245,15 +3433,40 @@ function bindFiling(body) {
       payload[field] = filing[key] === NONE ? null : filing[key];
       where.push(filing[key] === NONE ? `no ${noun}` : labelRow(list, filing[key])?.name || noun);
     }
-    if (!confirm(`File ${ids.length} item${ids.length === 1 ? "" : "s"} under ${where.join(" and ")}?`)) return;
+    // Quantities, for the items not going whole. They only mean something
+    // when a phase is being set.
+    const part = [];
+    const fail = (message) => { err.textContent = message; err.hidden = false; };
+    if (filing.phase === KEEP && ids.some((id) => String(filing.qty[id] ?? "").trim())) {
+      return fail("A quantity is how many go into a phase. Choose the phase under “Set phase to”, or clear the quantities.");
+    }
+    if (filing.phase !== KEEP) {
+      for (const id of ids) {
+        const typed = String(filing.qty[id] ?? "").trim();
+        if (!typed) continue;
+        const item = S.items.find((i) => i.id === id);
+        const qty = Number(typed);
+        if (!Number.isInteger(qty) || qty < 1) return fail(`${item?.code || "An item"}: the quantity is a whole number, 1 or more — or leave it empty for all of it.`);
+        if (item && qty > batchOf(item)) return fail(`${item.code} is a batch of ${batchOf(item)}; it cannot give ${qty}.`);
+        (payload.quantities ||= {})[id] = qty;
+        if (item && qty < batchOf(item)) part.push(`${qty} of ${item.code}`);
+      }
+    }
+    const whole = ids.length - part.length;
+    const what = [
+      whole ? `${whole} item${whole === 1 ? "" : "s"}` : "",
+      part.length ? `${part.slice(0, 6).join(", ")}${part.length > 6 ? ` and ${part.length - 6} more` : ""}` : "",
+    ].filter(Boolean).join(", and ");
+    if (!confirm(`File ${what} under ${where.join(" and ")}?${part.length ? "\n\nWhere a quantity is given, the rest of that batch stays in the phase it is in." : ""}`)) return;
     const go = document.getElementById("fl-go");
     go.disabled = true;
     try {
       const done = await api("/api/items/assign", { method: "POST", body: JSON.stringify(payload) });
-      toast(`${done.updated} item${done.updated === 1 ? "" : "s"} filed under ${where.join(" and ")}`);
+      toast(`${done.updated} item${done.updated === 1 ? "" : "s"} filed under ${where.join(" and ")}${done.split ? ` — ${done.split} in part` : ""}`);
       // Done with this batch: start the next one clean, but keep the search --
       // the next thing is usually to look at what is left.
       filing.ticked.clear();
+      filing.qty = {};
       filing.onlyTicked = false;
       filing.area = KEEP;
       filing.phase = KEEP;
@@ -3326,7 +3539,7 @@ function officeAreas(body) {
             <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
               <button class="ghost" data-lb-save="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>Save</button>
               <button class="ghost" data-lb-toggle="${list}:${row.id}" style="width:auto;padding:10px 16px" ${S.online ? "" : "disabled"}>${row.is_active ? "Retire" : "Reactivate"}</button>
-              ${count ? "" : `<button class="ghost" data-lb-delete="${list}:${row.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn)" ${S.online ? "" : "disabled"}>Delete</button>`}
+              ${count ? "" : `<button class="ghost" data-lb-delete="${list}:${row.id}" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>Delete</button>`}
             </div>
             <p class="muted" style="margin-top:6px">${count
               ? "Retiring takes it off the pickers; the items filed under it stay there."
@@ -3566,7 +3779,7 @@ function officeWorkOrders(body) {
       <div style="padding:8px 0;border-bottom:1px solid var(--line)">
         <div class="spread">
           <strong>${esc(row.label)} · Rev ${row.revision}</strong>
-          <span class="muted">${new Date(row.issued_at).toLocaleDateString()}</span>
+          <span class="muted">${fmtWhen(row.issued_at)}</span>
         </div>
         ${row.title ? `<div>${esc(row.title)}</div>` : ""}
         <div class="muted">${row.line_count} item${row.line_count === 1 ? "" : "s"} · ${row.total_qty} pcs · issued by ${esc(row.issued_by || "?")}</div>
@@ -3682,7 +3895,7 @@ function workOrderEditor(body, projects) {
       <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
         <button class="ghost" id="wo-cancel" style="width:auto;padding:10px 16px">${draft.id ? "Close without saving" : "Discard"}</button>
         ${draft.id ? `<a class="ghost button-link" href="/api/work-orders/${draft.id}/pdf" download>Download Rev ${draft.revision} PDF</a>` : ""}
-        ${draft.id && isAdmin ? `<button class="ghost" id="wo-delete" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn)" ${S.online ? "" : "disabled"}>Delete work order</button>` : ""}
+        ${draft.id && isAdmin ? `<button class="ghost" id="wo-delete" style="width:auto;padding:10px 16px;border-color:var(--warn);color:var(--warn-text)" ${S.online ? "" : "disabled"}>Delete work order</button>` : ""}
       </div>
     </div>`;
 
@@ -3994,10 +4207,10 @@ function officeStages(body) {
   body.innerHTML = `
     <div class="card">
       <h2>Stages &amp; stations</h2>
-      <p class="muted" style="margin-bottom:8px">Adding a stage needs no deploy and no code
-      change: add it here with its behaviour flags, add stations if it has physical
-      instances, and every item can be logged at it straight away. Sort order is only the
-      order stages are listed in — units move between them freely.</p>
+      <p class="muted" style="margin-bottom:8px">Add a stage here and every item
+      can be logged at it straight away, on each phone's next sync — there is nothing else
+      to set up. Add stations if the stage has more than one booth or bench. Sort order is
+      only the order stages are listed in: units move between them freely.</p>
       <div id="mg-stages" class="muted">Loading…</div>
       <details data-panel="new-stage" style="margin-top:12px">
         <summary class="muted" style="cursor:pointer">New stage</summary>
@@ -4203,7 +4416,7 @@ async function loadBackupStatus() {
     const when = new Date(status.last_at);
     const stale = Date.now() - when.getTime() > BACKUP_STALE_MS;
     target.className = stale ? "warn-text" : "";
-    target.textContent = `Last backup ${timeAgo(when.getTime())} (${when.toLocaleString()}) · ${status.count} kept`
+    target.textContent = `Last backup ${timeAgo(when.getTime())} (${fmtWhen(when)}) · ${status.count} kept`
       + (stale ? " — the nightly backup has not run; check the backup container's log." : "");
   }
 }

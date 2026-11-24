@@ -60,7 +60,7 @@ def upload_image(
     file: UploadFile = File(...),
     note: str = Form(default=""),
     kind: str = Form(default="snag"),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     if db.get(Item, item_id) is None:
@@ -110,7 +110,7 @@ def upload_image(
 @router.get("/items/{item_id}/images")
 def list_images(
     item_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     rows = db.scalars(
@@ -125,7 +125,7 @@ def list_images(
 def update_image_note(
     image_id: uuid.UUID,
     payload: ImageNoteUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """Describe a snag after the fact. Only the note is editable: the bytes an
@@ -141,7 +141,7 @@ def update_image_note(
 @router.delete("/images/{image_id}")
 def delete_image(
     image_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """Remove a photo: the bytes off storage, then the row.
@@ -178,7 +178,7 @@ def delete_image(
 @router.get("/images/{image_id}")
 def serve_image(
     image_id: uuid.UUID,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ):
     image = db.get(ItemImage, image_id)

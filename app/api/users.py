@@ -37,7 +37,7 @@ def _payload(user: User) -> dict:
 
 @router.get("")
 def list_users(
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     rows = db.scalars(sa.select(User).order_by(User.username))
@@ -47,7 +47,7 @@ def list_users(
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_user(
     payload: UserCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     username = payload.username.strip().lower()
@@ -68,7 +68,7 @@ def create_user(
 def update_user(
     user_id: uuid.UUID,
     payload: UserUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     user = db.get(User, user_id)

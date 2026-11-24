@@ -122,6 +122,9 @@ class Anomaly:
     item_id: uuid.UUID
     detail: str
     occurred_at: datetime | None = None
+    # On an over-advance: how many of the event's units were not there to
+    # move. The write path words its refusal from this, for the engineer.
+    shortfall: int | None = None
 
 
 @dataclass
@@ -494,6 +497,7 @@ class ItemLedger:
                     f"event moves {event.qty} but only {event.qty - shortfall} "
                     f"were available {where}; {shortfall} unaccounted for"
                 ),
+                shortfall=shortfall,
             )
 
         if move.outflow:
@@ -586,7 +590,7 @@ class ItemLedger:
                 break
         return taken, remaining
 
-    def _flag(self, event: Event, code: str, detail: str) -> None:
+    def _flag(self, event: Event, code: str, detail: str, shortfall: int | None = None) -> None:
         self.anomalies.append(
             Anomaly(
                 code=code,
@@ -594,6 +598,7 @@ class ItemLedger:
                 item_id=self.item.id,
                 detail=detail,
                 occurred_at=event.occurred_at,
+                shortfall=shortfall,
             )
         )
 

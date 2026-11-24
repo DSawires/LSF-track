@@ -10,6 +10,11 @@
   --accent: #e8a33d;
   --good: #4cc38a;
   --warn: #e5484d;
+  /* --warn is for borders and dots. As text on these panels it is 3.7:1, under
+     what small type needs -- and overdue ages and refusal reasons are the
+     words that most have to be read, often in glare. This one is 6:1 or
+     better on every panel. */
+  --warn-text: #ff8a8d;
   --radius: 10px;
 }
 
@@ -90,6 +95,7 @@ header h1 {
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 6px 12px;
+  min-height: 44px;
   white-space: nowrap;
   cursor: pointer;
 }
@@ -152,6 +158,11 @@ header h1 {
 
 #sync-pill.offline .dot { background: var(--warn); }
 #sync-pill.pending .dot { background: var(--accent); }
+/* An entry the server did not take needs someone to act; one that is merely
+   waiting needs nothing. Last, so it wins over "pending": red dot, red ring,
+   and the words at full strength. */
+#sync-pill.rejected { border-color: var(--warn); color: var(--text); }
+#sync-pill.rejected .dot { background: var(--warn); }
 
 /* ---- nav ---- */
 
@@ -340,7 +351,10 @@ button.primary {
   font-size: 17px;
 }
 
-button.primary:disabled { opacity: 0.5; }
+/* Not ready is still readable: the label says what is missing ("Pick where it
+   went"), so it cannot be the faintest text on the screen. Dimmed by colour,
+   not by opacity, which took the label down with the background. */
+button.primary:disabled { background: #51401f; color: #f5e3bd; }
 
 button.ghost {
   background: transparent;
@@ -358,6 +372,9 @@ input, select {
   border: 1px solid var(--line);
 }
 
+/* The browser's own placeholder grey is 3:1 on these fields. */
+::placeholder { color: var(--muted); opacity: 1; }
+
 label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px; }
 
 .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
@@ -373,9 +390,9 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 }
 
 .badge.qty { color: var(--text); font-weight: 600; }
-.badge.age-hot { color: var(--warn); border-color: var(--warn); }
+.badge.age-hot { color: var(--warn-text); border-color: var(--warn); }
 .badge.pending { color: var(--accent); border-color: var(--accent); }
-.badge.rework { color: var(--warn); }
+.badge.rework { color: var(--warn-text); }
 .badge.sample { color: var(--accent); border-color: var(--accent); font-weight: 600; }
 
 /* segmented pickers beat dropdowns with gloves on */
@@ -406,9 +423,29 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
 
 .seg button.on::before { content: "✓ "; }
 
+/* A picker for the exception rather than the rule (the entry type): one short
+   row, not a block the height of the main choice. */
+.seg.compact button { flex: 0 1 auto; min-height: 44px; padding: 8px 16px; }
+
+/* A choice already made, on one line, with the way to change it. */
+.picked-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 48px;
+  padding: 6px 6px 6px 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+}
+.picked-row strong { min-width: 0; }
+.picked-row .ghost { flex: none; }
+
 .qty-row { display: flex; gap: 8px; align-items: stretch; }
-.qty-row input { text-align: center; font-size: 22px; font-weight: 700; }
+.qty-row input { flex: 1; min-width: 0; text-align: center; font-size: 22px; font-weight: 700; }
 .qty-row button {
+  flex: none;
   width: 56px;
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -432,7 +469,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 5px
   text-align: center;
 }
 
-.warn-text { color: var(--warn); font-size: 13px; margin-top: 6px; }
+.warn-text { color: var(--warn-text); font-size: 13px; margin-top: 6px; }
 
 /* Camera / gallery. Two equal halves on a phone, one full-width button on a
    desktop — same box either way, so the row doesn't jump between devices. */
@@ -531,7 +568,50 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* Up to five of them on a phone: they wrap three to a row instead of
    squeezing into one. */
 .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
-.filters select { flex: 1 1 30%; min-width: 0; padding: 10px; }
+.filters select { flex: 1 1 30%; min-width: 0; min-height: 44px; padding: 10px; }
+
+/* The item list: search, and one button that unfolds the filters. Two to a
+   row once unfolded, so a name like "Any progress" is not cut short. */
+.find-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.find-row input { flex: 1; min-width: 0; }
+.find-row .ghost { flex: none; padding: 8px 14px; font-size: 15px; }
+.find-row .ghost.on { border-color: var(--accent); color: var(--accent); }
+#f-panel select { flex: 1 1 45%; }
+.filter-summary {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin: -2px 0 10px;
+}
+.filter-summary .muted { min-width: 0; font-size: 14px; }
+.filter-summary .ghost { flex: none; }
+
+/* On an item's card: entries of its that the server did not take. A row of
+   its own, because it is the one thing on the card that needs acting on. */
+.reject-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  min-height: 48px; padding: 8px 12px; margin: 6px 0;
+  border: 1px solid var(--warn); border-radius: 8px;
+  color: var(--warn-text); text-decoration: none; font-size: 15px; font-weight: 600;
+}
+.reject-row:active { background: var(--panel-2); }
+.reject-row .chev { font-size: 22px; line-height: 1; flex: none; }
+.card-flags { margin: 2px 0 6px; }
+.card-flags .badge { font-size: 13px; padding: 3px 10px; }
+
+/* A stage on the WIP report: the whole block is the button. */
+.wip-row {
+  display: block; text-align: left;
+  background: transparent; border: 1px solid transparent;
+  padding: 8px; margin: 0 -8px 4px; width: calc(100% + 16px);
+}
+.wip-row > span { display: block; }
+.wip-row > .spread { display: flex; }
+.wip-row .bar-fill { display: block; }
+.wip-row:active { background: var(--panel-2); }
+.wip-row.on { background: var(--panel-2); border-color: var(--accent); }
+
+/* A table cell that is a link: the whole cell is the target, not the word. */
+td .cell-link { display: block; min-height: 44px; padding: 6px 0; color: inherit; }
+td.overdue { color: var(--warn-text); font-weight: 700; }
 
 /* A list of things to tick. Rows are whole-width tap targets, and the list
    scrolls inside its card so the "file" button below it stays in reach. */

@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 @router.get("/wip")
 def wip(
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
     project_id: uuid.UUID | None = None,
     area_id: uuid.UUID | None = None,
@@ -26,7 +26,7 @@ def wip(
 
 @router.get("/aging")
 def aging(
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
     limit: int | None = None,
     project_id: uuid.UUID | None = None,
@@ -50,5 +50,5 @@ def aging(
 
 
 @router.get("/exceptions")
-def exceptions(db: Session = Depends(get_db), user: User = Depends(current_user)) -> dict:
+def exceptions(db: Session = Depends(get_db, scope="function"), user: User = Depends(current_user)) -> dict:
     return reports.exceptions_report(db)

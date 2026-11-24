@@ -351,7 +351,7 @@ def test_only_the_sample_exists_until_it_is_done(factory):
 
     factory.log(item, 10, 1, at=hours_ago(10), station_code="carpentry_1")
     # The batch is not on the floor yet: nothing upstream to move.
-    with pytest.raises(EventRejected, match="only 0"):
+    with pytest.raises(EventRejected, match="none are .* the batch is released when the sample is Done"):
         factory.log(item, 10, 5, at=hours_ago(9), station_code="carpentry_1")
 
     factory.log(item, 20, 1, at=hours_ago(8), station_code="paint_1")

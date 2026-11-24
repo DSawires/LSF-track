@@ -47,7 +47,7 @@ def _save(db: Session, user: User, payload: WorkOrderSave, existing: WorkOrder |
 @router.get("")
 def list_work_orders(
     project_id: uuid.UUID | None = None,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """Newest first. Without their lines: this is the list, not the documents."""
@@ -65,7 +65,7 @@ def list_work_orders(
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 def issue(
-    payload: WorkOrderSave, db: Session = Depends(get_db), user: User = Depends(current_user)
+    payload: WorkOrderSave, db: Session = Depends(get_db, scope="function"), user: User = Depends(current_user)
 ) -> dict:
     return _save(db, user, payload, None)
 
@@ -86,7 +86,7 @@ def translate_texts(payload: TranslateRequest, user: User = Depends(current_user
 
 @router.get("/{work_order_id}")
 def read(
-    work_order_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(current_user)
+    work_order_id: uuid.UUID, db: Session = Depends(get_db, scope="function"), user: User = Depends(current_user)
 ) -> dict:
     return work_orders.payload_of(db, _get(db, work_order_id))
 
@@ -95,7 +95,7 @@ def read(
 def reissue(
     work_order_id: uuid.UUID,
     payload: WorkOrderSave,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     """Save changes as the next revision, stamped with who and when."""
@@ -104,7 +104,7 @@ def reissue(
 
 @router.delete("/{work_order_id}")
 def delete(
-    work_order_id: uuid.UUID, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+    work_order_id: uuid.UUID, db: Session = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> dict:
     """Remove a work order that should not have been issued. Its number is not
     reused while a later one exists. Nothing about its items changes."""
@@ -119,7 +119,7 @@ def delete(
 
 @router.get("/{work_order_id}/pdf")
 def pdf(
-    work_order_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(current_user)
+    work_order_id: uuid.UUID, db: Session = Depends(get_db, scope="function"), user: User = Depends(current_user)
 ) -> Response:
     work_order = _get(db, work_order_id)
     name = f"{work_orders.label(work_order)}-rev{work_order.revision}.pdf"

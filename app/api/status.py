@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/status", tags=["status"])
 
 @router.get("/users")
 def user_status(
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     return status_service.user_activity(db)
@@ -40,7 +40,7 @@ def backup(admin: User = Depends(require_admin)) -> dict:
 
 @router.get("/banner")
 def read_banner(
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     return status_service.current_banner(db)
@@ -49,7 +49,7 @@ def read_banner(
 @router.post("/banner")
 def write_banner(
     payload: BannerUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     return status_service.set_banner(db, payload.color, payload.message, admin)

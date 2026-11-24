@@ -292,15 +292,18 @@ def _validate_availability(
     a validation error, not a stored fact. The test is a simulation, not a
     running-total check: replay the item's whole log in occurred_at order *with
     the candidate included*, and reject only if that replay over-advances where
-    the log without it did not. Judging the whole timeline matters because
-    events sync out of order -- a move out of paint arriving before the move
-    into paint must not be refused when the replay will seat both correctly
-    once the partner lands.
+    the log without it did not. Judging the whole timeline, rather than what
+    is there "now", is what lets an offline chain of moves validate against
+    itself whatever order its entries arrive in.
 
-    A genuine rejection is recoverable: the client quarantines the entry with
-    this reason and offers a retry, which is how it resolves once the state of
-    the log changes (a correction voids the conflicting entry, or the entry it
-    depends on syncs in from another device).
+    The entry is judged against the log as it stands. A move out of paint that
+    reaches the server before the move into paint (logged on another phone,
+    not yet synced) is refused like any other shortfall.
+
+    A rejection is recoverable: the client quarantines the entry with this
+    reason and offers a retry, which is how it resolves once the state of the
+    log changes (the entry it depends on syncs in from another device, or a
+    correction voids the conflicting one).
     """
     if not event_type.moves_quantity or payload.qty <= 0:
         return
@@ -364,8 +367,10 @@ def _validate_availability(
     with_candidate = replay(events + [candidate])
     after = [a for a in with_candidate.anomalies if a.code == "over_advance"]
     if len(after) > len(before):
-        blame = next((a for a in after if a.event_id == payload.id), after[-1])
-        raise EventRejected(f"the log cannot support this move: {blame.detail}", "qty")
+        blame = next((a for a in after if a.event_id == payload.id), None)
+        raise EventRejected(
+            _shortfall_reason(payload, blame, vocab, with_candidate.released_at is None), "qty"
+        )
 
     # allows_partial_qty=False: this stage takes whole lots, never a split.
     # Enforced as "nothing may be left behind": after the replay with this
@@ -388,6 +393,47 @@ def _validate_availability(
                 ),
                 "qty",
             )
+
+
+def _shortfall_reason(payload, blame, vocab, sample_running: bool) -> str:
+    """Why a move the log cannot hold was refused, in the engineer's words.
+
+    This is read on a phone on the floor, by the person who has to choose
+    between Retry and Discard: it says how many units are at the place the
+    entry takes them from, and how many the entry moves. `blame` is the
+    over-advance the replay found on this entry -- or None when this entry
+    fits and it is one already in the log that no longer would.
+    `sample_running`: the item's sample is not Done yet, so its batch is not
+    on the floor.
+    """
+    if blame is None or blame.shortfall is None:
+        # Dated before an entry already stored, and taking units that entry
+        # went on to move: the two cannot both be true.
+        return (
+            "an entry already in the log, dated after this one, moved these units on; "
+            "they cannot both be right"
+        )
+    there = payload.qty - blame.shortfall
+    count = "none" if there == 0 else f"only {there}"
+    verb = "is" if there == 1 else "are"
+    if payload.from_unstarted:
+        place = "still not started"
+    elif payload.from_done:
+        place = "in Done"
+    elif payload.from_stage_id is not None:
+        stage = vocab.stages.get(payload.from_stage_id)
+        place = f"at {stage.name}" if stage is not None else "at that stage"
+    else:
+        # A sequence-era entry: it names a step, or nothing at all.
+        place = "at the place it takes them from"
+    reason = f"{count} {verb} {place}, and this entry moves {payload.qty}"
+    # Drawing on "not started" -- by name, or as a sequence-era entry that
+    # names no source and reaches back to it -- while the sample is still
+    # running: the usual cause, and not one the numbers explain on their own.
+    unsourced = not (payload.from_done or payload.from_stage_id or payload.from_item_step_id)
+    if sample_running and (payload.from_unstarted or unsourced):
+        reason += "; the batch is released when the sample is Done"
+    return reason
 
 
 def _attribute_user(db: Session, payload, session_user: User) -> uuid.UUID:

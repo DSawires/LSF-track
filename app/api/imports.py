@@ -42,7 +42,7 @@ def template(user: User = Depends(current_user)) -> Response:
 def import_file(
     file: UploadFile = File(...),
     commit: bool = Form(False),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     content = file.file.read(MAX_BYTES + 1)

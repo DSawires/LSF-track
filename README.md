@@ -264,6 +264,14 @@ per phase.
   phase and file the lot. "In no area" / "In no phase" show what is still
   unfiled. If two of the ticked items would end up as the same batch, nothing
   is changed and the message names them.
+- **Filing part of a batch into a phase.** Every ticked item has a quantity
+  box. Empty sends the whole batch, as before. Type a number — 66 of the 216
+  — and only that many go into the phase chosen under *Set phase to*, as
+  their own batch under the same code (joining the batch already in that
+  phase, if there is one); the rest stay in the phase they are in. Before the
+  sample is done the new batch waits on the same sample. Only units that have
+  not started can be sent this way; units already at a stage are moved from
+  the item's own page, which asks which stage they come from.
 - The **Items** list filters by area, phase and progress (haven't started / in
   progress / finished); **Reports** narrow WIP and aging to an area and a
   phase. Wherever an item is shown, its area and phase are shown with its
@@ -469,7 +477,7 @@ exactly — see `app/ledger.py`.
   payload carries a token computed from the tables (`app/services/sync.py`);
   a phone holding the same token skips the replay behind `/api/items`.
 - **Done is not a stage.** Units reach it from anywhere through an event type
-  flagged `is_finish`, which names no stage. The phone offers it as "Done ✓"
+  flagged `is_finish`, which names no stage. The phone offers it as "Done"
   alongside the stages.
 - **`POST /api/items` accepts an initial per-stage distribution** for a batch
   that is already part-built when it reaches the system (with `sample_qty` 0);

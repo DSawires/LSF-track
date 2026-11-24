@@ -54,7 +54,7 @@ def _stage_payload(stage: Stage) -> dict:
 @router.post("/stages", status_code=status.HTTP_201_CREATED)
 def create_stage(
     payload: StageCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     if db.scalars(sa.select(Stage).where(Stage.code == payload.code)).first() is not None:
@@ -78,7 +78,7 @@ def create_stage(
 def update_stage(
     stage_id: uuid.UUID,
     payload: StageUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     stage = db.get(Stage, stage_id)
@@ -104,7 +104,7 @@ def _station_payload(station: Station) -> dict:
 @router.post("/stations", status_code=status.HTTP_201_CREATED)
 def create_station(
     payload: StationCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     if db.get(Stage, payload.stage_id) is None:
@@ -126,7 +126,7 @@ def create_station(
 def update_station(
     station_id: uuid.UUID,
     payload: StationUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """Rename, reorder or retire a physical station.
@@ -249,7 +249,7 @@ def _delete_label(db: Session, model, row_id: uuid.UUID, item_column, noun: str)
 
 @router.post("/areas", status_code=status.HTTP_201_CREATED)
 def create_area(
-    payload: LabelCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+    payload: LabelCreate, db: Session = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> dict:
     return _create_label(db, Area, payload, "area")
 
@@ -258,7 +258,7 @@ def create_area(
 def update_area(
     area_id: uuid.UUID,
     payload: LabelUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     return _update_label(db, Area, area_id, payload, "area")
@@ -266,14 +266,14 @@ def update_area(
 
 @router.delete("/areas/{area_id}")
 def delete_area(
-    area_id: uuid.UUID, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+    area_id: uuid.UUID, db: Session = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> dict:
     return _delete_label(db, Area, area_id, Item.area_id, "area")
 
 
 @router.post("/phases", status_code=status.HTTP_201_CREATED)
 def create_phase(
-    payload: LabelCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+    payload: LabelCreate, db: Session = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> dict:
     return _create_label(db, Phase, payload, "phase")
 
@@ -282,7 +282,7 @@ def create_phase(
 def update_phase(
     phase_id: uuid.UUID,
     payload: LabelUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     return _update_label(db, Phase, phase_id, payload, "phase")
@@ -290,7 +290,7 @@ def update_phase(
 
 @router.delete("/phases/{phase_id}")
 def delete_phase(
-    phase_id: uuid.UUID, db: Session = Depends(get_db), admin: User = Depends(require_admin)
+    phase_id: uuid.UUID, db: Session = Depends(get_db, scope="function"), admin: User = Depends(require_admin)
 ) -> dict:
     return _delete_label(db, Phase, phase_id, Item.phase_id, "phase")
 
@@ -298,7 +298,7 @@ def delete_phase(
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
 def create_project(
     payload: ProjectCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     user: User = Depends(current_user),
 ) -> dict:
     code = payload.code.strip().upper()
@@ -322,7 +322,7 @@ def create_project(
 def update_project(
     project_id: uuid.UUID,
     payload: ProjectUpdate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """Rename a project, correct its client, or bring an archived one back.
@@ -354,7 +354,7 @@ def update_project(
 def archive_project(
     project_id: uuid.UUID,
     with_items: bool = False,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db, scope="function"),
     admin: User = Depends(require_admin),
 ) -> dict:
     """Archive a project.
